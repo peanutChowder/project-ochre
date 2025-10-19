@@ -1,0 +1,14 @@
+__pycache__/
+.DS_Store
+venv/
+
+# Data
+*.png
+*.mp4
+preprocessed/
+MineRLNavigate-v0/
+outputs/
+
+
+# models
+checkpoints/
