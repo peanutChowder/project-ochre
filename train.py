@@ -1,5 +1,10 @@
-
-
+#!/usr/bin/env python3
+"""
+Checklist:
+- Update input model path to latest
+- Update run name
+- update prev hardcoded epoch
+"""
 import os, time, torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader
 from diffusers import AutoencoderKL
@@ -11,13 +16,15 @@ BATCH_SIZE  = 4
 SEQ_LEN     = 7
 LATENT_C    = 4
 LATENT_H    = LATENT_W = 32
-EPOCHS      = 20
+EPOCHS      = 2
 LR          = 1e-4
-DATA_DIR    = "/kaggle/input/minerl-navigate-spliced-120k/preprocessed"
+DATA_DIR    = "/kaggle/input/minerl-navigate-spliced-120k/preprocessedv2.0"
 
 PROJECT     = "project-ochre"
-RUN_NAME    = "run6-startFromEpoch13.5"
+RUN_NAME    = "v2.0-run1-epoch0"
 PREV_HARDCODED_EPOCH = 0
+
+LATENT_NOISE = False  # Flag to control latent noise injection
 
 # Safety limit: Kaggle runtime cutoff ~12 hours → stop early
 MAX_TRAIN_HOURS = 11.9
@@ -49,10 +56,16 @@ wandb.init(project=PROJECT, name=RUN_NAME, resume="allow",
            config=dict(batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS))
 
 # ---------- Dataset ----------
-dataset = MineRLSequenceDataset(DATA_DIR)
+dataset = MineRLFrameTripletDataset(DATA_DIR)
 loader  = DataLoader(dataset, batch_size=BATCH_SIZE,
                      shuffle=True, num_workers=2, pin_memory=True)
-print(f"Dataset size: {len(dataset)} sequences")
+print(f"Dataset size: {len(dataset)} frame triplets")
+
+print("Quick dataset smoke test: f.shape, a.shape, n.shape, n2.shape")
+for i, (f, a, n, n2) in enumerate(loader):
+    print(f.shape, a.shape, n.shape, n2.shape)
+    if i > 5: break
+print("-----------------")
 
 # ---------- VAE (frozen) ----------
 vae = AutoencoderKL.from_pretrained(
@@ -67,7 +80,7 @@ optimizer = optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.MSELoss()
 
 # ---------- Resume / Initialization ----------
-latest_ckpt = "/kaggle/input/project-ochre/pytorch/default/6/temporal_transformer_epoch13_half.pt"
+latest_ckpt = ""
 if latest_ckpt:
     start_epoch, global_step = load_checkpoint(model, optimizer, latest_ckpt)
 else:
@@ -80,18 +93,21 @@ for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     running_loss = 0.0
 
-    for frames, actions in loader:
-        frames  = frames.to(DEVICE, dtype=torch.float32)
-        actions = actions.to(DEVICE, dtype=torch.float32)
+    for frame_t, action_t, frame_next, frame_next2 in loader:
+        frame_t    = frame_t.to(DEVICE, dtype=torch.float32)
+        action_t   = action_t.to(DEVICE, dtype=torch.float32)
+        frame_next = frame_next.to(DEVICE, dtype=torch.float32)
+        _ = frame_next2  # Placeholder for future use (noise-injection, scheduled sampling, etc.)
 
-        # vae is frozen so dont need gradients
         with torch.no_grad():
-            latents = vae.encode(frames[:, :-1].reshape(-1, 3, 256, 256)).latent_dist.sample()
-            latents = latents.view(frames.size(0), SEQ_LEN-1, LATENT_C, LATENT_H, LATENT_W)
-            target  = vae.encode(frames[:, -1]).latent_dist.sample()
+            latents_t = vae.encode(frame_t).latent_dist.sample()
+            target    = vae.encode(frame_next).latent_dist.sample()
+            if LATENT_NOISE:
+                noise = torch.randn_like(latents_t) * 0.1
+                latents_t = latents_t + noise
 
-        pred = model(latents, actions)
-        loss = criterion(pred, target)
+        pred = model(latents_t.unsqueeze(1), action_t.unsqueeze(1))  # Add seq dim of 1
+        loss = criterion(pred.squeeze(1), target)
 
         optimizer.zero_grad()
         loss.backward()
