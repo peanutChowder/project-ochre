@@ -8,8 +8,9 @@ For every subfolder inside --parent_dir that contains
     * read action arrays from npz
     * downsample to target FPS
     * resize to target size
-    * create sequences of length seq_len (K context + 1 target)
-    * save each sequence as compressed npz in --out_dir
+    * save full trajectory as compressed npz in --out_dir
+
+Note: Each MP4 file is processed as a full trajectory, not split into shorter sequences.
 """
 
 import argparse, os, numpy as np
@@ -34,11 +35,14 @@ def build_action_matrix(d):
 def process_trajectory(traj_dir: Path,
                        out_dir: Path,
                        fps_target: int = 8,
-                       seq_len: int = 7,
-                       size: int = 256) -> int:
+                       size: int = 64) -> int:
     """
     Process a single trajectory directory.
-    Returns number of sequences written.
+    Returns 1 if saved successfully.
+
+    Note: During downsampling, movement action booleans are max-pooled within each frame group
+    to preserve transient keypresses (e.g., "W" pressed between sampled frames).
+    Camera deltas are averaged across the window to preserve smooth movement data.
     """
     # ---- Load action arrays ----
     d = np.load(traj_dir / "rendered.npz", allow_pickle=True)
@@ -49,11 +53,39 @@ def process_trajectory(traj_dir: Path,
     T = min(len(frames), len(actions))
     frames, actions = frames[:T], actions[:T]
 
+    # ---- Skip first 1 second of footage ----
+    skip_frames = int(round(20))  # MineRL native ~20 FPS
+    frames = frames[skip_frames:]
+    actions = actions[skip_frames:]
+    T = len(frames)
+
     # ---- Downsample to target FPS (MineRL native ≈20) ----
     step = max(1, int(round(20 / fps_target)))
+
+    # Downsample frames by taking every 'step' frame
     frames = frames[::step]
-    actions = actions[::step]
+
+    # Downsample actions with movement booleans max-pooled and camera deltas averaged
+    num_groups = (len(actions) + step - 1) // step
+    downsampled_actions = []
+    for i in range(num_groups):
+        group = actions[i*step:(i+1)*step]
+        if len(group) == 0:
+            continue
+        # Movement booleans: indices 0 to 4
+        movement = np.max(group[:, 0:5], axis=0)
+        # Camera deltas: indices 5 and 6
+        camera = np.mean(group[:, 5:7], axis=0)
+        combined = np.concatenate([movement, camera])
+        downsampled_actions.append(combined)
+    actions = np.array(downsampled_actions, dtype=np.float32)
+    dropped = T - len(frames)
+    print(f"Dropped {dropped} frames during downsampling for trajectory {traj_dir.name}")
     T = len(frames)
+
+    # Ensure frames and actions are aligned before saving
+    T = min(len(frames), len(actions))
+    frames, actions = frames[:T], actions[:T]
 
     # ---- Resize frames ----
     resized = np.zeros((T, size, size, 3), dtype=np.uint8)
@@ -62,23 +94,16 @@ def process_trajectory(traj_dir: Path,
         im = im.resize((size, size), Image.BICUBIC)
         resized[i] = np.asarray(im, dtype=np.uint8)
 
-    # ---- Sliding window sequences ----
-    K = seq_len - 1
-    count = 0
-    for i in range(T - seq_len + 1):
-        vid = resized[i:i + seq_len]
-        act = actions[i:i + K]
-        out_name = f"{traj_dir.name}_{i:06d}.npz"
-        np.savez_compressed(out_dir / out_name,
-                            video=vid,
-                            actions=act)
-        count += 1
-    return count
+    # ---- Save full trajectory ----
+    out_name = f"{traj_dir.name}.npz"
+    np.savez_compressed(out_dir / out_name,
+                        video=resized,
+                        actions=actions)
+    return 1
 
 def main(parent_dir: str,
          out_dir: str,
          fps_target: int = 8,
-         seq_len: int = 7,
          size: int = 256):
     parent = Path(parent_dir)
     out = Path(out_dir)
@@ -94,7 +119,6 @@ def main(parent_dir: str,
             traj,
             out,
             fps_target=fps_target,
-            seq_len=seq_len,
             size=size
         )
     print(f"\nProcessed {len(trajs)} trajectories")
@@ -108,8 +132,6 @@ if __name__ == "__main__":
                    help="Directory to save processed sequences")
     p.add_argument("--fps_target", type=int, default=8,
                    help="Target FPS after downsampling (default 8)")
-    p.add_argument("--seq_len", type=int, default=7,
-                   help="Frames per sequence (default 7)")
     p.add_argument("--size", type=int, default=256,
                    help="Output frame size (default 256)")
     args = p.parse_args()
