@@ -5,7 +5,7 @@ venv/
 # Data
 *.png
 *.mp4
-preprocessed/
+preprocessed*/
 MineRLNavigate-v0/
 outputs/
 
