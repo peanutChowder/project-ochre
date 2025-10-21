@@ -2,7 +2,7 @@
 
 ## Current training version
 
-#### v1.1
+### v1.1
 
 - 6 frame input + yaw/axis data, single frame prediction.
 
@@ -15,8 +15,8 @@ Results:
 Data
 - Each child of preprocessed data corresponds to a random 7-frame subset of all the mp4s
 
-
-#### v2.0
+---
+### v2.0
 - 1 frame input + yaw/axis data, single frame prediction.
 - Latent noise injection - gaussian noise in inputs to encourage recovery from previous error drift
 - Self-sampling - occasionally using predicted frame 1 as input to predict frame 2 **(Applied after ___ epochs)**
@@ -25,4 +25,14 @@ Data
 Data 
 - Each child folder of preprocessed data now corresponds to a mp4
 - Downsampling FPS - max pooling actions and sampling frames for 8 FPS
+
+**v2.0.2**
+- Bug fixes due to import errors
+
+**v2.0.3**
+- Added wandb logging for avg loss/10k steps
+- Added wandb epoch completion indicator (%)
+
+**v2.0.4**
+- Added safety checkpoint saves after final save failed from v2.0.2
 

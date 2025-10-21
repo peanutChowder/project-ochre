@@ -2,6 +2,7 @@
 """
 Checklist:
 - Update input model path to latest
+- Update output model name
 - Update run name
 - update prev hardcoded epoch
 """
@@ -21,13 +22,15 @@ LR          = 1e-4
 DATA_DIR    = "/kaggle/input/minerl-navigate-spliced-120k/preprocessedv2.0"
 
 PROJECT     = "project-ochre"
-RUN_NAME    = "v2.0.2-run1-epoch0"
+RUN_NAME    = "v2.0.4-run2-epoch0"
+MODEL_OUT_PREFIX  = "ochre_v2.0.4"
 PREV_HARDCODED_EPOCH = 0
+latest_ckpt = ""
 
 LATENT_NOISE = False  # Flag to control latent noise injection
 
 # Safety limit: Kaggle runtime cutoff ~12 hours → stop early
-MAX_TRAIN_HOURS = 11.9
+MAX_TRAIN_HOURS = 11.8
 
 print("Running on device:", DEVICE)
 
@@ -42,7 +45,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
         optimizer.load_state_dict(ckpt.get("optimizer_state", optimizer.state_dict()))
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
-        print(f"✅ Loaded full checkpoint from {checkpoint_path}")
+        print(f"✅ Loaded full checkpoint from {checkpoint_path}, beginning epoch {start_epoch}, global_step {global_step}")
     else:
         # Old format (only model weights)
         model.load_state_dict(ckpt)
@@ -77,7 +80,6 @@ optimizer = optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.MSELoss()
 
 # ---------- Resume / Initialization ----------
-latest_ckpt = ""
 if latest_ckpt:
     start_epoch, global_step = load_checkpoint(model, optimizer, latest_ckpt)
 else:
@@ -88,6 +90,7 @@ else:
 running_loss = 0.0
 loss_10k_sum = 0.0
 start_time = time.time()
+last_autosave_time = start_time
 
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
@@ -117,6 +120,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
         global_step += 1
         loss_10k_sum += loss.item()
 
+        # --- Autosave checkpoint every 2 hours ---
+        if time.time() - last_autosave_time > 7200:
+            torch.save({
+                "epoch": epoch,
+                "global_step": global_step,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+            }, f"/kaggle/working/{MODEL_OUT_PREFIX}_autosave.pt")
+            print(f"Autosave checkpoint saved at epoch {epoch}, step {global_step}.")
+            wandb.log({"autosave_checkpoint_saved": epoch})
+            last_autosave_time = time.time()
+
 
         if batch_idx % 50 == 0:
             wandb.log({
@@ -145,9 +160,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "global_step": global_step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-            }, f"/kaggle/working/temporal_transformer_epoch{epoch}_half.pt")
+            }, f"/kaggle/working/{MODEL_OUT_PREFIX}_epoch_{epoch}.pt")
             wandb.log({"safety_checkpoint_saved": epoch})
-            print("⚠️ Safety save triggered: stopping before timeout.")
+            print(f"⚠️ Safety save triggered: stopping before timeout at hour {elapsed_hours}.")
             wandb.finish()
             exit(0)
 
@@ -161,7 +176,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         "global_step": global_step,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-    }, f"/kaggle/working/temporal_transformer_epoch{epoch}_full.pt")
+    }, f"/kaggle/working/{MODEL_OUT_PREFIX}_epoch_{epoch}.pt")
 
 wandb.finish()
 print("✅ Training complete.")
