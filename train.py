@@ -21,13 +21,15 @@ LR          = 1e-4
 DATA_DIR    = "/kaggle/input/minerl-navigate-spliced-120k/preprocessedv2.0"
 
 PROJECT     = "project-ochre"
-RUN_NAME    = "v2.0-run1-epoch0"
+RUN_NAME    = "v2.0.2-run1-epoch0"
 PREV_HARDCODED_EPOCH = 0
 
 LATENT_NOISE = False  # Flag to control latent noise injection
 
 # Safety limit: Kaggle runtime cutoff ~12 hours → stop early
 MAX_TRAIN_HOURS = 11.9
+
+print("Running on device:", DEVICE)
 
 # ---------- HELPERS ----------
 def load_checkpoint(model, optimizer, checkpoint_path):
@@ -60,11 +62,6 @@ dataset = MineRLFrameTripletDataset(DATA_DIR)
 loader  = DataLoader(dataset, batch_size=BATCH_SIZE,
                      shuffle=True, num_workers=2, pin_memory=True)
 print(f"Dataset size: {len(dataset)} frame triplets")
-
-print("Quick dataset smoke test: f.shape, a.shape, n.shape, n2.shape")
-for i, (f, a, n, n2) in enumerate(loader):
-    print(f.shape, a.shape, n.shape, n2.shape)
-    if i > 5: break
 print("-----------------")
 
 # ---------- VAE (frozen) ----------
@@ -88,12 +85,15 @@ else:
     start_epoch, global_step = 1, 0
 
 # ---------- Training Loop ----------
+running_loss = 0.0
+loss_10k_sum = 0.0
 start_time = time.time()
+
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     running_loss = 0.0
 
-    for frame_t, action_t, frame_next, frame_next2 in loader:
+    for batch_idx, (frame_t, action_t, frame_next, frame_next2) in enumerate(loader):
         frame_t    = frame_t.to(DEVICE, dtype=torch.float32)
         action_t   = action_t.to(DEVICE, dtype=torch.float32)
         frame_next = frame_next.to(DEVICE, dtype=torch.float32)
@@ -115,14 +115,27 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         running_loss += loss.item()
         global_step += 1
+        loss_10k_sum += loss.item()
 
-        wandb.log({"train/loss": loss.item(), "train/step": global_step})
-        wandb.log({
-            "latent/pred_mean": pred.mean().item(),
-            "latent/pred_std": pred.std().item(),
-            "latent/target_mean": target.mean().item(),
-            "latent/target_std": target.std().item(),
-        })
+
+        if batch_idx % 50 == 0:
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/step": global_step,
+                "latent/pred_mean": pred.mean().item(),
+                "latent/pred_std": pred.std().item(),
+                "latent/target_mean": target.mean().item(),
+                "latent/target_std": target.std().item(),
+                "train/epoch_completion": (batch_idx / len(loader)) * 100,
+            })
+
+        # Log average loss every 10,000 steps
+        if global_step % 10_000 == 0 and global_step > 0:
+            avg_loss_10k = loss_10k_sum / 10_000
+            print(f"[Step {global_step}] Avg loss (10k): {avg_loss_10k:.4f}")
+            wandb.log({"train/avg_loss_10k": avg_loss_10k})
+            loss_10k_sum = 0.0
+
 
         # Safety save before Kaggle timeout
         elapsed_hours = (time.time() - start_time) / 3600
