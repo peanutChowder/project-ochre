@@ -142,10 +142,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 "latent/target_mean": target.mean().item(),
                 "latent/target_std": target.std().item(),
                 "train/epoch_completion": (batch_idx / len(loader)) * 100,
-            })
+            }, step=global_step)
 
-        # Log average loss every 10,000 steps
-        if global_step % 10_000 == 0 and global_step > 0:
+        # Log average loss per 1k steps
+        if global_step % 1000 == 0 and global_step > 0:
             avg_loss_10k = loss_10k_sum / 10_000
             print(f"[Step {global_step}] Avg loss (10k): {avg_loss_10k:.4f}")
             wandb.log({"train/avg_loss_10k": avg_loss_10k})
