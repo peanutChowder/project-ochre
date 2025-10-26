@@ -17,17 +17,17 @@ BATCH_SIZE  = 4
 SEQ_LEN     = 7
 LATENT_C    = 4
 LATENT_H    = LATENT_W = 32
-EPOCHS      = 2
+EPOCHS      = 20
 LR          = 1e-4
 DATA_DIR    = "/kaggle/input/minerl-navigate-spliced-120k/preprocessedv2.0"
 
 PROJECT     = "project-ochre"
-RUN_NAME    = "v2.0.4-run2-epoch0"
-MODEL_OUT_PREFIX  = "ochre_v2.0.4"
+RUN_NAME    = "v2.1.0-run6-epoch1.8"
+MODEL_OUT_PREFIX  = "ochre_v2.1.0"
 PREV_HARDCODED_EPOCH = 0
-latest_ckpt = ""
+latest_ckpt = "/kaggle/input/project-ochre/pytorch/default/14/ochre_v2.0.5_epoch_1.8.pt"
 
-LATENT_NOISE = False  # Flag to control latent noise injection
+LATENT_NOISE = True  # Flag to control latent noise injection
 
 # Safety limit: Kaggle runtime cutoff ~12 hours → stop early
 MAX_TRAIN_HOURS = 11.8
@@ -146,7 +146,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         # Log average loss per 1k steps
         if global_step % 1000 == 0 and global_step > 0:
-            avg_loss_10k = loss_10k_sum / 10_000
+            avg_loss_10k = loss_10k_sum / 1000
             print(f"[Step {global_step}] Avg loss (10k): {avg_loss_10k:.4f}")
             wandb.log({"train/avg_loss_10k": avg_loss_10k})
             loss_10k_sum = 0.0

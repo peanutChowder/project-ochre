@@ -36,6 +36,10 @@ Data
 **v2.0.4**
 - Added safety checkpoint saves after final save failed from v2.0.2
 
-***v2.0.5**
+**v2.0.5**
 - Fixed wandb x-axis steps not counted properly due to batched updates
 - Decreased average loss calulation to per 1k steps
+
+**v2.1.0**
+- Enabled latent noise injection
+- Fixed loss/1k steps divisor 
