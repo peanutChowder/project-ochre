@@ -58,6 +58,7 @@ def main():
     p.add_argument("--autowalk", action="store_true")
     p.add_argument("--latent-noise", type=float, default=0.0)
     p.add_argument("--reencode-context", action="store_true")
+    p.add_argument("--normalize-latent", action="store_true", help="Apply latent mean/std normalization each frame")
     args = p.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -133,6 +134,12 @@ def main():
             pred_lat = model(curr_lat.unsqueeze(1), action_vec)
             if args.latent_noise > 0:
                 pred_lat += torch.randn_like(pred_lat) * args.latent_noise
+            # --- Latent normalization ---
+            if args.normalize_latent:
+                with torch.no_grad():
+                    mean, std = pred_lat.mean(), pred_lat.std()
+                    target_std = 1.0  # expected VAE latent scale
+                    pred_lat = (pred_lat - mean) / (std + 1e-6) * target_std
             img = vae.decode(pred_lat).sample
             img = ((img.clamp(-1,1) + 1)/2).cpu()
             frame = (img[0].permute(1,2,0).numpy() * 255).astype(np.uint8)
