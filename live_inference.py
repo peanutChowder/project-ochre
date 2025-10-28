@@ -42,7 +42,7 @@ def build_initial_context_from_image(img_path: str, device, dtype) -> torch.Tens
     return t.unsqueeze(0).to(device=device, dtype=dtype)
 
 def clamp01(x): return max(0.0, min(1.0, float(x)))
-def clamp11(x): return max(-1.0, min(1.0, float(x)))
+def clamp22(x): return max(-2.0, min(2.0, float(x)))
 
 def main():
     p = argparse.ArgumentParser()
@@ -51,10 +51,10 @@ def main():
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--scale", type=int, default=2)
     p.add_argument("--no-mouse", action="store_true")
-    p.add_argument("--mouse-sens", type=float, default=0.25)
-    p.add_argument("--yaw-max-deg", type=float, default=60.0)
-    p.add_argument("--pitch-max-deg", type=float, default=60.0)
-    p.add_argument("--look-gain", type=float, default=1.0)
+    p.add_argument("--mouse-sens", type=float, default=3)
+    p.add_argument("--yaw-max-deg", type=float, default=120.0)
+    p.add_argument("--pitch-max-deg", type=float, default=120.0)
+    p.add_argument("--look-gain", type=float, default=2.0)
     p.add_argument("--autowalk", action="store_true")
     p.add_argument("--latent-noise", type=float, default=0.0)
     p.add_argument("--reencode-context", action="store_true")
@@ -104,18 +104,18 @@ def main():
         return fwd, left, back, right, jump
 
     def get_look_action():
-        if args.no_mouse:
-            keys = pygame.key.get_pressed()
-            yaw = (keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]) * 0.25
-            pitch = (keys[pygame.K_UP] - keys[pygame.K_DOWN]) * 0.25
-            return clamp11(yaw), clamp11(pitch)
-        else:
-            dx, dy = pygame.mouse.get_rel()
-            yaw_deg = np.clip(dx * args.mouse_sens, -args.yaw_max_deg, args.yaw_max_deg)
-            pitch_deg = np.clip(-dy * args.mouse_sens, -args.pitch_max_deg, args.pitch_max_deg)
-            yaw = clamp11((yaw_deg / 180.0) * args.look_gain)
-            pitch = clamp11((pitch_deg / 180.0) * args.look_gain)
-            return yaw, pitch
+        # if args.no_mouse:
+        keys = pygame.key.get_pressed()
+        yaw = (keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]) * 0.75
+        pitch = (keys[pygame.K_UP] - keys[pygame.K_DOWN]) * 0.75
+        return clamp22(yaw), clamp22(pitch)
+        # else:
+        #     dx, dy = pygame.mouse.get_rel()
+        #     yaw_deg = np.clip(dx * args.mouse_sens, -args.yaw_max_deg, args.yaw_max_deg)
+        #     pitch_deg = np.clip(-dy * args.mouse_sens, -args.pitch_max_deg, args.pitch_max_deg)
+        #     yaw = clamp22((yaw_deg / 180.0) * args.look_gain)
+        #     pitch = clamp22((pitch_deg / 180.0) * args.look_gain)
+        #     return yaw, pitch
 
     while running:
         for event in pygame.event.get():
@@ -155,6 +155,9 @@ def main():
         if args.scale != 1:
             surf = pygame.transform.smoothscale(surf, (width, height))
         screen.blit(surf, (0, 0))
+        input_text = f"W:{fwd} A:{left} S:{back} D:{right} Space:{jump} Yaw:{yaw:.2f} Pitch:{pitch:.2f}"
+        text_surface = hud_font.render(input_text, True, (255, 255, 255))
+        screen.blit(text_surface, (10, 10))
         pygame.display.flip()
         clock.tick(args.fps)
 
