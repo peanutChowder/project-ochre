@@ -43,3 +43,10 @@ Data
 **v2.1.0**
 - Enabled latent noise injection
 - Fixed loss/1k steps divisor 
+
+Results:
+- Trained for 1.8 epochs (limited due to training script inefficiency)
+- 0.6 epochs / 12hrs
+- Live inference maintains minecraft-ness much better
+- Live inference eventually collapses to still scene
+- Does not appear to respond to user input
