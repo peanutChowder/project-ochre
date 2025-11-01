@@ -19,7 +19,7 @@ Data
 ### v2.0
 - 1 frame input + yaw/axis data, single frame prediction.
 - Latent noise injection - gaussian noise in inputs to encourage recovery from previous error drift
-- Self-sampling - occasionally using predicted frame 1 as input to predict frame 2 **(Applied after ___ epochs)**
+- Self-sampling - occasionally using predicted frame 1 as input to predict frame 2 applied after **1.2** epochs
 - Removing 1s from start of each mp4 due to sudden teleporting
 
 Data 
@@ -50,3 +50,9 @@ Results:
 - Live inference maintains minecraft-ness much better
 - Live inference eventually collapses to still scene
 - Does not appear to respond to user input
+
+---
+### v3.0
+- n-frame rollout loss - increase across epochs
+- Replaced Gaussian VAE with VQ-VAE trained from scratch to address 64x64 resolution
+- TBD
