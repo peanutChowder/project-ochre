@@ -1,3 +1,8 @@
+"""
+Checklist:
+- Update output model name
+- Update run name
+"""
 import os
 import glob
 from PIL import Image
@@ -21,7 +26,7 @@ except ImportError:
     wandb = None
 
 # Configuration constants for Kaggle environment
-DATA_DIR = '/kaggle/input/dataset'  # Replace with actual dataset path in Kaggle
+DATA_DIR = '/kaggle/input/dataset'  
 EPOCHS = 10
 BATCH_SIZE = 64
 LR = 1e-3
@@ -35,6 +40,7 @@ SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 USE_LPIPS = False
 USE_WANDB = True
+RUN_NAME= ""
 
 
 class Encoder(nn.Module):
@@ -87,9 +93,9 @@ class VectorQuantizerEMA(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
 
-        embedding = torch.randn(embedding_dim, num_embeddings)
+        embedding = torch.randn(embedding_dim, num_embeddings, dtype=torch.float32)
         self.register_buffer('embedding', embedding)
-        self.register_buffer('cluster_size', torch.zeros(num_embeddings))
+        self.register_buffer('cluster_size', torch.zeros(num_embeddings, dtype=torch.float32))
         self.register_buffer('embedding_avg', embedding.clone())
 
     def forward(self, inputs):
@@ -97,56 +103,55 @@ class VectorQuantizerEMA(nn.Module):
         inputs: (B, D, H, W)
         returns: quantized (B, D, H, W), vq_loss, perplexity, encodings
         """
-        # Flatten input to (B*H*W, D)
-        inputs_perm = inputs.permute(0, 2, 3, 1).contiguous()  # (B, H, W, D)
+        inputs_f32 = inputs.float()
+        inputs_perm = inputs_f32.permute(0, 2, 3, 1).contiguous()  # (B, H, W, D)
         flat_input = inputs_perm.view(-1, self.embedding_dim)  # (B*H*W, D)
-
-        # Compute distances to embeddings
         emb = self.embedding
 
         distances = (
             torch.sum(flat_input ** 2, dim=1, keepdim=True)
-            + torch.sum(emb ** 2, dim=0)
-            - 2 * torch.matmul(flat_input, emb)
+            + torch.sum(emb ** 2, dim=0, keepdim=True)
+            - 2.0 * flat_input.matmul(emb)
         )
 
         encoding_indices = torch.argmin(distances, dim=1)  # (B*H*W,)
         encodings = F.one_hot(encoding_indices, self.num_embeddings).type(flat_input.dtype)  # (B*H*W, num_embeddings)
 
-        # Quantize
-        quantized = torch.matmul(encodings, emb.t())  # (B*H*W, D)
-        quantized = quantized.view(inputs_perm.shape)  # (B, H, W, D)
-        quantized = quantized.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        quantized = encodings.float().matmul(emb.t())
+        quantized = quantized.view(inputs_perm.shape).permute(0, 3, 1, 2).contiguous()
+        quantized = quantized.to(inputs.dtype)
 
         if self.training:
-            # EMA cluster size update
-            cluster_size = torch.sum(encodings, dim=0)  # (num_embeddings,)
-            self.cluster_size.data.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
+            with torch.no_grad():
+                enc_f = encodings.float()
+                # EMA cluster sizes
+                batch_cluster = enc_f.sum(0)
+                self.cluster_size.mul_(self.decay).add_(batch_cluster, alpha=1.0 - self.decay)
+                # EMA embedding sums
+                embed_sum = flat_input.t().matmul(enc_f)  # (D, K)
+                self.embedding_avg.mul_(self.decay).add_(embed_sum, alpha=1.0 - self.decay)
+                # Normalize with Laplace smoothing
+                n = self.cluster_size.sum()
+                cluster_size = (self.cluster_size + self.epsilon) / (n + self.num_embeddings * self.epsilon) * n
+                new_emb = self.embedding_avg / cluster_size.unsqueeze(0)
+                self.embedding.copy_(new_emb)
+                # Reseed dead codes from current batch encoder outputs
+                dead_mask = (batch_cluster == 0)
+                if dead_mask.any():
+                    dead_indices = torch.nonzero(dead_mask, as_tuple=False).squeeze(1)
+                    num_dead = dead_indices.numel()
+                    if flat_input.numel() > 0:
+                        rand_ids = torch.randint(0, flat_input.shape[0], (num_dead,), device=flat_input.device)
+                        self.embedding[:, dead_indices] = flat_input[rand_ids].t()
 
-            # EMA embedding average update
-            embed_sum = torch.matmul(flat_input.t(), encodings)  # (D, num_embeddings)
-            self.embedding_avg.data.mul_(self.decay).add_(embed_sum, alpha=1 - self.decay)
-
-            # Laplace smoothing of cluster size
-            n = torch.sum(self.cluster_size.data)
-            cluster_size = (
-                (self.cluster_size.data + self.epsilon)
-                / (n + self.num_embeddings * self.epsilon) * n
-            )
-
-            # Normalize embedding average with smoothed cluster size
-            self.embedding.data.copy_(self.embedding_avg.data / cluster_size.unsqueeze(0))
-
-        # Losses
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        inputs_4loss = inputs_f32
+        e_latent_loss = F.mse_loss(quantized.detach().float(), inputs_4loss)
+        q_latent_loss = F.mse_loss(quantized.float(), inputs_4loss.detach())
         loss = q_latent_loss + self.commitment_cost * e_latent_loss
 
-        # Straight Through Estimator
-        quantized = inputs + (quantized - inputs).detach()
+        quantized = inputs + (quantized.to(inputs.dtype) - inputs).detach()
 
-        # Perplexity
-        avg_probs = torch.mean(encodings, dim=0)
+        avg_probs = torch.mean(encodings.float(), dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
         return quantized, loss, perplexity, encoding_indices
@@ -235,7 +240,7 @@ def main():
     # W&B
     use_wandb = USE_WANDB and (wandb is not None)
     if use_wandb:
-        wandb.init(project="vqvae", config={ #type: ignore
+        wandb.init(project="vqvae", name=RUN_NAME, config={ #type: ignore
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "lr": LR,
@@ -272,6 +277,11 @@ def main():
                     lpips_loss = perceptual_loss_fn(x_recon, x).mean()
                     recon_loss = recon_loss + lpips_loss
                 loss = recon_loss + vq_loss
+
+            if not torch.isfinite(loss):
+                print("⚠️  Skipping batch due to non-finite loss.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -346,8 +356,22 @@ def main():
         os.makedirs(SAVE_DIR, exist_ok=True)
         latest_path = os.path.join(SAVE_DIR, 'vqvae.pt')
         epoch_path = os.path.join(SAVE_DIR, f'vqvae_epoch_{epoch}.pt')
-        torch.save(model.state_dict(), latest_path)
-        torch.save(model.state_dict(), epoch_path)
+        checkpoint = {
+            "epoch": epoch,
+            "encoder": model.encoder.state_dict(),
+            "quantizer": model.vq_vae.state_dict(),
+            "decoder": model.decoder.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": {
+                "embedding_dim": EMBEDDING_DIM,
+                "codebook_size": CODEBOOK_SIZE,
+                "beta": BETA,
+                "ema_decay": EMA_DECAY,
+                "lr": LR,
+            },
+        }
+        torch.save(checkpoint, latest_path)
+        torch.save(checkpoint, epoch_path)
 
         # Save reconstructions
         model.eval()
