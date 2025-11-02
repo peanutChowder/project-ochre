@@ -38,12 +38,16 @@ def main():
     decoder = Decoder().to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
-    if 'encoder' in checkpoint and 'decoder' in checkpoint:
+    if all(k in checkpoint for k in ['encoder', 'quantizer', 'decoder']):
         encoder.load_state_dict(checkpoint['encoder'])
         quantizer.load_state_dict(checkpoint['quantizer'])
         decoder.load_state_dict(checkpoint['decoder'])
+        if 'epoch' in checkpoint:
+            print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+        if 'config' in checkpoint:
+            print(f"Config: {checkpoint['config']}")
     else:
-        # Assume flat state dict (model.state_dict())
+        print("⚠️ Using legacy flat state_dict format")
         combined_model = nn.Module()
         combined_model.encoder = encoder
         combined_model.quantizer = quantizer
