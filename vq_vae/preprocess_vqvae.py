@@ -16,7 +16,10 @@ def extract_frames(input_dir, output_dir, frame_skip):
     total_frames = 0
 
     for video_path in tqdm(video_files, desc="Processing videos"):
+        parent_name = os.path.basename(os.path.dirname(video_path))
         video_name = os.path.splitext(os.path.basename(video_path))[0]
+        safe_prefix = f"{parent_name}_{video_name}"
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"Warning: Could not open video {video_path}, skipping.")
@@ -50,10 +53,13 @@ def extract_frames(input_dir, output_dir, frame_skip):
                 continue
 
             # Save frame as PNG
-            filename = f"{video_name}_{saved_frames}.png"
+            filename = f"{safe_prefix}_{saved_frames}.png"
             filepath = os.path.join(output_dir, filename)
-            cv2.imwrite(filepath, frame)
-            saved_frames += 1
+            success = cv2.imwrite(filepath, frame)
+            if success:
+                saved_frames += 1
+            else:
+                print(f"⚠️ Failed to save {filepath}")
             frame_idx += 1
 
         cap.release()

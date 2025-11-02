@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.amp.grad_scaler import GradScaler
 from torchvision import transforms, utils
 
 try:
@@ -101,17 +102,19 @@ class VectorQuantizerEMA(nn.Module):
         flat_input = inputs_perm.view(-1, self.embedding_dim)  # (B*H*W, D)
 
         # Compute distances to embeddings
+        emb = self.embedding
+
         distances = (
             torch.sum(flat_input ** 2, dim=1, keepdim=True)
-            + torch.sum(self.embedding ** 2, dim=0)
-            - 2 * torch.matmul(flat_input, self.embedding)
-        )  # (B*H*W, num_embeddings)
+            + torch.sum(emb ** 2, dim=0)
+            - 2 * torch.matmul(flat_input, emb)
+        )
 
         encoding_indices = torch.argmin(distances, dim=1)  # (B*H*W,)
         encodings = F.one_hot(encoding_indices, self.num_embeddings).type(flat_input.dtype)  # (B*H*W, num_embeddings)
 
         # Quantize
-        quantized = torch.matmul(encodings, self.embedding.t())  # (B*H*W, D)
+        quantized = torch.matmul(encodings, emb.t())  # (B*H*W, D)
         quantized = quantized.view(inputs_perm.shape)  # (B, H, W, D)
         quantized = quantized.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
 
@@ -232,7 +235,7 @@ def main():
     # W&B
     use_wandb = USE_WANDB and (wandb is not None)
     if use_wandb:
-        wandb.init(project="vqvae", config={
+        wandb.init(project="vqvae", config={ #type: ignore
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "lr": LR,
@@ -245,9 +248,9 @@ def main():
             "num_workers": NUM_WORKERS,
             "use_lpips": USE_LPIPS,
         })
-        wandb.watch(model, log="all")
+        wandb.watch(model, log="all") #type: ignore
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -262,7 +265,7 @@ def main():
         for step, x in enumerate(dataloader, 1):
             x = x.to(device)
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            with torch.autocast('cuda', enabled=(device.type == 'cuda')):
                 x_recon, vq_loss, perplexity, encoding_indices = model(x)
                 recon_loss = F.mse_loss(x_recon, x)
                 if perceptual_loss_fn is not None:
