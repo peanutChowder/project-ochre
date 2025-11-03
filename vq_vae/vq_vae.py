@@ -106,6 +106,7 @@ class VectorQuantizerEMA(nn.Module):
         inputs_f32 = inputs.float()
         inputs_perm = inputs_f32.permute(0, 2, 3, 1).contiguous()  # (B, H, W, D)
         flat_input = inputs_perm.view(-1, self.embedding_dim)  # (B*H*W, D)
+        flat_input = flat_input.clamp(-10.0, 10.0)
         emb = self.embedding
 
         distances = (
@@ -143,6 +144,12 @@ class VectorQuantizerEMA(nn.Module):
                     if flat_input.numel() > 0:
                         rand_ids = torch.randint(0, flat_input.shape[0], (num_dead,), device=flat_input.device)
                         self.embedding[:, dead_indices] = flat_input[rand_ids].t()
+
+                self.embedding.copy_(torch.nan_to_num(self.embedding, nan=0.0, posinf=1e3, neginf=-1e3).clamp_(-3.0, 3.0))
+                self.embedding_avg.copy_(torch.nan_to_num(self.embedding_avg, nan=0.0))
+                self.cluster_size.copy_(torch.nan_to_num(self.cluster_size, nan=0.0))
+
+                        
 
         inputs_4loss = inputs_f32
         e_latent_loss = F.mse_loss(quantized.detach().float(), inputs_4loss)
@@ -270,8 +277,14 @@ def main():
         for step, x in enumerate(dataloader, 1):
             x = x.to(device)
             optimizer.zero_grad()
+
+            # Run quantizer explicitly in float32 (outside autocast) to avoid fp16 overflow.
             with torch.autocast('cuda', enabled=(device.type == 'cuda')):
-                x_recon, vq_loss, perplexity, encoding_indices = model(x)
+                z_e = model.encoder(x)
+                z_e = model.pre_vq_conv(z_e)
+            quantized, vq_loss, perplexity, encoding_indices = model.vq_vae(z_e)
+            with torch.autocast('cuda', enabled=(device.type == 'cuda')):
+                x_recon = model.decoder(quantized)
                 recon_loss = F.mse_loss(x_recon, x)
                 if perceptual_loss_fn is not None:
                     lpips_loss = perceptual_loss_fn(x_recon, x).mean()
@@ -284,6 +297,8 @@ def main():
                 continue
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -299,6 +314,9 @@ def main():
             steps += 1
 
             if step % LOG_EVERY == 0:
+                if steps == 0:
+                    print(f"Epoch {epoch}: no valid steps (all skipped). Skipping averages.")
+                    continue
                 avg_recon = running_recon_loss / steps
                 avg_vq = running_vq_loss / steps
                 avg_total = running_total_loss / steps
@@ -306,9 +324,9 @@ def main():
                 code_usage_frac = len(used_codes) / CODEBOOK_SIZE
                 dead_codes = CODEBOOK_SIZE - len(used_codes)
 
-                # EMA codebook variance: variance of embedding magnitudes
-                embedding_norms = model.vq_vae.embedding.norm(dim=0)
-                ema_codebook_variance = embedding_norms.var().item()
+                emb_safe = torch.nan_to_num(model.vq_vae.embedding, nan=0.0)
+                embedding_norms = emb_safe.norm(dim=0)
+                ema_codebook_variance = torch.nan_to_num(embedding_norms.var(), nan=0.0).item()
 
                 print(f"Epoch {epoch} Step {step} | Recon Loss: {avg_recon:.6f} | VQ Loss: {avg_vq:.6f} | "
                       f"Total Loss: {avg_total:.6f} | Perplexity: {avg_perplexity:.4f} | "
@@ -326,6 +344,10 @@ def main():
                         "ema_codebook_variance": ema_codebook_variance,
                     })
 
+        if steps == 0:
+            print(f"Epoch {epoch}: no valid steps (all skipped). Skipping averages.")
+            continue
+
         # Epoch end logging
         avg_recon = running_recon_loss / steps
         avg_vq = running_vq_loss / steps
@@ -333,8 +355,9 @@ def main():
         avg_perplexity = running_perplexity / steps
         code_usage_frac = len(used_codes) / CODEBOOK_SIZE
         dead_codes = CODEBOOK_SIZE - len(used_codes)
-        embedding_norms = model.vq_vae.embedding.norm(dim=0)
-        ema_codebook_variance = embedding_norms.var().item()
+        emb_safe = torch.nan_to_num(model.vq_vae.embedding, nan=0.0)
+        embedding_norms = emb_safe.norm(dim=0)
+        ema_codebook_variance = torch.nan_to_num(embedding_norms.var(), nan=0.0).item()
 
         print(f"Epoch {epoch} completed. Avg Recon Loss: {avg_recon:.6f} | Avg VQ Loss: {avg_vq:.6f} | "
               f"Avg Total Loss: {avg_total:.6f} | Avg Perplexity: {avg_perplexity:.4f} | "
