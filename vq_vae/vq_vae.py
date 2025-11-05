@@ -41,6 +41,7 @@ NUM_WORKERS = 4
 USE_LPIPS = False
 USE_WANDB = True
 RUN_NAME= ""
+LOAD_FROM_SAVE = ""
 
 
 class Encoder(nn.Module):
@@ -235,6 +236,25 @@ def main():
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
+    start_epoch = 1
+    if (LOAD_FROM_SAVE):
+        print(f"Resuming from checkpoint '{LOAD_FROM_SAVE}'")
+        checkpoint = torch.load(LOAD_FROM_SAVE, map_location=device)
+        try:
+            model.encoder.load_state_dict(checkpoint["encoder"])
+            model.vq_vae.load_state_dict(checkpoint["quantizer"])
+            model.decoder.load_state_dict(checkpoint["decoder"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_epoch = checkpoint["epoch"] + 1
+            saved_lr = checkpoint["config"]["lr"]
+            print(f"Retrieved learning rate '{saved_lr}'")
+            print(f"Successfully loaded checkpoint, beginning training from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}")
+    else:
+        print("No checkpoint found - starting from epoch 0")
+            
+
     # LPIPS loss
     if USE_LPIPS and lpips is not None:
         perceptual_loss_fn = lpips.LPIPS(net='alex').to(device)
@@ -264,7 +284,7 @@ def main():
 
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         running_recon_loss = 0.0
         running_vq_loss = 0.0
