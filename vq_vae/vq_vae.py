@@ -2,6 +2,7 @@
 Checklist:
 - Update output model name
 - Update run name
+- Update checkpoint path
 """
 import os
 import glob
