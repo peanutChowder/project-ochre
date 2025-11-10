@@ -36,24 +36,16 @@ def _safe_linspace_idx(count_from: int, count_to: int, n: int) -> np.ndarray:
     return np.clip(idx, 0, max(count_to - 1, 0))
 
 def build_action_matrix(d):
-    """Combine action$* arrays into a [T,7] float32 matrix.
+    """Combine MineRL camera + WASD actions into a [T,4] float32 matrix.
 
-    Columns: [forward, left, back, right, jump, yaw, pitch]
-    where yaw/pitch are scaled deltas per step (approximately degrees/180).
+    Columns: [yaw, pitch, move_x, move_z]
+    - yaw/pitch are scaled to [-1,1] range (degrees/15)
+    - move_x = right - left, move_z = forward - back
     """
-    camera = d["action$camera"]  # shape (T, 2) [pitch, yaw]
-    return np.stack(
-        [
-            d["action$forward"],
-            d["action$left"],
-            d["action$back"],
-            d["action$right"],
-            d["action$jump"],
-            np.clip(camera[:, 1] / 180.0, -1, 1),  # yaw
-            np.clip(camera[:, 0] / 180.0, -1, 1),  # pitch
-        ],
-        axis=1,
-    ).astype(np.float32)
+    cam = np.clip(d["action$camera"], -15.0, 15.0) / 15.0
+    move_x = d["action$right"] - d["action$left"]
+    move_z = d["action$forward"] - d["action$back"]
+    return np.stack([cam[:, 1], cam[:, 0], move_x, move_z], axis=1).astype(np.float32)
 
 def load_vqvae(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -166,11 +158,10 @@ def process_trajectory(
         s0, s1 = kept_states[i], kept_states[i + 1]
         window = per_step_actions[s0:s1]
         if window.shape[0] == 0:
-            agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(7, dtype=np.float32))
+            agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(4, dtype=np.float32))
             continue
-        movement = np.max(window[:, 0:5], axis=0)
-        camera = np.mean(window[:, 5:7], axis=0)
-        agg_actions.append(np.concatenate([movement, camera]).astype(np.float32))
+        pooled = np.mean(window, axis=0)
+        agg_actions.append(pooled.astype(np.float32))
     actions = np.stack(agg_actions, axis=0)
 
     assert actions.shape[0] == len(kept_frames) - 1, (
