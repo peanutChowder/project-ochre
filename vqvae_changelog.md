@@ -23,7 +23,9 @@ Results:
 ### v1.0.1
 - Gradient clipping set to a maximum norm of 1.0 to stabilize training.
 
-Results:
+Results after 10 epochs ~30min:
 - Rapid descent across all loss metrics + perplexity in epoch 1-2
 - Gradual minor loss + perplexity metric increases in epoch 3-10
 
+Results after 10 more epochs, LPIPS enabled
+- No visually discernible difference. Images still have a pixelated blur, likely due to MSE. Future training should encourage sharpness in pixels.
