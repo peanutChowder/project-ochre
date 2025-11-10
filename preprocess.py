@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Preprocess MineRL Navigate dataset.
+Preprocess MineRL Navigate dataset for autoregressive training.
 
-For every subfolder inside --parent_dir that contains
-  recording.mp4 + rendered.npz:
-    * read frames from mp4
-    * read action arrays from npz
-    * downsample to target FPS
-    * resize to target size
-    * encode frames to discrete tokens using TinyVQ-VAE
-    * save full trajectory tokens and actions as compressed npz in --out_dir
+For each subfolder with recording.mp4 + rendered.npz:
+  - Align actions to frames via step→frame mapping (uses metadata duration when available).
+  - Downsample in step space to target FPS and resize frames.
+  - Encode frames to discrete codes using your trained VQ‑VAE in vq_vae/checkpoints.
+  - Save one .npz per trajectory with:
+      tokens: [K, H, W] uint16 (K kept frames; H=W≈16 for 64×64 inputs)
+      actions: [K−1, 7] float32 (WASD+jump max‑pooled; yaw/pitch averaged)
+  - Write out_dir/manifest.json with per‑trajectory lengths to enforce boundaries when sampling sequences.
 
-Note: Each MP4 file is processed as a full trajectory, not split into shorter sequences.
+This avoids mid‑training VQ‑VAE encodes. For n‑step autoregressive loss, sample within a single
+trajectory file using manifest lengths so you never cross video boundaries.
 """
 
 import argparse, os, json, numpy as np
@@ -20,8 +21,7 @@ from PIL import Image
 from tqdm import tqdm
 import imageio.v3 as iio
 import torch
-from taming.models.vqgan import VQModel
-from huggingface_hub import hf_hub_download
+from vq_vae.vq_vae import Encoder, VectorQuantizerEMA
 
 def _safe_linspace_idx(count_from: int, count_to: int, n: int) -> np.ndarray:
     """Integer index mapping by rounding linspace.
@@ -55,14 +55,40 @@ def build_action_matrix(d):
         axis=1,
     ).astype(np.float32)
 
+def load_vqvae(checkpoint_path: str, device: torch.device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    emb_dim = 256
+    num_emb = 2048
+    if isinstance(ckpt, dict):
+        if "quantizer" in ckpt and isinstance(ckpt["quantizer"], dict):
+            emb = ckpt["quantizer"].get("embedding")
+            if isinstance(emb, torch.Tensor) and emb.ndim == 2:
+                emb_dim, num_emb = int(emb.shape[0]), int(emb.shape[1])
+        cfg = ckpt.get("config") or {}
+        emb_dim = int(cfg.get("embedding_dim", emb_dim))
+        num_emb = int(cfg.get("num_embeddings", num_emb))
+    enc = Encoder(3, embedding_dim=emb_dim).to(device)
+    quant = VectorQuantizerEMA(embedding_dim=emb_dim, num_embeddings=num_emb).to(device)
+    if isinstance(ckpt, dict) and all(k in ckpt for k in ["encoder", "quantizer"]):
+        enc.load_state_dict(ckpt["encoder"]) 
+        quant.load_state_dict(ckpt["quantizer"]) 
+    else:
+        tmp = torch.nn.Module(); tmp.encoder = enc; tmp.quantizer = quant
+        tmp.load_state_dict(ckpt, strict=False)
+    enc.eval(); quant.eval()
+    return enc, quant
+
+
 def process_trajectory(
     traj_dir: Path,
     out_dir: Path,
-    vq,
+    encoder,
+    quantizer,
     device,
     fps_target: int = 8,
     size: int = 64,
     skip_sec: float = 0.0,
+    encode_batch: int = 64,
 ) -> int:
     """
     Process a single trajectory directory.
@@ -158,13 +184,19 @@ def process_trajectory(
         im = im.resize((size, size), Image.BICUBIC)
         resized[i] = np.asarray(im, dtype=np.uint8)
 
-    # ---- Encode frames to discrete tokens using TinyVQ-VAE ----
-    vq.eval()
+    # ---- Encode frames to discrete tokens using trained VQ-VAE ----
+    tokens_list = []
+    encoder.eval(); quantizer.eval()
     with torch.no_grad():
-        batch = torch.from_numpy(resized).permute(0,3,1,2).float() / 255.0
-        batch = batch.to(device, dtype=vq.dtype)
-        codes = vq.encode(batch)  # expected shape: [T, H, W] discrete tokens
-        tokens = codes.cpu().numpy().astype(np.uint16)
+        for i in range(0, T, encode_batch):
+            chunk = torch.from_numpy(resized[i:i+encode_batch]).permute(0,3,1,2).float() / 255.0
+            chunk = chunk.to(device)
+            z_e = encoder(chunk)
+            _, _, _, enc_idx = quantizer(z_e)
+            H, W = z_e.shape[2], z_e.shape[3]
+            enc_idx = enc_idx.view(-1, H, W)
+            tokens_list.append(enc_idx.cpu().to(torch.int32))
+    tokens = torch.cat(tokens_list, dim=0).numpy().astype(np.uint16)
 
     # ---- Save full trajectory tokens and actions ----
     out_name = f"{traj_dir.name}.npz"
@@ -180,19 +212,16 @@ def process_trajectory(
 def main(parent_dir: str,
          out_dir: str,
          fps_target: int = 8,
-         size: int = 256,
-         skip_sec: float = 0.0):
+         size: int = 64,
+         skip_sec: float = 0.0,
+         vqvae_ckpt: str = "vq_vae/checkpoints/vqvae_epoch_10.pt",
+         encode_batch: int = 64):
     parent = Path(parent_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Download config and checkpoint from Hugging Face hub
-    config_path = hf_hub_download(repo_id="dalle-mini/vqgan_imagenet_f16_16384", filename="config.json")
-    checkpoint_path = hf_hub_download(repo_id="dalle-mini/vqgan_imagenet_f16_16384", filename="flax_model.msgpack")
-
-    vq = VQModel(config_path=config_path, ckpt_path=checkpoint_path).to(device)
+    encoder, quantizer = load_vqvae(vqvae_ckpt, device)
 
     trajs = [p for p in parent.iterdir()
              if p.is_dir() and (p / "rendered.npz").exists()
@@ -203,14 +232,28 @@ def main(parent_dir: str,
         total += process_trajectory(
             traj,
             out,
-            vq=vq,
+            encoder=encoder,
+            quantizer=quantizer,
             device=device,
             fps_target=fps_target,
             size=size,
             skip_sec=skip_sec,
+            encode_batch=encode_batch,
         )
     print(f"\nProcessed {len(trajs)} trajectories")
     print(f"Saved {total} sequences to {out}")
+    # Emit a manifest summarizing per-trajectory sequence lengths
+    manifest = []
+    for traj in trajs:
+        out_name = f"{traj.name}.npz"
+        op = out / out_name
+        if op.exists():
+            try:
+                z = np.load(op)
+                manifest.append({"file": out_name, "length": int(z["tokens"].shape[0])})
+            except Exception:
+                pass
+    (out / "manifest.json").write_text(json.dumps({"sequences": manifest}, indent=2))
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -224,5 +267,9 @@ if __name__ == "__main__":
                    help="Output frame size (default 64)")
     p.add_argument("--skip_sec", type=float, default=0.0,
                    help="Skip this many seconds at start (proportional)")
+    p.add_argument("--vqvae_ckpt", type=str, default="vq_vae/checkpoints/vqvae_epoch_10.pt",
+                   help="Path to trained VQ-VAE checkpoint for encoding frames")
+    p.add_argument("--encode_batch", type=int, default=64,
+                   help="Batch size for VQ-VAE encoding")
     args = p.parse_args()
     main(**vars(args))
