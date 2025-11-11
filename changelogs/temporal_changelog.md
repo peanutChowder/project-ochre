@@ -53,6 +53,27 @@ Results:
 
 ---
 ### v3.0
-- n-frame rollout loss - increase across epochs
-- Replaced Gaussian VAE with VQ-VAE trained from scratch to address 64x64 resolution
-- TBD
+Dataset:
+- Overhauled preprocessing and alignment; do not assume fixed 20 FPS.
+- Use metadata.json (duration_ms, duration_steps) + decoded MP4 frames to map steps→frames via linspace.
+- Downsample in step space to target FPS; aggregate actions between kept frames.
+- Replaced Gaussian VAE with our trained VQ‑VAE (vq_vae/checkpoints) at 64×64.
+
+Preprocessing (preprocess.py):
+- Outputs per‑trajectory .npz with:
+  - tokens: [K, 16, 16] uint16 VQ‑VAE code indices for kept frames
+  - actions: [K−1, 4] float32 = [yaw, pitch, move_x, move_z]
+- Action aggregation per window (kept_state[i]→kept_state[i+1]):
+  - yaw/pitch: mean of MineRL camera deltas; clipped to ±15° and scaled to [-1,1]
+  - move_x = right − left, move_z = forward − back (averaged)
+- Emits manifest.json with [{file, length=K}] for boundary‑safe sampling.
+- Guarantees len(actions) = len(tokens) − 1 and strict per‑video boundaries.
+
+Utilities:
+- Added align_check.py to verify alignment counts and preview aggregated actions.
+- inspect_npz.py retained for quick introspection.
+
+Training (train.py + model):
+- Autoregressive multi‑step rollout loss with curriculum unroll (BASE_SEQ_LEN->MAX_SEQ_LEN).
+- Dataset samples n‑length windows strictly within a single trajectory using manifest boundaries.
+- Model conditions a ConvGRU token predictor via FiLM on 4D actions; codebook size matches VQ‑VAE (default 2048).

@@ -8,7 +8,7 @@ For each subfolder with recording.mp4 + rendered.npz:
   - Encode frames to discrete codes using your trained VQ‑VAE in vq_vae/checkpoints.
   - Save one .npz per trajectory with:
       tokens: [K, H, W] uint16 (K kept frames; H=W≈16 for 64×64 inputs)
-      actions: [K−1, 7] float32 (WASD+jump max‑pooled; yaw/pitch averaged)
+      actions: [K−1, 4] float32 = [yaw, pitch, move_x, move_z]
   - Write out_dir/manifest.json with per‑trajectory lengths to enforce boundaries when sampling sequences.
 
 This avoids mid‑training VQ‑VAE encodes. For n‑step autoregressive loss, sample within a single
