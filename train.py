@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, time, json, numpy as np, torch
+import os, time, json, math, numpy as np, torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import wandb
@@ -100,16 +100,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
         logits_list = model(Z_seq, A_seq, return_all=True)
         step_losses = []
         for t, logits in enumerate(logits_list):
-            loss_t = F.cross_entropy(
-                logits.view(-1, logits.size(1)),  # flatten spatial grid
-                Z_target_seq[:, t].reshape(-1)
-            )
+            # Flatten spatial + batch to N, keep class dimension as C
+            logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, logits.size(1))
+            target_flat = Z_target_seq[:, t].reshape(-1)
+            loss_t = F.cross_entropy(logits_flat, target_flat)
             step_losses.append(loss_t)
 
         loss = torch.stack(step_losses).mean()
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         total_loss += loss.item()
