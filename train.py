@@ -116,11 +116,47 @@ for epoch in range(start_epoch, EPOCHS + 1):
         global_step += 1
 
         if global_step % 50 == 0:
-            wandb.log({"train/loss": loss.item(), "seq_len": seq_len}, step=global_step)
+            # Perplexity estimates (in nats -> exp(loss))
+            loss_first = step_losses[0].item()
+            loss_last = step_losses[-1].item()
+            ppl = math.exp(loss.item())
+            ppl_first = math.exp(loss_first)
+            ppl_last = math.exp(loss_last)
+
+            # Last-step token accuracy and entropy for quick health signal
+            with torch.no_grad():
+                last_logits = logits_list[-1]
+                last_target = Z_target_seq[:, -1]
+                pred_last = last_logits.argmax(dim=1)
+                acc_last = (pred_last == last_target).float().mean().item()
+                p_last = torch.softmax(last_logits, dim=1)
+                # Sum over class dim, then mean over batch and spatial dims
+                entropy_last = (-p_last * torch.log(torch.clamp(p_last, min=1e-9))).sum(dim=1).mean().item()
+                conf_last = p_last.max(dim=1).values.mean().item()
+
+            lr = optimizer.param_groups[0].get("lr", 0.0)
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/ppl": ppl,
+                "train/loss_first": loss_first,
+                "train/loss_last": loss_last,
+                "train/ppl_first": ppl_first,
+                "train/ppl_last": ppl_last,
+                "train/acc_last": acc_last,
+                "train/entropy_last": entropy_last,
+                "train/conf_last": conf_last,
+                "train/grad_norm": float(grad_norm),
+                "seq_len": seq_len,
+                "lr": lr,
+            }, step=global_step)
 
     epoch_loss = total_loss / len(loader)
     print(f"Epoch {epoch}: mean loss {epoch_loss:.4f}")
-    wandb.log({"epoch": epoch, "mean_loss": epoch_loss})
+    wandb.log({
+        "epoch": epoch,
+        "mean_loss": epoch_loss,
+        "mean_ppl": math.exp(epoch_loss),
+    })
 
     torch.save({
         "epoch": epoch,
