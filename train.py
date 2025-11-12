@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
+"""
+Checklist:
+- Update output model name
+- Update run name
+- update vqvae checkpoint
+- update world model checkpoint
+"""
 import os, time, json, math, numpy as np, torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import wandb
+from model_convGru import WorldModelConvFiLM
 
 # ---------- CONFIG ----------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DATA_DIR = "/kaggle/input/project-ochre/preprocessedv3.0"
+DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 BATCH_SIZE = 4
 BASE_SEQ_LEN = 4      # initial context
@@ -59,12 +67,6 @@ class MineRLTokenDataset(Dataset):
             torch.tensor(Z_target_seq, dtype=torch.long),
         )
 
-# instantiate dataset + loader
-dataset = MineRLTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=BASE_SEQ_LEN)
-loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                     num_workers=2, pin_memory=True)
-print(f"Dataset loaded: {len(dataset)} sequence windows.")
-
 # ---------- MODEL ----------
 model = WorldModelConvFiLM().to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -90,8 +92,22 @@ for epoch in range(start_epoch, EPOCHS + 1):
     seq_len = BASE_SEQ_LEN
     if CURRICULUM_UNROLL:
         seq_len = min(BASE_SEQ_LEN + (epoch // 5), MAX_SEQ_LEN)
-        loader.dataset.seq_len = seq_len
-        print(f"🧩 Curriculum unrolling active → seq_len = {seq_len}")
+    print(f"🧩 Curriculum unrolling active → seq_len = {seq_len}")
+
+    # Rebuild dataset and DataLoader each epoch to avoid stale worker state when seq_len changes
+    dataset = MineRLTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
+    if len(dataset) == 0:
+        print(f"Warning: No sequences available for seq_len={seq_len}. Skipping epoch {epoch}.")
+        continue
+    loader  = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=(DEVICE == "cuda"),
+        persistent_workers=False,
+    )
+    print(f"Dataset loaded: {len(dataset)} sequence windows.")
 
     for batch_idx, batch in enumerate(loader):
         Z_seq, A_seq, Z_target_seq = [x.to(DEVICE) for x in batch]
@@ -130,7 +146,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 pred_last = last_logits.argmax(dim=1)
                 acc_last = (pred_last == last_target).float().mean().item()
                 p_last = torch.softmax(last_logits, dim=1)
-                # Sum over class dim, then mean over batch and spatial dims
                 entropy_last = (-p_last * torch.log(torch.clamp(p_last, min=1e-9))).sum(dim=1).mean().item()
                 conf_last = p_last.max(dim=1).values.mean().item()
 
