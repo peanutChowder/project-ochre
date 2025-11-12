@@ -180,6 +180,29 @@ class VQVAE(nn.Module):
         quantized, vq_loss, perplexity, encoding_indices = self.vq_vae(z_e)
         x_recon = self.decoder(quantized)
         return x_recon, vq_loss, perplexity, encoding_indices
+    
+    def decode_code(self, code_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Decode from discrete code indices back into an RGB image.
+        code_indices: (B, H, W) or (H, W)
+        Returns (B, 3, 64, 64) in [0,1]
+        """
+        if code_indices.dim() == 2:
+            code_indices = code_indices.unsqueeze(0)
+        elif code_indices.dim() == 3 and code_indices.size(0) == 1:
+            # ensure consistent dtype and batch dimension
+            code_indices = code_indices.clone()
+        else:
+            raise ValueError(f"Unexpected shape for code_indices: {tuple(code_indices.shape)}")
+
+        code_indices = code_indices.long()  # ensure integer indices
+        emb = self.vq_vae.embedding  # (D, K)
+        # F.embedding expects (...,) and adds trailing dimension D
+        z_q = F.embedding(code_indices, emb.t())  # (B, H, W, D)
+        if z_q.dim() == 3:  # safety fallback if batch dim squeezed
+            z_q = z_q.unsqueeze(0)
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        return self.decoder(z_q)
 
 
 class FlatFolderDataset(Dataset):

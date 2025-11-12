@@ -1,167 +1,157 @@
 #!/usr/bin/env python3
 """
-Live interactive inference for 1→1 temporal transformer (single-frame model).
+Live interactive inference for the Ochre world model (VQ‑VAE + WorldModelConvFiLM).
 
-Controls (default):
-  - W/A/S/D: forward/left/back/right (binary 0/1)
-  - Space: jump (binary 0/1)
-  - Mouse move: yaw (dx) and pitch (dy) scaled to [-1, 1]
-  - Arrow keys (fallback if --no-mouse): Left/Right -> yaw, Up/Down -> pitch
+Controls:
+  - W/A/S/D: movement (binary)
+  - Mouse move: yaw (dx) and pitch (dy) → normalized to [-1, 1]
+  - Arrow keys: fallback for yaw/pitch if mouse is disabled
   - Esc or Q: quit
 """
 
-import argparse, sys, time
-import numpy as np
-import torch
-from PIL import Image
-from diffusers import AutoencoderKL
-print("Imported AutoencoderKL")
-from model_temporal import TemporalTransformer
-print("Imported TemporalTransformer")
+import argparse, os, time, numpy as np, torch, pygame
+from vq_vae.vq_vae import VQVAE
+from model_convGru import WorldModelConvFiLM
+
+# ---------------------- Constants ----------------------
+FRAME_SIZE = 64
+LATENT_H = LATENT_W = 16
+CTX_LEN = 6  # rolling token/action window
 
 
-# ---------------------- Config ----------------------
-LATENT_C  = 4
-LATENT_H  = LATENT_W = 32
-FRAME_SIZE = 256  # model’s training size
+def load_vqvae(vqvae_ckpt: str, device: torch.device) -> VQVAE:
+    ckpt = torch.load(vqvae_ckpt, map_location=device)
+    vqvae = VQVAE(
+        embedding_dim=ckpt["config"]["embedding_dim"],
+        num_embeddings=ckpt["config"]["codebook_size"],
+        commitment_cost=ckpt["config"]["beta"],
+        decay=ckpt["config"]["ema_decay"],
+    ).to(device)
+    vqvae.encoder.load_state_dict(ckpt["encoder"])  # not used here, but kept for completeness
+    vqvae.decoder.load_state_dict(ckpt["decoder"])
+    vqvae.vq_vae.load_state_dict(ckpt["quantizer"])  # codebook
+    vqvae.eval()
+    return vqvae
 
-def try_load_state_dict(model: torch.nn.Module, checkpoint_path: str, device: torch.device):
-    data = torch.load(checkpoint_path, map_location=device)
+
+def try_load_state_dict(model: torch.nn.Module, path: str, device: torch.device):
+    data = torch.load(path, map_location=device)
     if isinstance(data, dict) and "model_state" in data:
         model.load_state_dict(data["model_state"])
     else:
         model.load_state_dict(data)
+    print(f"✅ Loaded world model from {path}")
 
-    print("Loaded model")
 
-def build_initial_context_from_image(img_path: str, device, dtype) -> torch.Tensor:
-    """Load an RGB image, resize, normalize to [0,1], return [1,3,H,W]."""
-    init_img = Image.open(img_path).convert("RGB").resize((FRAME_SIZE, FRAME_SIZE))
-    arr = np.array(init_img, dtype=np.uint8)
-    t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
-    return t.unsqueeze(0).to(device=device, dtype=dtype)
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
-def clamp01(x): return max(0.0, min(1.0, float(x)))
-def clamp22(x): return max(-2.0, min(2.0, float(x)))
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True, help="Path to trained .pt checkpoint")
-    p.add_argument("--start_image", required=True, help="Seed image to bootstrap initial frame")
+    p.add_argument("--checkpoint", required=True, help="WorldModelConvFiLM checkpoint (.pt)")
+    p.add_argument("--vqvae_ckpt", required=True, help="Trained VQ‑VAE checkpoint (.pt)")
+    p.add_argument("--context_npz", help="Optional preprocessed .npz providing initial tokens/actions")
     p.add_argument("--fps", type=int, default=8)
-    p.add_argument("--scale", type=int, default=2)
-    p.add_argument("--no-mouse", action="store_true")
-    p.add_argument("--mouse-sens", type=float, default=3)
-    p.add_argument("--yaw-max-deg", type=float, default=120.0)
-    p.add_argument("--pitch-max-deg", type=float, default=120.0)
-    p.add_argument("--look-gain", type=float, default=2.0)
-    p.add_argument("--autowalk", action="store_true")
-    p.add_argument("--latent-noise", type=float, default=0.0)
-    p.add_argument("--reencode-context", action="store_true")
-    p.add_argument("--normalize-latent", action="store_true", help="Apply latent mean/std normalization each frame")
+    p.add_argument("--scale", type=int, default=8)
+    p.add_argument("--no_mouse", action="store_true", help="Disable mouse look; use arrow keys instead")
+    p.add_argument("--mouse_sens", type=float, default=60.0, help="Divisor for mouse dx/dy → [-1,1]")
     args = p.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    dtype = torch.float32
-    print(f"Live inference on {device}, target {args.fps} FPS")
+    print(f"Live inference on {device} @ {args.fps} FPS")
 
     # --- Load models ---
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype).to(device)
-    vae.eval()
-
-    model = TemporalTransformer(latent_channels=LATENT_C, H=LATENT_H, W=LATENT_W).to(device)
+    vqvae = load_vqvae(args.vqvae_ckpt, device)
+    model = WorldModelConvFiLM().to(device)
     try_load_state_dict(model, args.checkpoint, device)
     model.eval()
 
-    # --- Prepare initial frame ---
-    init_img = build_initial_context_from_image(args.start_image, device, dtype)
-    with torch.no_grad():
-        curr_lat = vae.encode(init_img).latent_dist.sample()  # [1,4,32,32]
+    # --- Initialize rolling context (tokens/actions) ---
+    if args.context_npz and os.path.exists(args.context_npz):
+        data = np.load(args.context_npz)
+        tokens = torch.tensor(data["tokens"], dtype=torch.long, device=device)  # (T,16,16)
+        actions = torch.tensor(data["actions"], dtype=torch.float32, device=device)  # (T,4)
+        if tokens.size(0) >= CTX_LEN:
+            Z_seq = tokens[:CTX_LEN].unsqueeze(0)  # (1,K,16,16)
+        else:
+            pad = CTX_LEN - tokens.size(0)
+            Z_seq = torch.cat([tokens, torch.randint(0, 2048, (pad, LATENT_H, LATENT_W), device=device)], dim=0).unsqueeze(0)
+        if actions.size(0) >= CTX_LEN:
+            A_seq = actions[:CTX_LEN].unsqueeze(0)  # (1,K,4)
+        else:
+            pad = CTX_LEN - actions.size(0)
+            A_seq = torch.cat([actions, torch.zeros(pad, 4, device=device)], dim=0).unsqueeze(0)
+        print(f"Seeded from {args.context_npz}")
+    else:
+        Z_seq = torch.randint(0, 2048, (1, CTX_LEN, LATENT_H, LATENT_W), device=device)
+        A_seq = torch.zeros((1, CTX_LEN, 4), device=device)
+        print("⚠️ No context provided — starting from random tokens")
 
-    # --- Setup display/input ---
-    import pygame
+    # --- Pygame setup ---
     pygame.init()
     width, height = FRAME_SIZE * args.scale, FRAME_SIZE * args.scale
     screen = pygame.display.set_mode((width, height))
-    pygame.display.set_caption("Live Model Inference")
+    pygame.display.set_caption("Project Ochre — Live Inference")
     clock = pygame.time.Clock()
     pygame.font.init()
-    hud_font = pygame.font.SysFont("Arial", max(10, int(12 * args.scale * 0.6)))
+    hud_font = pygame.font.SysFont("Arial", max(10, int(10 * args.scale / 5)))
+
     if not args.no_mouse:
         pygame.event.set_grab(True)
         pygame.mouse.set_visible(False)
-        pygame.mouse.get_rel()
+        pygame.mouse.get_rel()  # reset relative motion accumulator
+
+    def get_action_vec():
+        keys = pygame.key.get_pressed()
+        move_x = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
+        move_z = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
+        if args.no_mouse:
+            yaw = (float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT]))
+            pitch = (float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN]))
+            yaw = clamp(yaw, -1.0, 1.0)
+            pitch = clamp(pitch, -1.0, 1.0)
+        else:
+            dx, dy = pygame.mouse.get_rel()
+            yaw = clamp(dx / args.mouse_sens, -1.0, 1.0)
+            pitch = clamp(-dy / args.mouse_sens, -1.0, 1.0)
+        return [yaw, pitch, move_x, move_z]
+
+    print("🎮 W/A/S/D to move, mouse to look (or arrows), ESC/Q to quit")
 
     running = True
-
-    def get_keyboard_action():
-        keys = pygame.key.get_pressed()
-        fwd = 1.0 if (args.autowalk or keys[pygame.K_w]) else 0.0
-        left = 1.0 if keys[pygame.K_a] else 0.0
-        back = 1.0 if keys[pygame.K_s] else 0.0
-        right = 1.0 if keys[pygame.K_d] else 0.0
-        jump = 1.0 if keys[pygame.K_SPACE] else 0.0
-        return fwd, left, back, right, jump
-
-    def get_look_action():
-        # if args.no_mouse:
-        keys = pygame.key.get_pressed()
-        yaw = (keys[pygame.K_RIGHT] - keys[pygame.K_LEFT]) * 0.75
-        pitch = (keys[pygame.K_UP] - keys[pygame.K_DOWN]) * 0.75
-        return clamp22(yaw), clamp22(pitch)
-        # else:
-        #     dx, dy = pygame.mouse.get_rel()
-        #     yaw_deg = np.clip(dx * args.mouse_sens, -args.yaw_max_deg, args.yaw_max_deg)
-        #     pitch_deg = np.clip(-dy * args.mouse_sens, -args.pitch_max_deg, args.pitch_max_deg)
-        #     yaw = clamp22((yaw_deg / 180.0) * args.look_gain)
-        #     pitch = clamp22((pitch_deg / 180.0) * args.look_gain)
-        #     return yaw, pitch
-
     while running:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q): running = False
-                elif event.key == pygame.K_n: args.latent_noise = 0.25 if args.latent_noise == 0 else 0.0
-                elif event.key == pygame.K_r: args.reencode_context = not args.reencode_context
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                running = False
 
-        fwd, left, back, right, jump = get_keyboard_action()
-        yaw, pitch = get_look_action()
-        action_vec = torch.tensor([[[fwd, left, back, right, jump, yaw, pitch]]],
-                                  device=device, dtype=dtype)
+        act = get_action_vec()
+        A_seq = torch.cat([A_seq[:, 1:], torch.tensor([[act]], device=device)], dim=1)  # (1,K,4)
 
         with torch.no_grad():
-            pred_lat = model(curr_lat.unsqueeze(1), action_vec)
-            if args.latent_noise > 0:
-                pred_lat += torch.randn_like(pred_lat) * args.latent_noise
-            # --- Latent normalization ---
-            if args.normalize_latent:
-                with torch.no_grad():
-                    mean, std = pred_lat.mean(), pred_lat.std()
-                    target_std = 1.0  # expected VAE latent scale
-                    pred_lat = (pred_lat - mean) / (std + 1e-6) * target_std
-            img = vae.decode(pred_lat).sample
-            img = ((img.clamp(-1,1) + 1)/2).cpu()
-            frame = (img[0].permute(1,2,0).numpy() * 255).astype(np.uint8)
+            logits = model(Z_seq, A_seq)               # (B,2048,16,16)
+            pred_tokens = logits.argmax(dim=1)         # (B,16,16)
+            frame = vqvae.decode_code(pred_tokens)[0]  # (3,64,64)
+            img = (frame.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-        if args.reencode_context:
-            with torch.no_grad():
-                fr_t = torch.from_numpy(frame).permute(2,0,1).unsqueeze(0).float().to(device)/255.0
-                curr_lat = vae.encode(fr_t).latent_dist.sample()
-        else:
-            curr_lat = pred_lat.squeeze(1)
+        # update token window
+        Z_seq = torch.cat([Z_seq[:, 1:], pred_tokens.unsqueeze(1)], dim=1)
 
-        surf = pygame.image.frombuffer(frame.tobytes(), (FRAME_SIZE, FRAME_SIZE), "RGB")
+        # draw
+        surf = pygame.image.frombuffer(img.tobytes(), (FRAME_SIZE, FRAME_SIZE), "RGB")
         if args.scale != 1:
             surf = pygame.transform.smoothscale(surf, (width, height))
         screen.blit(surf, (0, 0))
-        input_text = f"W:{fwd} A:{left} S:{back} D:{right} Space:{jump} Yaw:{yaw:.2f} Pitch:{pitch:.2f}"
-        text_surface = hud_font.render(input_text, True, (255, 255, 255))
-        screen.blit(text_surface, (10, 10))
+        hud = f"Yaw:{act[0]:+.2f} Pitch:{act[1]:+.2f} MX:{act[2]:+.1f} MZ:{act[3]:+.1f}"
+        screen.blit(hud_font.render(hud, True, (255, 255, 255)), (10, 10))
         pygame.display.flip()
         clock.tick(args.fps)
 
     pygame.quit()
+    print("✅ Exited live session")
+
 
 if __name__ == "__main__":
     main()
