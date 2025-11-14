@@ -5,7 +5,7 @@ Live interactive inference for the Ochre world model (VQ‑VAE + WorldModelConvF
 Controls:
   - W/A/S/D: movement (binary)
   - Mouse move: yaw (dx) and pitch (dy) → normalized to [-1, 1]
-  - Arrow keys: fallback for yaw/pitch if mouse is disabled
+  - Arrow keys: look yaw/pitch 
   - Esc or Q: quit
 """
 
@@ -56,6 +56,7 @@ def main():
     p.add_argument("--scale", type=int, default=8)
     p.add_argument("--no_mouse", action="store_true", help="Disable mouse look; use arrow keys instead")
     p.add_argument("--mouse_sens", type=float, default=60.0, help="Divisor for mouse dx/dy → [-1,1]")
+    p.add_argument("--key_look_gain", type=float, default=0.5, help="Arrow key look gain added to yaw/pitch")
     args = p.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -106,18 +107,22 @@ def main():
         keys = pygame.key.get_pressed()
         move_x = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
         move_z = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
+        # Arrow keys contribute to look regardless of mouse mode
+        key_yaw = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
+        key_pitch = float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN])
+
         if args.no_mouse:
-            yaw = (float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT]))
-            pitch = (float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN]))
-            yaw = clamp(yaw, -1.0, 1.0)
-            pitch = clamp(pitch, -1.0, 1.0)
+            # Arrow-only look
+            yaw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
+            pitch = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
         else:
+            # Combine mouse and arrow key look
             dx, dy = pygame.mouse.get_rel()
-            yaw = clamp(dx / args.mouse_sens, -1.0, 1.0)
-            pitch = clamp(-dy / args.mouse_sens, -1.0, 1.0)
+            yaw = clamp((dx / args.mouse_sens) + (key_yaw * args.key_look_gain), -1.0, 1.0)
+            pitch = clamp((-dy / args.mouse_sens) + (key_pitch * args.key_look_gain), -1.0, 1.0)
         return [yaw, pitch, move_x, move_z]
 
-    print("🎮 W/A/S/D to move, mouse to look (or arrows), ESC/Q to quit")
+    print("🎮 W/A/S/D move • Mouse/Arrows look • ESC/Q quit")
 
     running = True
     while running:
