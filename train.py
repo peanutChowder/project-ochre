@@ -10,7 +10,6 @@ import os, time, json, math, numpy as np, torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import wandb
-from model_convGru import WorldModelConvFiLM
 
 # ---------- CONFIG ----------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
