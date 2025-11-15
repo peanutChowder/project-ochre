@@ -95,3 +95,6 @@ Training (train.py + model):
 - Suspect improved dataset or autoregressive strategy needed for model to understanding orientation changes
 - W (forward) results in the most significant scene changes - suspect due to dominance in dataset
 - Still struggles with dense scenes (shrubs, forests) - becomes a blurry mix
+
+**v3.0.1**
+- Increased base rollout length to 15

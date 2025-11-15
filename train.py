@@ -16,9 +16,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 BATCH_SIZE = 4
-BASE_SEQ_LEN = 4      # initial context
-MAX_SEQ_LEN = 8       # maximum unroll window
-EPOCHS = 20
+BASE_SEQ_LEN = 15      # initial context
+MAX_SEQ_LEN = 40       # maximum unroll window
+EPOCHS = 50
 LR = 3e-4
 CURRICULUM_UNROLL = True  # gradually increase sequence length
 
