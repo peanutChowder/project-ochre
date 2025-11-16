@@ -21,6 +21,8 @@ MAX_SEQ_LEN = 40       # maximum unroll window
 EPOCHS = 50
 LR = 3e-4
 CURRICULUM_UNROLL = True  # gradually increase sequence length
+SPIKE_LOSS = 7
+SPIKE_GRAD = 400
 
 PROJECT = "project-ochre"
 RUN_NAME = "v3.0-epoch0"
@@ -54,16 +56,20 @@ class MineRLTokenDataset(Dataset):
         meta = self.entries[vid_idx]
         path = os.path.join(self.root_dir, meta["file"])
         data = np.load(path)
-        tokens = data["tokens"]      # (T,16,16)
-        actions = data["actions"]    # (T,4)
-        i = start
-        Z_seq = tokens[i:i+self.seq_len]
-        A_seq = actions[i:i+self.seq_len]
-        Z_target_seq = tokens[i+1:i+self.seq_len+1]
+        tokens = data["tokens"]
+        actions = data["actions"]
+
+        Z_seq = tokens[start:start+self.seq_len]
+        A_seq = actions[start:start+self.seq_len]
+        Z_target_seq = tokens[start+1:start+self.seq_len+1]
+
         return (
             torch.tensor(Z_seq, dtype=torch.long),
             torch.tensor(A_seq, dtype=torch.float32),
             torch.tensor(Z_target_seq, dtype=torch.long),
+            idx,                  
+            vid_idx,             
+            start                
         )
 
 # ---------- MODEL ----------
@@ -109,7 +115,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     print(f"Dataset loaded: {len(dataset)} sequence windows.")
 
     for batch_idx, batch in enumerate(loader):
-        Z_seq, A_seq, Z_target_seq = [x.to(DEVICE) for x in batch]
+        Z_seq, A_seq, Z_target_seq, idxs, vid_idxs, starts = batch
+        Z_seq, A_seq, Z_target_seq = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target_seq.to(DEVICE)
 
         # forward pass (multi-step unrolling)
         logits_list = model(Z_seq, A_seq, return_all=True)
@@ -126,6 +133,35 @@ for epoch in range(start_epoch, EPOCHS + 1):
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+
+        if loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD:
+            print("\n Large spike --------------")
+            print(f"  global_step={global_step}")
+            print(f"  loss={loss.item():.4f}, grad_norm={float(grad_norm):.2f}")
+
+            # Additional diagnostics for spike batches
+            loss_first = step_losses[0].item()
+            loss_last = step_losses[-1].item()
+            ppl = math.exp(loss.item())
+            ppl_first = math.exp(loss_first)
+            ppl_last = math.exp(loss_last)
+
+            with torch.no_grad():
+                last_logits = logits_list[-1]
+                last_target = Z_target_seq[:, -1]
+                pred_last = last_logits.argmax(dim=1)
+                acc_last = (pred_last == last_target).float().mean().item()
+                p_last = torch.softmax(last_logits, dim=1)
+                entropy_last = (-p_last * torch.log(torch.clamp(p_last, min=1e-9))).sum(dim=1).mean().item()
+                conf_last = p_last.max(dim=1).values.mean().item()
+
+            print(f"  loss_first={loss_first:.4f}, loss_last={loss_last:.4f}")
+            print(f"  ppl={ppl:.2f}, ppl_first={ppl_first:.2f}, ppl_last={ppl_last:.2f}")
+            print(f"  acc_last={acc_last:.4f}, entropy_last={entropy_last:.4f}, conf_last={conf_last:.4f}")
+            print(f"  seq_len={seq_len}")
+            print("  Offending batch samples:")
+            for vid, start in zip(vid_idxs.tolist(), starts.tolist()):
+                print(f"    - video {vid}, start index {start}")
 
         total_loss += loss.item()
         global_step += 1
