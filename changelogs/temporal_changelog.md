@@ -79,7 +79,7 @@ Training (train.py + model):
 - Dataset samples n‑length windows strictly within a single trajectory using manifest boundaries.
 - Model conditions a ConvGRU token predictor via FiLM on 4D actions; codebook size matches VQ‑VAE (default 2048).
 
-**Results, 9 epochs**
+<u>Results, 9 epochs</u>
 - Immediately recognizable minecraft world
 - Does not respond well to inputs -- seems to shift only on initial delta in movements/camera
 - No collapse! Maintains "minecraft-ness".
@@ -87,7 +87,7 @@ Training (train.py + model):
 
 
 
-**Results, 36 epochs**
+<u>Results, 36 epochs</u>
 - Improvement on continued frame changes as movement+camera keys are held down
 - Detail improvement - medium objects like trees are beginning to appear
 - Still no improvement on orientation - camera movement only changes groups of pixels at a time rather than shifting entire scene.
@@ -98,3 +98,11 @@ Training (train.py + model):
 
 **v3.0.1**
 - Increased base rollout length to 15
+
+<u>Results, 43 epochs</u>
+- Continued training from 36 epoch checkpoint, increased base rollout so seq_len was 22-23 frames
+- Stronger reaction to camera movements. Sudden mouse movements could completely change the scene
+- "w" results are beginning to show "enlarging" effect of moving forwards
+- Understanding general structure of terrain better - separation of water/land/sky
+- Still confused by detailed terrain like bushes
+- Beginning to learn unwanted details, e.g. the pixel-ness of the VAE
