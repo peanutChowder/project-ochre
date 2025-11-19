@@ -27,57 +27,88 @@ except ImportError:
     wandb = None
 
 # Configuration constants for Kaggle environment
-DATA_DIR = '/kaggle/input/dataset'  
+DATA_DIR = '/kaggle/input/dataset'
 EPOCHS = 10
 BATCH_SIZE = 64
 LR = 1e-3
-EMBEDDING_DIM = 256
-CODEBOOK_SIZE = 2048
+EMBEDDING_DIM = 384
+CODEBOOK_SIZE = 4096
 BETA = 0.25
 EMA_DECAY = 0.99
-IMAGE_SIZE = 64
+# Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 64x36).
+IMAGE_HEIGHT = 36
+IMAGE_WIDTH = 64
 LOG_EVERY = 50
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 USE_LPIPS = False
 USE_WANDB = True
-RUN_NAME= ""
+RUN_NAME = "v2.0-epoch0"
 LOAD_FROM_SAVE = ""
+
+
+class ResidualBlock(nn.Module):
+    """
+    Simple residual block: Conv -> ReLU -> Conv + skip connection.
+    Operates at fixed channel count and preserves spatial resolution.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = out + residual
+        out = self.relu(out)
+        return out
 
 
 class Encoder(nn.Module):
     """
-    Encoder for 64x64 images producing 16x16 latent feature maps.
+    Encoder for 64x36 images producing 16x9 latent feature maps.
     """
     def __init__(self, in_channels=3, embedding_dim=256):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Output spatial size: 64 -> 32 -> 16 (downsample twice by stride=2)
-        self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=4, stride=2, padding=1)  # 64->32
-        self.conv2 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1)  # 32->16
+        # Output spatial size (for 64x36 input): 64x36 -> 32x18 -> 16x9
+        self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=4, stride=2, padding=1)
+        self.res1 = ResidualBlock(128)
+        self.conv2 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1)
+        self.res2 = ResidualBlock(embedding_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.conv1(x))
+        x = self.res1(x)
         x = self.conv2(x)
+        x = self.res2(x)
         return x
 
 
 class Decoder(nn.Module):
     """
-    Decoder for 16x16 latent feature maps producing 64x64 images.
+    Decoder for 16x9 latent feature maps producing 64x36 images.
     """
     def __init__(self, embedding_dim=256, out_channels=3):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Upsample twice by stride=2 transpose conv
+        # Upsample twice by stride=2 transpose conv with residual refinement at each scale.
+        self.res_latent = ResidualBlock(embedding_dim)
         self.conv_trans1 = nn.ConvTranspose2d(embedding_dim, 128, kernel_size=4, stride=2, padding=1)  # 16->32
+        self.res_mid = ResidualBlock(128)
         self.conv_trans2 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)  # 32->64
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
 
     def forward(self, x):
+        x = self.res_latent(x)
         x = self.relu(self.conv_trans1(x))
+        x = self.res_mid(x)
         x = self.conv_trans2(x)
         x = torch.sigmoid(x)
         return x
@@ -185,7 +216,7 @@ class VQVAE(nn.Module):
         """
         Decode from discrete code indices back into an RGB image.
         code_indices: (B, H, W) or (H, W)
-        Returns (B, 3, 64, 64) in [0,1]
+        Returns (B, 3, IMAGE_HEIGHT, IMAGE_WIDTH) in [0,1] when trained at that size.
         """
         if code_indices.dim() == 2:
             code_indices = code_indices.unsqueeze(0)
@@ -209,15 +240,16 @@ class FlatFolderDataset(Dataset):
     """
     Dataset that recursively loads all PNG/JPG images from a folder (flat folder).
     """
-    def __init__(self, root_dir, image_size=64):
+    def __init__(self, root_dir, height: int, width: int):
         self.root_dir = root_dir
-        self.image_size = image_size
+        self.height = height
+        self.width = width
         self.paths = []
         for ext in ('**/*.png', '**/*.jpg', '**/*.jpeg'):
             self.paths.extend(glob.glob(os.path.join(root_dir, ext), recursive=True))
         self.paths = sorted(self.paths)
         self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize((self.height, self.width)),
             transforms.ToTensor(),
         ])
 
@@ -245,7 +277,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Setup dataset and dataloader
-    dataset = FlatFolderDataset(DATA_DIR, IMAGE_SIZE)
+    dataset = FlatFolderDataset(DATA_DIR, IMAGE_HEIGHT, IMAGE_WIDTH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                             num_workers=NUM_WORKERS, pin_memory=True)
 
@@ -299,7 +331,8 @@ def main():
             "codebook_size": CODEBOOK_SIZE,
             "beta": BETA,
             "ema_decay": EMA_DECAY,
-            "image_size": IMAGE_SIZE,
+            "image_height": IMAGE_HEIGHT,
+            "image_width": IMAGE_WIDTH,
             "log_every": LOG_EVERY,
             "num_workers": NUM_WORKERS,
             "use_lpips": USE_LPIPS,

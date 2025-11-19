@@ -29,3 +29,14 @@ Results after 10 epochs ~30min:
 
 Results after 10 more epochs, LPIPS enabled
 - No visually discernible difference. Images still have a pixelated blur, likely due to MSE. Future training should encourage sharpness in pixels.
+
+### v2.0
+
+Dataset
+- Changed to 25.3k of randomly sampled images from GameFactory, guaranteed 5 frame gaps.
+
+Architecture:
+- Input resolution: 64x36 (16:9), downsampled from GameFactory.
+- Latent grid: 16x9 (144 tokens per frame) via two stride-2 conv downsamples.
+- Encoder/Decoder: added residual blocks
+- Quantizer: embedding_dim=384, codebook_size=4096.
