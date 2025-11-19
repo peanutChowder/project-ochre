@@ -106,3 +106,12 @@ Training (train.py + model):
 - Understanding general structure of terrain better - separation of water/land/sky
 - Still confused by detailed terrain like bushes
 - Beginning to learn unwanted details, e.g. the pixel-ness of the VAE
+
+**v4.0**
+Dataset:
+- Changed to GameFactory, 69.6hrs with unbiased action sampling + focus on isolated actions
+- 16FPS, 640x360
+
+Temporal Training:
+- Added mixed‑precision training (autocast + GradScaler) for more memory efficient rollouts.
+- Switched to streaming autoregressive loss over time steps (using `model.step`) to avoid storing all logits and reduce peak VRAM.

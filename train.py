@@ -9,6 +9,8 @@ Checklist:
 import os, time, json, math, numpy as np, torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast
+from torch.amp.grad_scaler import GradScaler
 import wandb
 
 # ---------- CONFIG ----------
@@ -55,18 +57,21 @@ class MineRLTokenDataset(Dataset):
         vid_idx, start = self.index_map[idx]
         meta = self.entries[vid_idx]
         path = os.path.join(self.root_dir, meta["file"])
-        data = np.load(path)
-        tokens = data["tokens"]
-        actions = data["actions"]
+        data = np.load(path)  # loads arrays like {"tokens": ..., "actions": ...}
+        tokens = data["tokens"]   # shape (T, H, W) of discrete VQ-VAE indices over time
+        actions = data["actions"] # shape (T, A) of continuous action vectors per frame
 
-        Z_seq = tokens[start:start+self.seq_len]
-        A_seq = actions[start:start+self.seq_len]
-        Z_target_seq = tokens[start+1:start+self.seq_len+1]
+        # Take a window of length seq_len from this video.
+        # Z_seq are the input tokens at times [t, ..., t+seq_len-1]
+        # Z_target_seq are the next-step tokens [t+1, ..., t+seq_len]
+        Z_seq = tokens[start:start + self.seq_len]
+        A_seq = actions[start:start + self.seq_len]
+        Z_target_seq = tokens[start + 1:start + self.seq_len + 1]
 
         return (
-            torch.tensor(Z_seq, dtype=torch.long),
-            torch.tensor(A_seq, dtype=torch.float32),
-            torch.tensor(Z_target_seq, dtype=torch.long),
+            torch.tensor(Z_seq, dtype=torch.long),        # (K, H, W)
+            torch.tensor(A_seq, dtype=torch.float32),     # (K, A)
+            torch.tensor(Z_target_seq, dtype=torch.long), # (K, H, W)
             idx,                  
             vid_idx,             
             start                
@@ -75,6 +80,7 @@ class MineRLTokenDataset(Dataset):
 # ---------- MODEL ----------
 model = WorldModelConvFiLM().to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 global_step = 0
 start_epoch = 1
 if os.path.exists(resume_path):
@@ -115,24 +121,48 @@ for epoch in range(start_epoch, EPOCHS + 1):
     print(f"Dataset loaded: {len(dataset)} sequence windows.")
 
     for batch_idx, batch in enumerate(loader):
+        # Each batch is a tuple of tensors/lists from __getitem__ stacked along batch dim.
         Z_seq, A_seq, Z_target_seq, idxs, vid_idxs, starts = batch
+        # Move token sequences and actions to GPU/CPU device.
         Z_seq, A_seq, Z_target_seq = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target_seq.to(DEVICE)
 
-        # forward pass (multi-step unrolling)
-        logits_list = model(Z_seq, A_seq, return_all=True)
+        # Z_seq has shape (B, K, H, W):
+        #   B = batch size (number of different windows),
+        #   K = sequence length (number of time steps),
+        #   H, W = spatial dimensions of the VQ-VAE latent grid.
+        B, K, H, W = Z_seq.shape
         step_losses = []
-        for t, logits in enumerate(logits_list):
-            # Flatten spatial + batch to N, keep class dimension as C
-            logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, logits.size(1))
-            target_flat = Z_target_seq[:, t].reshape(-1)
-            loss_t = F.cross_entropy(logits_flat, target_flat)
-            step_losses.append(loss_t)
+        logits_last = None
 
-        loss = torch.stack(step_losses).mean()
+        # Reset gradients for this batch.
         optimizer.zero_grad()
-        loss.backward()
+        # Initialize the hidden state for the ConvGRU layers for this batch.
+        h_list = model.init_state(B, device=DEVICE)
+        with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
+            # Iterate over time steps 0..K-1 and unroll the world model.
+            for t in range(K):
+                # Z_seq[:, t] has shape (B, H, W) of token indices at time t.
+                # A_seq[:, t] has shape (B, A) of actions at time t.
+                logits_t, h_list = model.step(Z_seq[:, t], A_seq[:, t], h_list)
+                logits_last = logits_t
+                # logits_t is (B, codebook_size, H, W). We flatten batch and spatial dims
+                # so that each position predicts one token class.
+                logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                # Z_target_seq[:, t] is (B, H, W), we flatten it to match logits_flat rows.
+                target_flat = Z_target_seq[:, t].reshape(-1)
+                loss_t = F.cross_entropy(logits_flat, target_flat)
+                step_losses.append(loss_t)
+
+            # Final loss is the mean over all time-step losses in the unroll.
+            loss = torch.stack(step_losses).mean()
+
+        # Backpropagate the mixed-precision loss using GradScaler for numerical stability.
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        # Clip gradients to avoid exploding gradients at long horizons.
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         if loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD:
             print("\n Large spike --------------")
@@ -147,7 +177,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
             ppl_last = math.exp(loss_last)
 
             with torch.no_grad():
-                last_logits = logits_list[-1]
+                last_logits = logits_last
                 last_target = Z_target_seq[:, -1]
                 pred_last = last_logits.argmax(dim=1)
                 acc_last = (pred_last == last_target).float().mean().item()
@@ -176,7 +206,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             # Last-step token accuracy and entropy for quick health signal
             with torch.no_grad():
-                last_logits = logits_list[-1]
+                last_logits = logits_last
                 last_target = Z_target_seq[:, -1]
                 pred_last = last_logits.argmax(dim=1)
                 acc_last = (pred_last == last_target).float().mean().item()
