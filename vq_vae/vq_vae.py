@@ -42,6 +42,7 @@ IMAGE_WIDTH = 128
 LOG_EVERY = 50
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
+VAL_SPLIT = 0.1
 USE_LPIPS = False
 USE_WANDB = True
 RUN_NAME = "v2.0-epoch0"
@@ -286,9 +287,23 @@ def save_reconstructions(x, x_recon, epoch, save_dir):
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Setup dataset and dataloader
-    dataset = FlatFolderDataset(DATA_DIR, IMAGE_HEIGHT, IMAGE_WIDTH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+    # Setup dataset and train/val splits
+    full_dataset = FlatFolderDataset(DATA_DIR, IMAGE_HEIGHT, IMAGE_WIDTH)
+    num_total = len(full_dataset)
+    val_size = max(1, int(num_total * VAL_SPLIT)) if num_total > 0 else 0
+    train_size = num_total - val_size
+    if train_size <= 0:
+        raise RuntimeError("Not enough samples to create a non-empty training split.")
+
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                             num_workers=NUM_WORKERS, pin_memory=True)
 
     # Model
@@ -365,7 +380,10 @@ def main():
         used_codes = set()
         steps = 0
 
-        for step, x in enumerate(dataloader, 1):
+        # --------------------
+        # Training epoch
+        # --------------------
+        for step, x in enumerate(train_loader, 1):
             x = x.to(device)
             optimizer.zero_grad()
 
@@ -463,31 +481,94 @@ def main():
             print(f"Epoch {epoch}: no valid steps (all skipped). Skipping averages.")
             continue
 
-        # Epoch end logging
-        avg_recon = running_recon_loss / steps
-        avg_vq = running_vq_loss / steps
-        avg_total = running_total_loss / steps
-        avg_perplexity = running_perplexity / steps
-        code_usage_frac = len(used_codes) / CODEBOOK_SIZE
-        dead_codes = CODEBOOK_SIZE - len(used_codes)
+        # Training epoch summary
+        train_avg_recon = running_recon_loss / steps
+        train_avg_vq = running_vq_loss / steps
+        train_avg_total = running_total_loss / steps
+        train_avg_perplexity = running_perplexity / steps
+        train_code_usage_frac = len(used_codes) / CODEBOOK_SIZE
+        train_dead_codes = CODEBOOK_SIZE - len(used_codes)
         emb_safe = torch.nan_to_num(model.vq_vae.embedding, nan=0.0)
         embedding_norms = emb_safe.norm(dim=0)
-        ema_codebook_variance = torch.nan_to_num(embedding_norms.var(), nan=0.0).item()
+        train_ema_codebook_variance = torch.nan_to_num(embedding_norms.var(), nan=0.0).item()
 
-        print(f"Epoch {epoch} completed. Avg Recon Loss: {avg_recon:.6f} | Avg VQ Loss: {avg_vq:.6f} | "
-              f"Avg Total Loss: {avg_total:.6f} | Avg Perplexity: {avg_perplexity:.4f} | "
-              f"Code Usage Fraction: {code_usage_frac:.4f} | Dead Codes: {dead_codes} | EMA Codebook Var: {ema_codebook_variance:.6f}")
+        print(f"Epoch {epoch} TRAIN | Avg Recon Loss: {train_avg_recon:.6f} | Avg VQ Loss: {train_avg_vq:.6f} | "
+              f"Avg Total Loss: {train_avg_total:.6f} | Avg Perplexity: {train_avg_perplexity:.4f} | "
+              f"Code Usage Fraction: {train_code_usage_frac:.4f} | Dead Codes: {train_dead_codes} | "
+              f"EMA Codebook Var: {train_ema_codebook_variance:.6f}")
 
         if use_wandb:
             wandb.log({
                 "epoch": epoch,
-                "val/avg_recon_loss": avg_recon,
-                "val/avg_vq_loss": avg_vq,
-                "val/avg_total_loss": avg_total,
-                "val/avg_perplexity": avg_perplexity,
-                "val/avg_code_usage_frac": code_usage_frac,
-                "val/dead_codes": dead_codes,
-                "val/ema_codebook_variance": ema_codebook_variance,
+                "train/avg_recon_loss": train_avg_recon,
+                "train/avg_vq_loss": train_avg_vq,
+                "train/avg_total_loss": train_avg_total,
+                "train/avg_perplexity": train_avg_perplexity,
+                "train/avg_code_usage_frac": train_code_usage_frac,
+                "train/dead_codes": train_dead_codes,
+                "train/ema_codebook_variance": train_ema_codebook_variance,
+            }, step=global_step)
+
+        # --------------------
+        # Validation epoch
+        # --------------------
+        model.eval()
+        val_running_recon_loss = 0.0
+        val_running_vq_loss = 0.0
+        val_running_total_loss = 0.0
+        val_running_perplexity = 0.0
+        val_used_codes = set()
+        val_total_codes = 0
+        val_steps = 0
+
+        with torch.no_grad():
+            for x in val_loader:
+                x = x.to(device)
+                with torch.autocast('cuda', enabled=(device.type == 'cuda')):
+                    z_e = model.encoder(x)
+                    z_e = model.pre_vq_conv(z_e)
+                quantized, vq_loss, perplexity, encoding_indices = model.vq_vae(z_e)
+                with torch.autocast('cuda', enabled=(device.type == 'cuda')):
+                    x_recon = model.decoder(quantized)
+                    recon_loss = F.mse_loss(x_recon, x)
+                    if perceptual_loss_fn is not None:
+                        lpips_loss = perceptual_loss_fn(x_recon, x).mean()
+                        recon_loss = recon_loss + lpips_loss
+                    loss = recon_loss + vq_loss
+
+                val_running_recon_loss += recon_loss.item()
+                val_running_vq_loss += vq_loss.item()
+                val_running_total_loss += loss.item()
+                val_running_perplexity += perplexity.item()
+                val_used_codes.update(encoding_indices.cpu().numpy())
+                val_total_codes += encoding_indices.numel()
+                val_steps += 1
+
+        if val_steps > 0:
+            val_avg_recon = val_running_recon_loss / val_steps
+            val_avg_vq = val_running_vq_loss / val_steps
+            val_avg_total = val_running_total_loss / val_steps
+            val_avg_perplexity = val_running_perplexity / val_steps
+            val_code_usage_frac = len(val_used_codes) / CODEBOOK_SIZE
+            val_dead_codes = CODEBOOK_SIZE - len(val_used_codes)
+        else:
+            val_avg_recon = val_avg_vq = val_avg_total = val_avg_perplexity = 0.0
+            val_code_usage_frac = 0.0
+            val_dead_codes = CODEBOOK_SIZE
+
+        print(f"Epoch {epoch} VAL   | Avg Recon Loss: {val_avg_recon:.6f} | Avg VQ Loss: {val_avg_vq:.6f} | "
+              f"Avg Total Loss: {val_avg_total:.6f} | Avg Perplexity: {val_avg_perplexity:.4f} | "
+              f"Code Usage Fraction: {val_code_usage_frac:.4f} | Dead Codes: {val_dead_codes}")
+
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch,
+                "val/avg_recon_loss": val_avg_recon,
+                "val/avg_vq_loss": val_avg_vq,
+                "val/avg_total_loss": val_avg_total,
+                "val/avg_perplexity": val_avg_perplexity,
+                "val/avg_code_usage_frac": val_code_usage_frac,
+                "val/dead_codes": val_dead_codes,
             }, step=global_step)
 
         # Save checkpoint
@@ -513,9 +594,12 @@ def main():
         torch.save(checkpoint, epoch_path)
 
         # Save reconstructions
-        model.eval()
         with torch.no_grad():
-            x = next(iter(dataloader))
+            # Use validation samples for qualitative inspection if available, else fall back to train.
+            try:
+                x = next(iter(val_loader))
+            except StopIteration:
+                x = next(iter(train_loader))
             x = x.to(device)
             x_recon, _, _, _ = model(x)
             save_reconstructions(x.cpu(), x_recon.cpu(), epoch, SAVE_DIR)
