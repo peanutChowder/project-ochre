@@ -6,6 +6,7 @@ Checklist:
 """
 import os
 import glob
+import time
 from PIL import Image
 import numpy as np
 
@@ -35,9 +36,9 @@ EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 4096
 BETA = 0.25
 EMA_DECAY = 0.99
-# Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 64x36).
-IMAGE_HEIGHT = 36
-IMAGE_WIDTH = 64
+# Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 128x72).
+IMAGE_HEIGHT = 72
+IMAGE_WIDTH = 128
 LOG_EVERY = 50
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
@@ -45,6 +46,7 @@ USE_LPIPS = False
 USE_WANDB = True
 RUN_NAME = "v2.0-epoch0"
 LOAD_FROM_SAVE = ""
+EMERGENCY_SAVE_HOURS = 11.8
 
 
 class ResidualBlock(nn.Module):
@@ -70,46 +72,54 @@ class ResidualBlock(nn.Module):
 
 class Encoder(nn.Module):
     """
-    Encoder for 64x36 images producing 16x9 latent feature maps.
+    Encoder for 128x72 images producing 16x9 latent feature maps.
     """
     def __init__(self, in_channels=3, embedding_dim=256):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Output spatial size (for 64x36 input): 64x36 -> 32x18 -> 16x9
-        self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=4, stride=2, padding=1)
+        # Output spatial size (for 128x72 input): 128x72 -> 64x36 -> 32x18 -> 16x9
+        self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=4, stride=2, padding=1)   # 128x72 -> 64x36
         self.res1 = ResidualBlock(128)
-        self.conv2 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1)
-        self.res2 = ResidualBlock(embedding_dim)
+        self.conv2 = nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1)          # 64x36 -> 32x18
+        self.res2 = ResidualBlock(128)
+        self.conv3 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1) # 32x18 -> 16x9
+        self.res3 = ResidualBlock(embedding_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = self.relu(self.conv1(x))
         x = self.res1(x)
-        x = self.conv2(x)
+        x = self.relu(self.conv2(x))
         x = self.res2(x)
+        x = self.relu(self.conv3(x))
+        x = self.res3(x)
         return x
 
 
 class Decoder(nn.Module):
     """
-    Decoder for 16x9 latent feature maps producing 64x36 images.
+    Decoder for 16x9 latent feature maps producing 128x72 images.
     """
     def __init__(self, embedding_dim=256, out_channels=3):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Upsample twice by stride=2 transpose conv with residual refinement at each scale.
+        # Upsample three times by stride=2 transpose conv with residual refinement at each scale.
         self.res_latent = ResidualBlock(embedding_dim)
-        self.conv_trans1 = nn.ConvTranspose2d(embedding_dim, 128, kernel_size=4, stride=2, padding=1)  # 16->32
-        self.res_mid = ResidualBlock(128)
-        self.conv_trans2 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)  # 32->64
+        self.conv_trans1 = nn.ConvTranspose2d(embedding_dim, 128, kernel_size=4, stride=2, padding=1)  # 16x9 -> 32x18
+        self.res_mid1 = ResidualBlock(128)
+        self.conv_trans2 = nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1)           # 32x18 -> 64x36
+        self.res_mid2 = ResidualBlock(128)
+        self.conv_trans3 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)  # 64x36 -> 128x72
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
 
     def forward(self, x):
         x = self.res_latent(x)
         x = self.relu(self.conv_trans1(x))
-        x = self.res_mid(x)
-        x = self.conv_trans2(x)
+        x = self.res_mid1(x)
+        x = self.relu(self.conv_trans2(x))
+        x = self.res_mid2(x)
+        x = self.conv_trans3(x)
         x = torch.sigmoid(x)
         return x
 
@@ -293,6 +303,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     start_epoch = 1
+    global_step = 0
     if (LOAD_FROM_SAVE):
         print(f"Resuming from checkpoint '{LOAD_FROM_SAVE}'")
         checkpoint = torch.load(LOAD_FROM_SAVE, map_location=device)
@@ -303,6 +314,7 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer"])
             start_epoch = checkpoint["epoch"] + 1
             saved_lr = checkpoint["config"]["lr"]
+            global_step = checkpoint.get("global_step", 0)
             print(f"Retrieved learning rate '{saved_lr}'")
             print(f"Successfully loaded checkpoint, beginning training from epoch {start_epoch}")
         except Exception as e:
@@ -340,6 +352,8 @@ def main():
         wandb.watch(model, log="all") #type: ignore
 
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
+    start_time = time.time()
+    emergency_saved = False
 
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
@@ -389,6 +403,7 @@ def main():
             total_codes += encoding_indices.numel()
 
             steps += 1
+            global_step += 1
 
             if step % LOG_EVERY == 0:
                 if steps == 0:
@@ -411,15 +426,38 @@ def main():
 
                 if use_wandb:
                     wandb.log({
-                        "step": (epoch - 1) * len(dataloader) + step,
-                        "recon_loss": avg_recon,
-                        "vq_loss": avg_vq,
-                        "total_loss": avg_total,
-                        "perplexity": avg_perplexity,
-                        "code_usage_frac": code_usage_frac,
-                        "dead_codes": dead_codes,
-                        "ema_codebook_variance": ema_codebook_variance,
-                    })
+                        "train/recon_loss": avg_recon,
+                        "train/vq_loss": avg_vq,
+                        "train/total_loss": avg_total,
+                        "train/perplexity": avg_perplexity,
+                        "train/code_usage_frac": code_usage_frac,
+                        "train/dead_codes": dead_codes,
+                        "train/ema_codebook_variance": ema_codebook_variance,
+                    }, step=global_step)
+
+            # Emergency save at 11.8 hrs
+            if not emergency_saved:
+                elapsed_hours = (time.time() - start_time) / 3600.0
+                if elapsed_hours >= EMERGENCY_SAVE_HOURS:
+                    os.makedirs(SAVE_DIR, exist_ok=True)
+                    emergency_path = os.path.join(SAVE_DIR, 'vqvae_emergency.pt')
+                    checkpoint = {
+                        "epoch": epoch,
+                        "encoder": model.encoder.state_dict(),
+                        "quantizer": model.vq_vae.state_dict(),
+                        "decoder": model.decoder.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "config": {
+                            "embedding_dim": EMBEDDING_DIM,
+                            "codebook_size": CODEBOOK_SIZE,
+                            "beta": BETA,
+                            "ema_decay": EMA_DECAY,
+                            "lr": LR,
+                        },
+                    }
+                    torch.save(checkpoint, emergency_path)
+                    print(f"⏰ Emergency checkpoint saved to {emergency_path} after {elapsed_hours:.2f} hours.")
+                    emergency_saved = True
 
         if steps == 0:
             print(f"Epoch {epoch}: no valid steps (all skipped). Skipping averages.")
@@ -443,14 +481,14 @@ def main():
         if use_wandb:
             wandb.log({
                 "epoch": epoch,
-                "avg_recon_loss": avg_recon,
-                "avg_vq_loss": avg_vq,
-                "avg_total_loss": avg_total,
-                "avg_perplexity": avg_perplexity,
-                "avg_code_usage_frac": code_usage_frac,
-                "dead_codes": dead_codes,
-                "ema_codebook_variance": ema_codebook_variance,
-            })
+                "val/avg_recon_loss": avg_recon,
+                "val/avg_vq_loss": avg_vq,
+                "val/avg_total_loss": avg_total,
+                "val/avg_perplexity": avg_perplexity,
+                "val/avg_code_usage_frac": code_usage_frac,
+                "val/dead_codes": dead_codes,
+                "val/ema_codebook_variance": ema_codebook_variance,
+            }, step=global_step)
 
         # Save checkpoint
         os.makedirs(SAVE_DIR, exist_ok=True)
@@ -462,6 +500,7 @@ def main():
             "quantizer": model.vq_vae.state_dict(),
             "decoder": model.decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "global_step": global_step,
             "config": {
                 "embedding_dim": EMBEDDING_DIM,
                 "codebook_size": CODEBOOK_SIZE,

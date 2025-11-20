@@ -40,3 +40,11 @@ Architecture:
 - Latent grid: 16x9 (144 tokens per frame) via two stride-2 conv downsamples.
 - Encoder/Decoder: added residual blocks
 - Quantizer: embedding_dim=384, codebook_size=4096.
+
+Results:
+- Convergence within 1 epoch, solid outputs. Though was tested on train set.
+- Nearly matches input images, blocks are just missing the pixelated minecraft look.
+
+**v2.0.1**
+- Increased input resolution to: 128 x 72, old input image was too constraining on model.
+- Extended encoder/decoder with third sampling stage to handle new res.
