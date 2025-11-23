@@ -30,11 +30,11 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 40
+EPOCHS = 30
 BATCH_SIZE = 192
 LR = 1e-3
 EMBEDDING_DIM = 384
-CODEBOOK_SIZE = 4096
+CODEBOOK_SIZE = 1024
 BETA = 0.25
 EMA_DECAY = 0.99
 # Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 128x72).
@@ -46,9 +46,9 @@ NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_LPIPS = True
 USE_WANDB = True
-RUN_NAME = "v2.0.2-epoch20"
-OUTPUT_NAME = "vqvae_v2.0.2_"
-LOAD_FROM_SAVE = "vqvae_v2.0.1_epoch20.pt"
+RUN_NAME = "v2.0.3-epoch0"
+OUTPUT_NAME = "vqvae_v2.0.3_"
+LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
 
@@ -276,14 +276,14 @@ class FlatFolderDataset(Dataset):
         return img
 
 
-def save_reconstructions(x, x_recon, epoch, save_dir):
+def save_reconstructions(x, x_recon, epoch, save_dir, subset="test"):
     """
     Save an 8x2 grid of original and reconstructed images side by side.
     """
     n = min(8, x.size(0))
     comparison = torch.cat([x[:n], x_recon[:n]])
     grid = utils.make_grid(comparison, nrow=n)
-    utils.save_image(grid, os.path.join(save_dir, f'recon_epoch_{epoch}.png'))
+    utils.save_image(grid, os.path.join(save_dir, f'{subset}_epoch{epoch}.png'))
 
 
 def main():
@@ -597,14 +597,17 @@ def main():
 
         # Save reconstructions
         with torch.no_grad():
-            # Use validation samples for qualitative inspection if available, else fall back to train.
-            try:
-                x = next(iter(val_loader))
-            except StopIteration:
-                x = next(iter(train_loader))
-            x = x.to(device)
-            x_recon, _, _, _ = model(x)
-            save_reconstructions(x.cpu(), x_recon.cpu(), epoch, SAVE_DIR)
+            # Produce samples from train and test sets
+            x_val = next(iter(val_loader))
+            x_train = next(iter(train_loader))
+
+            x_val = x_val.to(device)
+            x_recon_val, _, _, _ = model(x_val)
+            save_reconstructions(x_val.cpu(), x_recon_val.cpu(), epoch, SAVE_DIR, subset="val")
+
+            x_train = x_train.to(device)
+            x_recon_train, _, _, _ = model(x_train)
+            save_reconstructions(x_train.cpu(), x_recon_train.cpu(), epoch, SAVE_DIR, subset="train")
 
 
 if __name__ == "__main__":

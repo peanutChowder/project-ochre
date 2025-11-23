@@ -57,3 +57,11 @@ Epoch 20 Results:
 **v2.0.2**
 - Enabled LPIPS
 - Increased batch to 192
+
+Epoch 40 Results (cont. from v2.0.1):
+- Only some scenes show general pattern captured, e.g. desert scene gets a bunch of weird pink coloured blobs
+- Grid pattern is strongly imprinted onto images, especially sky - turns into grey grid instead of smooth blue gradient
+
+**v2.0.3**
+- Reduced codebook size to 1024
+- Added in train set output samples to determine generalizability 
