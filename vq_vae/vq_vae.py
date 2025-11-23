@@ -30,7 +30,7 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 30
+EPOCHS = 80
 BATCH_SIZE = 192
 LR = 1e-3
 EMBEDDING_DIM = 384
