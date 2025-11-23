@@ -65,3 +65,10 @@ Epoch 40 Results (cont. from v2.0.1):
 **v2.0.3**
 - Reduced codebook size to 1024
 - Added in train set output samples to determine generalizability 
+
+Epoch 30 Results:
+- Strange patches in images, general scene patterns not captured in some biomes (e.g. water)
+
+**v2.0.4**
+- Applied 0.3 * LPIPS 
+- Added separate wandb logging for MSE vs LPIPS loss

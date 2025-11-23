@@ -46,8 +46,8 @@ NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_LPIPS = True
 USE_WANDB = True
-RUN_NAME = "v2.0.3-epoch0"
-OUTPUT_NAME = "vqvae_v2.0.3_"
+RUN_NAME = "v2.0.4-epoch0"
+OUTPUT_NAME = "vqvae_v2.0.4_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
@@ -378,6 +378,8 @@ def main():
         running_vq_loss = 0.0
         running_total_loss = 0.0
         running_perplexity = 0.0
+        running_mse_loss = 0.0
+        running_lpips_loss = 0.0
         total_codes = 0
         used_codes = set()
         steps = 0
@@ -396,10 +398,14 @@ def main():
             quantized, vq_loss, perplexity, encoding_indices = model.vq_vae(z_e)
             with torch.autocast('cuda', enabled=(device.type == 'cuda')):
                 x_recon = model.decoder(quantized)
-                recon_loss = F.mse_loss(x_recon, x)
+                mse_loss = F.mse_loss(x_recon, x)
+                lpips_loss_value = 0.0
                 if perceptual_loss_fn is not None:
                     lpips_loss = perceptual_loss_fn(x_recon, x).mean()
-                    recon_loss = recon_loss + lpips_loss
+                    lpips_loss_value = lpips_loss.item()
+                    recon_loss = mse_loss + lpips_loss * 0.3  # LPIPS weighted in recon_loss
+                else:
+                    recon_loss = mse_loss
                 loss = recon_loss + vq_loss
 
             if not torch.isfinite(loss):
@@ -417,6 +423,9 @@ def main():
             running_vq_loss += vq_loss.item()
             running_total_loss += loss.item()
             running_perplexity += perplexity.item()
+            running_mse_loss += mse_loss.item()
+            if perceptual_loss_fn is not None:
+                running_lpips_loss += lpips_loss_value
 
             # Track code usage
             used_codes.update(encoding_indices.cpu().numpy())
@@ -433,6 +442,8 @@ def main():
                 avg_vq = running_vq_loss / steps
                 avg_total = running_total_loss / steps
                 avg_perplexity = running_perplexity / steps
+                avg_mse = running_mse_loss / steps
+                avg_lpips = (running_lpips_loss / steps) if perceptual_loss_fn is not None else 0.0
                 code_usage_frac = len(used_codes) / CODEBOOK_SIZE
                 dead_codes = CODEBOOK_SIZE - len(used_codes)
 
@@ -442,7 +453,8 @@ def main():
 
                 print(f"Epoch {epoch} Step {step} | Recon Loss: {avg_recon:.6f} | VQ Loss: {avg_vq:.6f} | "
                       f"Total Loss: {avg_total:.6f} | Perplexity: {avg_perplexity:.4f} | "
-                      f"Code Usage: {code_usage_frac:.4f} | Dead Codes: {dead_codes} | EMA Codebook Var: {ema_codebook_variance:.6f}")
+                      f"Code Usage: {code_usage_frac:.4f} | Dead Codes: {dead_codes} | EMA Codebook Var: {ema_codebook_variance:.6f} | "
+                      f"MSE: {avg_mse:.6f} | LPIPS: {avg_lpips:.6f}")
 
                 if use_wandb:
                     wandb.log({
@@ -453,6 +465,8 @@ def main():
                         "train/code_usage_frac": code_usage_frac,
                         "train/dead_codes": dead_codes,
                         "train/ema_codebook_variance": ema_codebook_variance,
+                        "train/mse_loss": avg_mse,
+                        "train/lpips_loss": avg_lpips,
                     }, step=global_step)
 
             # Emergency save at 11.8 hrs
@@ -488,6 +502,8 @@ def main():
         train_avg_vq = running_vq_loss / steps
         train_avg_total = running_total_loss / steps
         train_avg_perplexity = running_perplexity / steps
+        train_avg_mse = running_mse_loss / steps
+        train_avg_lpips = (running_lpips_loss / steps) if perceptual_loss_fn is not None else 0.0
         train_code_usage_frac = len(used_codes) / CODEBOOK_SIZE
         train_dead_codes = CODEBOOK_SIZE - len(used_codes)
         emb_safe = torch.nan_to_num(model.vq_vae.embedding, nan=0.0)
@@ -497,7 +513,8 @@ def main():
         print(f"Epoch {epoch} TRAIN | Avg Recon Loss: {train_avg_recon:.6f} | Avg VQ Loss: {train_avg_vq:.6f} | "
               f"Avg Total Loss: {train_avg_total:.6f} | Avg Perplexity: {train_avg_perplexity:.4f} | "
               f"Code Usage Fraction: {train_code_usage_frac:.4f} | Dead Codes: {train_dead_codes} | "
-              f"EMA Codebook Var: {train_ema_codebook_variance:.6f}")
+              f"EMA Codebook Var: {train_ema_codebook_variance:.6f} | "
+              f"Avg MSE: {train_avg_mse:.6f} | Avg LPIPS: {train_avg_lpips:.6f}")
 
         if use_wandb:
             wandb.log({
@@ -509,6 +526,8 @@ def main():
                 "train/avg_code_usage_frac": train_code_usage_frac,
                 "train/dead_codes": train_dead_codes,
                 "train/ema_codebook_variance": train_ema_codebook_variance,
+                "train/avg_mse_loss": train_avg_mse,
+                "train/avg_lpips_loss": train_avg_lpips,
             }, step=global_step)
 
         # --------------------
@@ -519,6 +538,8 @@ def main():
         val_running_vq_loss = 0.0
         val_running_total_loss = 0.0
         val_running_perplexity = 0.0
+        val_running_mse_loss = 0.0
+        val_running_lpips_loss = 0.0
         val_used_codes = set()
         val_total_codes = 0
         val_steps = 0
@@ -532,16 +553,23 @@ def main():
                 quantized, vq_loss, perplexity, encoding_indices = model.vq_vae(z_e)
                 with torch.autocast('cuda', enabled=(device.type == 'cuda')):
                     x_recon = model.decoder(quantized)
-                    recon_loss = F.mse_loss(x_recon, x)
+                    val_mse_loss = F.mse_loss(x_recon, x)
+                    val_lpips_loss_value = 0.0
                     if perceptual_loss_fn is not None:
-                        lpips_loss = perceptual_loss_fn(x_recon, x).mean()
-                        recon_loss = recon_loss + lpips_loss
+                        val_lpips_loss = perceptual_loss_fn(x_recon, x).mean()
+                        val_lpips_loss_value = val_lpips_loss.item()
+                        recon_loss = val_mse_loss + val_lpips_loss * 0.3
+                    else:
+                        recon_loss = val_mse_loss
                     loss = recon_loss + vq_loss
 
                 val_running_recon_loss += recon_loss.item()
                 val_running_vq_loss += vq_loss.item()
                 val_running_total_loss += loss.item()
                 val_running_perplexity += perplexity.item()
+                val_running_mse_loss += val_mse_loss.item()
+                if perceptual_loss_fn is not None:
+                    val_running_lpips_loss += val_lpips_loss_value
                 val_used_codes.update(encoding_indices.cpu().numpy())
                 val_total_codes += encoding_indices.numel()
                 val_steps += 1
@@ -551,16 +579,21 @@ def main():
             val_avg_vq = val_running_vq_loss / val_steps
             val_avg_total = val_running_total_loss / val_steps
             val_avg_perplexity = val_running_perplexity / val_steps
+            val_avg_mse = val_running_mse_loss / val_steps
+            val_avg_lpips = (val_running_lpips_loss / val_steps) if perceptual_loss_fn is not None else 0.0
             val_code_usage_frac = len(val_used_codes) / CODEBOOK_SIZE
             val_dead_codes = CODEBOOK_SIZE - len(val_used_codes)
         else:
             val_avg_recon = val_avg_vq = val_avg_total = val_avg_perplexity = 0.0
             val_code_usage_frac = 0.0
             val_dead_codes = CODEBOOK_SIZE
+            val_avg_mse = 0.0
+            val_avg_lpips = 0.0
 
         print(f"Epoch {epoch} VAL   | Avg Recon Loss: {val_avg_recon:.6f} | Avg VQ Loss: {val_avg_vq:.6f} | "
               f"Avg Total Loss: {val_avg_total:.6f} | Avg Perplexity: {val_avg_perplexity:.4f} | "
-              f"Code Usage Fraction: {val_code_usage_frac:.4f} | Dead Codes: {val_dead_codes}")
+              f"Code Usage Fraction: {val_code_usage_frac:.4f} | Dead Codes: {val_dead_codes} | "
+              f"Avg MSE: {val_avg_mse:.6f} | Avg LPIPS: {val_avg_lpips:.6f}")
 
         if use_wandb:
             wandb.log({
@@ -571,6 +604,8 @@ def main():
                 "val/avg_perplexity": val_avg_perplexity,
                 "val/avg_code_usage_frac": val_code_usage_frac,
                 "val/dead_codes": val_dead_codes,
+                "val/avg_mse_loss": val_avg_mse,
+                "val/avg_lpips_loss": val_avg_lpips,
             }, step=global_step)
 
         # Save checkpoint
