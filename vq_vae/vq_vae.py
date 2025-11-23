@@ -46,8 +46,8 @@ NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_LPIPS = True
 USE_WANDB = True
-RUN_NAME = "v2.0.4-epoch0"
-OUTPUT_NAME = "vqvae_v2.0.4_"
+RUN_NAME = "v2.0.5-epoch0"
+OUTPUT_NAME = "vqvae_v2.0.5_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
@@ -629,6 +629,15 @@ def main():
         }
         torch.save(checkpoint, latest_path)
         torch.save(checkpoint, epoch_path)
+        # Try deleting old epoch
+        if epoch > 1:
+            prev_epoch_path = os.path.join(SAVE_DIR, f'{OUTPUT_NAME}_epoch{epoch-1}.pt')
+            if os.path.exists(prev_epoch_path):
+                try:
+                    os.remove(prev_epoch_path)
+                    print(f"Removed previous checkpoint: {prev_epoch_path}")
+                except OSError as e:
+                    print(f"Warning: failed to remove previous checkpoint {prev_epoch_path}: {e}")
 
         # Save reconstructions
         with torch.no_grad():

@@ -72,3 +72,11 @@ Epoch 30 Results:
 **v2.0.4**
 - Applied 0.3 * LPIPS 
 - Added separate wandb logging for MSE vs LPIPS loss
+
+Epoch 30 Results:
+- Realized via wandb LPIPS was always 0. 
+
+**v2.0.5**
+- Added missing LPIPS installation in kaggle
+
+Epoch 60 (cont. from 2.0.4-epoch30) Results:
