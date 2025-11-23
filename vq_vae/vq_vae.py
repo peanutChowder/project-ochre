@@ -1,5 +1,6 @@
 """
 Checklist:
+- Update dataset
 - Update output model name
 - Update run name
 - Update checkpoint path
@@ -29,8 +30,8 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 10
-BATCH_SIZE = 64
+EPOCHS = 40
+BATCH_SIZE = 192
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 4096
@@ -43,10 +44,11 @@ LOG_EVERY = 50
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 VAL_SPLIT = 0.1
-USE_LPIPS = False
+USE_LPIPS = True
 USE_WANDB = True
-RUN_NAME = "v2.0-epoch0"
-LOAD_FROM_SAVE = ""
+RUN_NAME = "v2.0.2-epoch20"
+OUTPUT_NAME = "vqvae_v2.0.2_"
+LOAD_FROM_SAVE = "vqvae_v2.0.1_epoch20.pt"
 EMERGENCY_SAVE_HOURS = 11.8
 
 
@@ -458,7 +460,7 @@ def main():
                 elapsed_hours = (time.time() - start_time) / 3600.0
                 if elapsed_hours >= EMERGENCY_SAVE_HOURS:
                     os.makedirs(SAVE_DIR, exist_ok=True)
-                    emergency_path = os.path.join(SAVE_DIR, 'vqvae_emergency.pt')
+                    emergency_path = os.path.join(SAVE_DIR, f'{OUTPUT_NAME}_epoch{epoch}_emergency.pt')
                     checkpoint = {
                         "epoch": epoch,
                         "encoder": model.encoder.state_dict(),
@@ -574,7 +576,7 @@ def main():
         # Save checkpoint
         os.makedirs(SAVE_DIR, exist_ok=True)
         latest_path = os.path.join(SAVE_DIR, 'vqvae.pt')
-        epoch_path = os.path.join(SAVE_DIR, f'vqvae_epoch_{epoch}.pt')
+        epoch_path = os.path.join(SAVE_DIR, f'{OUTPUT_NAME}_epoch{epoch}.pt')
         checkpoint = {
             "epoch": epoch,
             "encoder": model.encoder.state_dict(),

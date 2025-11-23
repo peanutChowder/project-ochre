@@ -53,3 +53,7 @@ Epoch 20 Results:
 - General structure present
 - Poor sharpness diff between predicted and gt
 - Some low-detail images (e.g. sky) show "vqvae" patterns rather than smooth colours
+
+**v2.0.2**
+- Enabled LPIPS
+- Increased batch to 192
