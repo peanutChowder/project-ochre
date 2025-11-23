@@ -48,3 +48,8 @@ Results:
 **v2.0.1**
 - Increased input resolution to: 128 x 72, old input image was too constraining on model.
 - Extended encoder/decoder with third sampling stage to handle new res.
+
+Epoch 20 Results:
+- General structure present
+- Poor sharpness diff between predicted and gt
+- Some low-detail images (e.g. sky) show "vqvae" patterns rather than smooth colours
