@@ -98,3 +98,8 @@ Results
 - Still grey
 - LPIPS likely not cause - collapse in vq_loss suddenly drops from ~0.1 to 1e-8 in 2 epochs
 
+**v2.1.2**
+- Reduced batch size from 256 -> 192
+
+Results
+- Batch size is not the culprit

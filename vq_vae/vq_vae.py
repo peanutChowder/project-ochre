@@ -30,8 +30,8 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 30
-BATCH_SIZE = 256
+EPOCHS = 10
+BATCH_SIZE = 196
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 1024
@@ -40,13 +40,13 @@ EMA_DECAY = 0.99
 # Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 128x72).
 IMAGE_HEIGHT = 72
 IMAGE_WIDTH = 128
-LOG_EVERY = 4
+LOG_EVERY = 10
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_WANDB = True
-RUN_NAME = "v2.1.1-epoch0"
-OUTPUT_NAME = "vqvae_v2.1.1_"
+RUN_NAME = "v2.1.2-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.2_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
