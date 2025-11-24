@@ -110,3 +110,5 @@ Results
 **v2.1.4**
 - Decreased batch size to 64 
 - Increased num_workers 4 -> 12
+- Re-enabled LPIPS with a more gradual schedule
+- Reduced beta 0.25 -> 0.05

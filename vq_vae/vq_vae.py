@@ -35,7 +35,7 @@ BATCH_SIZE = 64
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 1024
-BETA = 0.25
+BETA = 0.05
 EMA_DECAY = 0.99
 # Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 128x72).
 IMAGE_HEIGHT = 72
@@ -53,9 +53,11 @@ EMERGENCY_SAVE_HOURS = 11.8
 SIGNAL_LOGGING = True
 
 # LPIPS
-USE_LPIPS = False
-LPIPS_EPOCHS_TO_INCREASE = 10
-MAX_LPIPS_FACTOR = 0.1
+USE_LPIPS = True
+LPIPS_EPOCHS_UNTIL_INCREASE = 3
+LPIPS_INCREASE = 0.02
+STARTING_LPIPS = 0.05
+MAX_LPIPS_FACTOR = 0.3
 
 
 
@@ -289,7 +291,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # initial lpips
-    lpips_factor = 0
+    lpips_factor = STARTING_LPIPS
 
     # Setup dataset and train/val splits
     full_dataset = FlatFolderDataset(DATA_DIR, IMAGE_HEIGHT, IMAGE_WIDTH)
@@ -393,7 +395,7 @@ def main():
         used_codes = set()
         steps = 0
 
-        if (epoch % LPIPS_EPOCHS_TO_INCREASE) == 0 and lpips_factor < MAX_LPIPS_FACTOR:
+        if (epoch % LPIPS_EPOCHS_UNTIL_INCREASE) == 0 and lpips_factor < MAX_LPIPS_FACTOR:
             lpips_factor += 0.005
             print(f"🔵 Increasing LPIPS to {lpips_factor}")
 
