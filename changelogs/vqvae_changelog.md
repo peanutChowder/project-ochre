@@ -80,3 +80,13 @@ Epoch 30 Results:
 - Added missing LPIPS installation in kaggle
 
 Epoch 60 (cont. from 2.0.4-epoch30) Results:
+- Better reconstruction in some images. LPIPS seems to bias model towards memorizing local patterns, to the point of "screen burn in" where images of sky have small patches of grass appearing.
+- Any fine texture is represented as grid noise
+
+**v2.1.0**
+- Reduced 3 -> 2 down/upsampling layers to now support 32x18 latents
+- Added LPIPS schedule, +0.05 per 5 epochs
+- Increased batch size 192 -> 256
+
+Results:
+- Just a grey image

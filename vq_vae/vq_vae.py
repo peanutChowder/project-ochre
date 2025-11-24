@@ -30,8 +30,8 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 80
-BATCH_SIZE = 192
+EPOCHS = 30
+BATCH_SIZE = 256
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 1024
@@ -40,16 +40,21 @@ EMA_DECAY = 0.99
 # Target training resolution, matching 16:9 aspect ratio (e.g., 640x360 -> 128x72).
 IMAGE_HEIGHT = 72
 IMAGE_WIDTH = 128
-LOG_EVERY = 50
+LOG_EVERY = 4
 SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 VAL_SPLIT = 0.1
-USE_LPIPS = True
 USE_WANDB = True
-RUN_NAME = "v2.0.5-epoch0"
-OUTPUT_NAME = "vqvae_v2.0.5_"
+RUN_NAME = "v2.1.0-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.0_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
+
+# LPIPS
+USE_LPIPS = True
+LPIPS_EPOCHS_TO_INCREASE = 5
+MAX_LPIPS_FACTOR = 0.3
+
 
 
 class ResidualBlock(nn.Module):
@@ -75,18 +80,16 @@ class ResidualBlock(nn.Module):
 
 class Encoder(nn.Module):
     """
-    Encoder for 128x72 images producing 16x9 latent feature maps.
+    Encoder for 128x72 images producing 32x18 latent feature maps.
     """
     def __init__(self, in_channels=3, embedding_dim=256):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Output spatial size (for 128x72 input): 128x72 -> 64x36 -> 32x18 -> 16x9
+        # Output spatial size (for 128x72 input): 128x72 -> 64x36 -> 32x18
         self.conv1 = nn.Conv2d(in_channels, 128, kernel_size=4, stride=2, padding=1)   # 128x72 -> 64x36
         self.res1 = ResidualBlock(128)
-        self.conv2 = nn.Conv2d(128, 128, kernel_size=4, stride=2, padding=1)          # 64x36 -> 32x18
-        self.res2 = ResidualBlock(128)
-        self.conv3 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1) # 32x18 -> 16x9
-        self.res3 = ResidualBlock(embedding_dim)
+        self.conv2 = nn.Conv2d(128, embedding_dim, kernel_size=4, stride=2, padding=1) # 64x36 -> 32x18
+        self.res2 = ResidualBlock(embedding_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -94,25 +97,21 @@ class Encoder(nn.Module):
         x = self.res1(x)
         x = self.relu(self.conv2(x))
         x = self.res2(x)
-        x = self.relu(self.conv3(x))
-        x = self.res3(x)
         return x
 
 
 class Decoder(nn.Module):
     """
-    Decoder for 16x9 latent feature maps producing 128x72 images.
+    Decoder for 32x18 latent feature maps producing 128x72 images.
     """
     def __init__(self, embedding_dim=256, out_channels=3):
         super().__init__()
         self.embedding_dim = embedding_dim
-        # Upsample three times by stride=2 transpose conv with residual refinement at each scale.
+        # Upsample twice by stride=2 transpose conv with residual refinement at each scale.
         self.res_latent = ResidualBlock(embedding_dim)
-        self.conv_trans1 = nn.ConvTranspose2d(embedding_dim, 128, kernel_size=4, stride=2, padding=1)  # 16x9 -> 32x18
+        self.conv_trans1 = nn.ConvTranspose2d(embedding_dim, 128, kernel_size=4, stride=2, padding=1)  # 32x18 -> 64x36
         self.res_mid1 = ResidualBlock(128)
-        self.conv_trans2 = nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1)           # 32x18 -> 64x36
-        self.res_mid2 = ResidualBlock(128)
-        self.conv_trans3 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)  # 64x36 -> 128x72
+        self.conv_trans2 = nn.ConvTranspose2d(128, out_channels, kernel_size=4, stride=2, padding=1)   # 64x36 -> 128x72
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
 
@@ -121,8 +120,6 @@ class Decoder(nn.Module):
         x = self.relu(self.conv_trans1(x))
         x = self.res_mid1(x)
         x = self.relu(self.conv_trans2(x))
-        x = self.res_mid2(x)
-        x = self.conv_trans3(x)
         x = torch.sigmoid(x)
         return x
 
@@ -289,6 +286,9 @@ def save_reconstructions(x, x_recon, epoch, save_dir, subset="test"):
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # initial lpips
+    lpips_factor = 0
+
     # Setup dataset and train/val splits
     full_dataset = FlatFolderDataset(DATA_DIR, IMAGE_HEIGHT, IMAGE_WIDTH)
     num_total = len(full_dataset)
@@ -334,6 +334,13 @@ def main():
             global_step = checkpoint.get("global_step", 0)
             print(f"Retrieved learning rate '{saved_lr}'")
             print(f"Successfully loaded checkpoint, beginning training from epoch {start_epoch}")
+            # Restore LPIPS factor if present (default to 0.0 for older checkpoints)
+            if "lpips_factor" in checkpoint:
+                lpips_factor = checkpoint["lpips_factor"]
+                print(f"Restored LPIPS factor: {lpips_factor}")
+            else:
+                lpips_factor = 0.0
+                print("No LPIPS factor found in checkpoint; starting from 0.0")
         except Exception as e:
             print(f"Failed to load checkpoint: {e}")
     else:
@@ -384,6 +391,10 @@ def main():
         used_codes = set()
         steps = 0
 
+        if (epoch % LPIPS_EPOCHS_TO_INCREASE) == 0 and lpips_factor < MAX_LPIPS_FACTOR:
+            lpips_factor += 0.05
+            print(f"🔵 Increasing LPIPS to {lpips_factor}")
+
         # --------------------
         # Training epoch
         # --------------------
@@ -401,9 +412,10 @@ def main():
                 mse_loss = F.mse_loss(x_recon, x)
                 lpips_loss_value = 0.0
                 if perceptual_loss_fn is not None:
+
                     lpips_loss = perceptual_loss_fn(x_recon, x).mean()
                     lpips_loss_value = lpips_loss.item()
-                    recon_loss = mse_loss + lpips_loss * 0.3  # LPIPS weighted in recon_loss
+                    recon_loss = mse_loss + lpips_loss * lpips_factor  # LPIPS weighted in recon_loss
                 else:
                     recon_loss = mse_loss
                 loss = recon_loss + vq_loss
@@ -481,6 +493,8 @@ def main():
                         "quantizer": model.vq_vae.state_dict(),
                         "decoder": model.decoder.state_dict(),
                         "optimizer": optimizer.state_dict(),
+                        "global_step": global_step,
+                        "lpips_factor": lpips_factor,
                         "config": {
                             "embedding_dim": EMBEDDING_DIM,
                             "codebook_size": CODEBOOK_SIZE,
@@ -558,7 +572,7 @@ def main():
                     if perceptual_loss_fn is not None:
                         val_lpips_loss = perceptual_loss_fn(x_recon, x).mean()
                         val_lpips_loss_value = val_lpips_loss.item()
-                        recon_loss = val_mse_loss + val_lpips_loss * 0.3
+                        recon_loss = val_mse_loss + val_lpips_loss * lpips_factor
                     else:
                         recon_loss = val_mse_loss
                     loss = recon_loss + vq_loss
@@ -619,6 +633,7 @@ def main():
             "decoder": model.decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
             "global_step": global_step,
+            "lpips_factor": lpips_factor,
             "config": {
                 "embedding_dim": EMBEDDING_DIM,
                 "codebook_size": CODEBOOK_SIZE,
