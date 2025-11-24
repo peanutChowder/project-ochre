@@ -31,7 +31,7 @@ except ImportError:
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
 EPOCHS = 15
-BATCH_SIZE = 256
+BATCH_SIZE = 64
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 1024
@@ -42,18 +42,18 @@ IMAGE_HEIGHT = 72
 IMAGE_WIDTH = 128
 LOG_EVERY = 10
 SAVE_DIR = '/kaggle/working'
-NUM_WORKERS = 4
+NUM_WORKERS = 12
 VAL_SPLIT = 0.1
 USE_WANDB = True
-RUN_NAME = "v2.1.3-epoch0"
-OUTPUT_NAME = "vqvae_v2.1.3_"
+RUN_NAME = "v2.1.4-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.4_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
 SIGNAL_LOGGING = True
 
 # LPIPS
-USE_LPIPS = True
+USE_LPIPS = False
 LPIPS_EPOCHS_TO_INCREASE = 10
 MAX_LPIPS_FACTOR = 0.1
 

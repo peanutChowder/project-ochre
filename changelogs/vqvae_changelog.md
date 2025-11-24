@@ -106,3 +106,7 @@ Results
 
 **v2.1.3**
 - Added additional signal logging for triaging
+
+**v2.1.4**
+- Decreased batch size to 64 
+- Increased num_workers 4 -> 12
