@@ -30,8 +30,8 @@ except ImportError:
 
 # Configuration constants for Kaggle environment
 DATA_DIR = '/kaggle/input/dataset'
-EPOCHS = 10
-BATCH_SIZE = 196
+EPOCHS = 15
+BATCH_SIZE = 256
 LR = 1e-3
 EMBEDDING_DIM = 384
 CODEBOOK_SIZE = 1024
@@ -45,10 +45,12 @@ SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_WANDB = True
-RUN_NAME = "v2.1.2-epoch0"
-OUTPUT_NAME = "vqvae_v2.1.2_"
+RUN_NAME = "v2.1.3-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.3_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
+
+SIGNAL_LOGGING = True
 
 # LPIPS
 USE_LPIPS = True
@@ -419,6 +421,35 @@ def main():
                 else:
                     recon_loss = mse_loss
                 loss = recon_loss + vq_loss
+
+            # Debug logging for early batches to inspect signal flow
+            if epoch == start_epoch and step <= 3 and SIGNAL_LOGGING:
+                with torch.no_grad():
+                    x_cpu = x.detach().cpu()
+                    x_recon_cpu = x_recon.detach().cpu()
+                    z_e_cpu = z_e.detach().cpu()
+                    quantized_cpu = quantized.detach().cpu()
+
+                    print(f"[DEBUG] Epoch {epoch} Step {step}")
+                    print(f"  x      mean={x_cpu.mean():.4f} std={x_cpu.std():.4f} "
+                          f"min={x_cpu.min():.4f} max={x_cpu.max():.4f}")
+                    print(f"  x_rec  mean={x_recon_cpu.mean():.4f} std={x_recon_cpu.std():.4f} "
+                          f"min={x_recon_cpu.min():.4f} max={x_recon_cpu.max():.4f}")
+                    print(f"  z_e    mean={z_e_cpu.mean():.4f} std={z_e_cpu.std():.4f} "
+                          f"min={z_e_cpu.min():.4f} max={z_e_cpu.max():.4f}")
+                    print(f"  q(z_e) mean={quantized_cpu.mean():.4f} std={quantized_cpu.std():.4f} "
+                          f"min={quantized_cpu.min():.4f} max={quantized_cpu.max():.4f}")
+
+                    # Quantization error summary
+                    delta = (quantized_cpu - z_e_cpu).abs()
+                    print(f"  |q - z_e| mean={delta.mean():.6f} std={delta.std():.6f} "
+                          f"min={delta.min():.6f} max={delta.max():.6f}")
+
+                    # Per-batch code usage
+                    unique_codes = torch.unique(encoding_indices.cpu())
+                    print(f"  Codes used in this batch: {unique_codes.numel()} / {CODEBOOK_SIZE}")
+                    print(f"  Batch MSE={mse_loss.item():.6f}, VQ loss={vq_loss.item():.6e}, "
+                          f"LPIPS={lpips_loss_value:.6f}, Total loss={loss.item():.6f}")
 
             if not torch.isfinite(loss):
                 print("⚠️  Skipping batch due to non-finite loss.")

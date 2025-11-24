@@ -103,3 +103,6 @@ Results
 
 Results
 - Batch size is not the culprit
+
+**v2.1.3**
+- Added additional signal logging for triaging
