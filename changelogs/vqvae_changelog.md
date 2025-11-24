@@ -112,3 +112,17 @@ Results
 - Increased num_workers 4 -> 12
 - Re-enabled LPIPS with a more gradual schedule
 - Reduced beta 0.25 -> 0.05
+
+Epoch 15 Results:
+- Recovered some of the image, no longer just grey
+- Entire image is still heavily greyed out
+- The few details starting to peek out are heavily saturated - suspect LPIPS trying to fight MSE grey averaging
+
+**v2.1.5**
+- Fixed decoder final transposed conv outputs from passing through ReLU before sigmoid which now allows use of full [0, 1] colour range.
+- Corrected LPIPS usage by normalizing inputs to roughly [-1,1] before computing perceptual loss, preventing biasing towards low contrast images.
+
+Epoch 15 Results:
+- Grey averaging fixed! Sharpness fixed!
+- Land scenes are nearly identical to original picture, even pixelations within dirt/sand blocks are preserved well.
+- Sky scenes have block pixelation imprinted on them

@@ -45,8 +45,8 @@ SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 12
 VAL_SPLIT = 0.1
 USE_WANDB = True
-RUN_NAME = "v2.1.4-epoch0"
-OUTPUT_NAME = "vqvae_v2.1.4_"
+RUN_NAME = "v2.1.5-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.5_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
@@ -123,7 +123,7 @@ class Decoder(nn.Module):
         x = self.res_latent(x)
         x = self.relu(self.conv_trans1(x))
         x = self.res_mid1(x)
-        x = self.relu(self.conv_trans2(x))
+        x = self.conv_trans2(x)
         x = torch.sigmoid(x)
         return x
 
@@ -416,8 +416,10 @@ def main():
                 mse_loss = F.mse_loss(x_recon, x)
                 lpips_loss_value = 0.0
                 if perceptual_loss_fn is not None:
-
-                    lpips_loss = perceptual_loss_fn(x_recon, x).mean()
+                    # LPIPS expects inputs roughly in [-1, 1]
+                    x_lpips = (x * 2.0 - 1.0).clamp(-1.0, 1.0)
+                    x_recon_lpips = (x_recon * 2.0 - 1.0).clamp(-1.0, 1.0)
+                    lpips_loss = perceptual_loss_fn(x_recon_lpips, x_lpips).mean()
                     lpips_loss_value = lpips_loss.item()
                     recon_loss = mse_loss + lpips_loss * lpips_factor  # LPIPS weighted in recon_loss
                 else:
@@ -603,7 +605,10 @@ def main():
                     val_mse_loss = F.mse_loss(x_recon, x)
                     val_lpips_loss_value = 0.0
                     if perceptual_loss_fn is not None:
-                        val_lpips_loss = perceptual_loss_fn(x_recon, x).mean()
+                        # LPIPS expects inputs roughly in [-1, 1]
+                        x_lpips = (x * 2.0 - 1.0).clamp(-1.0, 1.0)
+                        x_recon_lpips = (x_recon * 2.0 - 1.0).clamp(-1.0, 1.0)
+                        val_lpips_loss = perceptual_loss_fn(x_recon_lpips, x_lpips).mean()
                         val_lpips_loss_value = val_lpips_loss.item()
                         recon_loss = val_mse_loss + val_lpips_loss * lpips_factor
                     else:
