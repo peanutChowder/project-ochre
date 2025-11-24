@@ -45,15 +45,15 @@ SAVE_DIR = '/kaggle/working'
 NUM_WORKERS = 4
 VAL_SPLIT = 0.1
 USE_WANDB = True
-RUN_NAME = "v2.1.0-epoch0"
-OUTPUT_NAME = "vqvae_v2.1.0_"
+RUN_NAME = "v2.1.1-epoch0"
+OUTPUT_NAME = "vqvae_v2.1.1_"
 LOAD_FROM_SAVE = ""
 EMERGENCY_SAVE_HOURS = 11.8
 
 # LPIPS
 USE_LPIPS = True
-LPIPS_EPOCHS_TO_INCREASE = 5
-MAX_LPIPS_FACTOR = 0.3
+LPIPS_EPOCHS_TO_INCREASE = 10
+MAX_LPIPS_FACTOR = 0.1
 
 
 
@@ -392,7 +392,7 @@ def main():
         steps = 0
 
         if (epoch % LPIPS_EPOCHS_TO_INCREASE) == 0 and lpips_factor < MAX_LPIPS_FACTOR:
-            lpips_factor += 0.05
+            lpips_factor += 0.005
             print(f"🔵 Increasing LPIPS to {lpips_factor}")
 
         # --------------------

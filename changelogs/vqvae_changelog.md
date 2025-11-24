@@ -90,3 +90,11 @@ Epoch 60 (cont. from 2.0.4-epoch30) Results:
 
 Results:
 - Just a grey image
+
+**v2.1.1**
+- Reduced LPIPS increase factor to +0.005 every 10 epochs
+
+Results
+- Still grey
+- LPIPS likely not cause - collapse in vq_loss suddenly drops from ~0.1 to 1e-8 in 2 epochs
+
