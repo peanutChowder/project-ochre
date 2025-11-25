@@ -126,3 +126,6 @@ Epoch 15 Results:
 - Grey averaging fixed! Sharpness fixed!
 - Land scenes are nearly identical to original picture, even pixelations within dirt/sand blocks are preserved well.
 - Sky scenes have block pixelation imprinted on them
+
+**v2.1.6**
+- Decreased LPIPS schedule further
