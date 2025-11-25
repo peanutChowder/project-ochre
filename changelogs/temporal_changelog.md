@@ -115,3 +115,7 @@ Dataset:
 Temporal Training:
 - Added mixed‑precision training (autocast + GradScaler) for more memory efficient rollouts.
 - Switched to streaming autoregressive loss over time steps (using `model.step`) to avoid storing all logits and reduce peak VRAM.
+
+Preprocessing
+- Adjusted for GameFactory dataset format (ws, ad, etc.)
+- Added persistent metadata on preprocessing format due to large size

@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Preprocess MineRL Navigate dataset for autoregressive training.
+Preprocess GameFactory dataset into VQ‑VAE token + action sequences for autoregressive training.
 
-For each subfolder with recording.mp4 + rendered.npz:
-  - Align actions to frames via step→frame mapping (uses metadata duration when available).
-  - Downsample in step space to target FPS and resize frames.
-  - Encode frames to discrete codes using your trained VQ‑VAE in vq_vae/checkpoints.
-  - Save one .npz per trajectory with:
-      tokens: [K, H, W] uint16 (K kept frames; H=W≈16 for 64×64 inputs)
-      actions: [K−1, 4] float32 = [yaw, pitch, move_x, move_z]
-  - Write out_dir/manifest.json with per‑trajectory lengths to enforce boundaries when sampling sequences.
+Layout (data_2003):
+- parent_dir/metadata/*.json  (per‑frame actions)
+- parent_dir/video/*.mp4      (matching basename)
+- parent_dir/annotation.csv   (optional, not used here)
+
+Pipeline:
+- Align actions to frames via simple linspace mapping.
+- Optionally downsample in step space to a target FPS (default 16).
+- Resize frames to the VQ‑VAE training resolution (IMAGE_WIDTH x IMAGE_HEIGHT).
+- Encode frames to discrete codes using the trained VQ‑VAE.
+- Save one .npz per video with:
+    tokens: [K, H, W] uint16
+    actions: [K−1, 5] float32 = [yaw, pitch, move_x, move_z, jump]
+- Maintain manifest.json with per‑trajectory lengths.
 
 This avoids mid‑training VQ‑VAE encodes. For n‑step autoregressive loss, sample within a single
 trajectory file using manifest lengths so you never cross video boundaries.
@@ -21,7 +27,9 @@ from PIL import Image
 from tqdm import tqdm
 import imageio.v3 as iio
 import torch
-from vq_vae.vq_vae import Encoder, VectorQuantizerEMA
+from vq_vae.vq_vae import Encoder, VectorQuantizerEMA, IMAGE_HEIGHT, IMAGE_WIDTH
+
+PROGRESS_FILENAME = "progress.json"
 
 def _safe_linspace_idx(count_from: int, count_to: int, n: int) -> np.ndarray:
     """Integer index mapping by rounding linspace.
@@ -35,17 +43,59 @@ def _safe_linspace_idx(count_from: int, count_to: int, n: int) -> np.ndarray:
     idx = np.round(xs).astype(int)
     return np.clip(idx, 0, max(count_to - 1, 0))
 
-def build_action_matrix(d):
-    """Combine MineRL camera + WASD actions into a [T,4] float32 matrix.
 
-    Columns: [yaw, pitch, move_x, move_z]
-    - yaw/pitch are scaled to [-1,1] range (degrees/15)
-    - move_x = right - left, move_z = forward - back
+def build_action_matrix_gamefactory(actions_dict: dict, angle_scale: float = 0.3) -> np.ndarray:
     """
-    cam = np.clip(d["action$camera"], -15.0, 15.0) / 15.0
-    move_x = d["action$right"] - d["action$left"]
-    move_z = d["action$forward"] - d["action$back"]
-    return np.stack([cam[:, 1], cam[:, 0], move_x, move_z], axis=1).astype(np.float32)
+    Build [T,5] float32 matrix from GameFactory metadata actions.
+
+    Expected per-step keys:
+      - ws: 0/1/2 → none / W (forward) / S (backward)
+      - ad: 0/1/2 → none / A (left) / D (right)
+      - yaw_delta, pitch_delta: float deltas
+      - scs: 0/1/2/3 → none / jump (Space) / sneak (Shift) / sprint (Ctrl)
+
+    Mapping:
+      move_z: +1 = forward (W), -1 = backward (S), 0 = none
+      move_x: -1 = left (A), +1 = right (D), 0 = none
+      yaw/pitch are scaled deltas, roughly normalized to [-1,1].
+      jump is a binary flag derived from scs (1 when Space/jump is active).
+    """
+    idxs = sorted(actions_dict.keys(), key=lambda k: int(k))
+    T = len(idxs)
+    yaw = np.zeros(T, dtype=np.float32)
+    pitch = np.zeros(T, dtype=np.float32)
+    move_x = np.zeros(T, dtype=np.float32)
+    move_z = np.zeros(T, dtype=np.float32)
+    jump = np.zeros(T, dtype=np.float32)
+    for i, k in enumerate(idxs):
+        a = actions_dict[k]
+        ws = int(a.get("ws", 0))
+        ad = int(a.get("ad", 0))
+        scs = int(a.get("scs", 0))
+        yaw_delta = float(a.get("yaw_delta", 0.0))
+        pitch_delta = float(a.get("pitch_delta", 0.0))
+        # Forward/back: 1=W (forward) → +1, 2=S (backward) → -1
+        if ws == 1:
+            move_z[i] = 1.0
+        elif ws == 2:
+            move_z[i] = -1.0
+        else:
+            move_z[i] = 0.0
+
+        # Strafe: 1=A (left) → -1, 2=D (right) → +1
+        if ad == 1:
+            move_x[i] = -1.0
+        elif ad == 2:
+            move_x[i] = 1.0
+        else:
+            move_x[i] = 0.0
+        yaw[i] = yaw_delta / max(angle_scale, 1e-6)
+        pitch[i] = pitch_delta / max(angle_scale, 1e-6)
+        # scs == 1 corresponds to Space/jump; other values are ignored for now.
+        jump[i] = 1.0 if scs == 1 else 0.0
+    yaw = np.clip(yaw, -1.0, 1.0)
+    pitch = np.clip(pitch, -1.0, 1.0)
+    return np.stack([yaw, pitch, move_x, move_z, jump], axis=1).astype(np.float32)
 
 def load_vqvae(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -70,143 +120,46 @@ def load_vqvae(checkpoint_path: str, device: torch.device):
     enc.eval(); quant.eval()
     return enc, quant
 
+def _load_progress(progress_path: Path) -> dict:
+    if not progress_path.exists():
+        return {"processed": []}
+    try:
+        with progress_path.open("r") as f:
+            return json.load(f)
+    except Exception:
+        return {"processed": []}
 
-def process_trajectory(
-    traj_dir: Path,
-    out_dir: Path,
-    encoder,
-    quantizer,
-    device,
-    fps_target: int = 8,
-    size: int = 64,
-    skip_sec: float = 0.0,
-    encode_batch: int = 64,
-) -> int:
-    """
-    Process a single trajectory directory.
-    Returns 1 if saved successfully.
 
-    Note: During downsampling, movement action booleans are max-pooled within each frame group
-    to preserve transient keypresses (e.g., "W" pressed between sampled frames).
-    Camera deltas are averaged across the window to preserve smooth movement data.
-    Frames are encoded to discrete tokens using TinyVQ-VAE before saving.
-    """
-    # ---- Load metadata and arrays ----
-    meta = {}
-    mp = traj_dir / "metadata.json"
-    if mp.exists():
-        try:
-            meta = json.loads(mp.read_text())
-        except Exception:
-            meta = {}
+def _save_progress(progress_path: Path, progress: dict) -> None:
+    tmp = progress_path.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(progress, f, indent=2)
+    tmp.replace(progress_path)
 
-    d = np.load(traj_dir / "rendered.npz", allow_pickle=True)
-    per_step_actions = build_action_matrix(d)  # length T
-    T = per_step_actions.shape[0]
 
-    # ---- Decode all video frames ----
-    frames = [np.asarray(f) for f in iio.imiter(traj_dir / "recording.mp4")]
-    F = len(frames)
-    if F < 2 or T < 1:
-        return 0
-
-    # ---- Optional proportional skip by time ----
-    duration_ms = meta.get("duration_ms")
-    if duration_ms and duration_ms > 0 and skip_sec > 0.0:
-        skip_ms = int(round(skip_sec * 1000))
-        skip_steps = int(round(T * (skip_ms / duration_ms)))
-        skip_frames = int(round(F * (skip_ms / duration_ms)))
-    else:
-        print(f"Warning: {traj_dir} has duration {duration_ms}, defaulting to 20FPS")
-        skip_steps = 0
-        skip_frames = 0
-
-    if skip_steps > 0 or skip_frames > 0:
-        per_step_actions = per_step_actions[skip_steps:]
-        frames = frames[skip_frames:]
-        T = per_step_actions.shape[0]
-        F = len(frames)
-        if F < 2 or T < 1:
-            return 0
-
-    # ---- Map step indices (0..T) to frame indices (0..F-1) ----
-    step_to_frame = _safe_linspace_idx(T + 1, F, T + 1)  # length T+1
-
-    # ---- Choose kept state indices in step space using target FPS ----
-    if duration_ms and duration_ms > 0:
-        eff_ms = max(1, duration_ms - int(round(skip_sec * 1000))) if skip_sec > 0 else duration_ms
-        target_states = max(2, int(round((eff_ms / 1000.0) * fps_target)) + 1)
-    else:
-        # Fallback heuristic if metadata missing
-        approx_native = 20.0
-        approx_dur_s = F / approx_native
-        target_states = max(2, int(round(approx_dur_s * fps_target)) + 1)
-
-    kept_states = np.round(np.linspace(0, T, min(T + 1, target_states))).astype(int)
-    kept_states = np.unique(np.append(kept_states, T))
-    if kept_states[0] != 0:
-        kept_states = np.insert(kept_states, 0, 0)
-    if kept_states.size < 2:
-        return 0
-
-    # ---- Select frames for kept states and aggregate actions between them ----
-    kept_frame_idx = step_to_frame[kept_states]
-    kept_frames = [frames[i] for i in kept_frame_idx]
-
-    agg_actions = []
-    for i in range(len(kept_states) - 1):
-        s0, s1 = kept_states[i], kept_states[i + 1]
-        window = per_step_actions[s0:s1]
-        if window.shape[0] == 0:
-            agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(4, dtype=np.float32))
+def _update_manifest(out_dir: Path) -> None:
+    manifest = []
+    for npz_path in sorted(out_dir.glob("*.npz")):
+        if npz_path.name == "manifest.json":
             continue
-        pooled = np.mean(window, axis=0)
-        agg_actions.append(pooled.astype(np.float32))
-    actions = np.stack(agg_actions, axis=0)
+        try:
+            z = np.load(npz_path)
+            manifest.append({"file": npz_path.name, "length": int(z["tokens"].shape[0])})
+        except Exception:
+            continue
+    (out_dir / "manifest.json").write_text(json.dumps({"sequences": manifest}, indent=2))
 
-    assert actions.shape[0] == len(kept_frames) - 1, (
-        f"Alignment error: actions {actions.shape[0]} vs frames {len(kept_frames)}")
-
-    # ---- Resize frames ----
-    T = len(kept_frames)
-    resized = np.zeros((T, size, size, 3), dtype=np.uint8)
-    for i, img in enumerate(kept_frames):
-        im = Image.fromarray(img)
-        im = im.resize((size, size), Image.BICUBIC)
-        resized[i] = np.asarray(im, dtype=np.uint8)
-
-    # ---- Encode frames to discrete tokens using trained VQ-VAE ----
-    tokens_list = []
-    encoder.eval(); quantizer.eval()
-    with torch.no_grad():
-        for i in range(0, T, encode_batch):
-            chunk = torch.from_numpy(resized[i:i+encode_batch]).permute(0,3,1,2).float() / 255.0
-            chunk = chunk.to(device)
-            z_e = encoder(chunk)
-            _, _, _, enc_idx = quantizer(z_e)
-            H, W = z_e.shape[2], z_e.shape[3]
-            enc_idx = enc_idx.view(-1, H, W)
-            tokens_list.append(enc_idx.cpu().to(torch.int32))
-    tokens = torch.cat(tokens_list, dim=0).numpy().astype(np.uint16)
-
-    # ---- Save full trajectory tokens and actions ----
-    out_name = f"{traj_dir.name}.npz"
-    # tokens.shape[0] == actions.shape[0] + 1
-    np.savez_compressed(
-        out_dir / out_name,
-        tokens=tokens,
-        actions=actions,
-    )
-    print(f"Saved tokens and actions for trajectory {traj_dir.name}")
-    return 1
 
 def main(parent_dir: str,
          out_dir: str,
-         fps_target: int = 8,
-         size: int = 64,
-         skip_sec: float = 0.0,
+         fps_target: int = 16,
          vqvae_ckpt: str = "vq_vae/checkpoints/vqvae_epoch_10.pt",
-         encode_batch: int = 64):
+         encode_batch: int = 64,
+         angle_scale: float = 0.3):
+    """
+    parent_dir: GameFactory data_2003 directory containing metadata/ and video/.
+    fps_target: target FPS after downsampling in step space (default 16).
+    """
     parent = Path(parent_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -214,53 +167,117 @@ def main(parent_dir: str,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder, quantizer = load_vqvae(vqvae_ckpt, device)
 
-    trajs = [p for p in parent.iterdir()
-             if p.is_dir() and (p / "rendered.npz").exists()
-                             and (p / "recording.mp4").exists()]
+    progress_path = out / PROGRESS_FILENAME
+    progress = _load_progress(progress_path)
+    processed_set = set(progress.get("processed", []))
 
+    meta_dir = parent / "metadata"
+    video_dir = parent / "video"
+    meta_files = sorted(meta_dir.glob("*.json"))
     total = 0
-    for traj in tqdm(trajs, desc="Processing trajectories"):
-        total += process_trajectory(
-            traj,
-            out,
-            encoder=encoder,
-            quantizer=quantizer,
-            device=device,
-            fps_target=fps_target,
-            size=size,
-            skip_sec=skip_sec,
-            encode_batch=encode_batch,
-        )
-    print(f"\nProcessed {len(trajs)} trajectories")
-    print(f"Saved {total} sequences to {out}")
-    # Emit a manifest summarizing per-trajectory sequence lengths
-    manifest = []
-    for traj in trajs:
-        out_name = f"{traj.name}.npz"
-        op = out / out_name
-        if op.exists():
-            try:
-                z = np.load(op)
-                manifest.append({"file": out_name, "length": int(z["tokens"].shape[0])})
-            except Exception:
-                pass
-    (out / "manifest.json").write_text(json.dumps({"sequences": manifest}, indent=2))
+    for meta_path in tqdm(meta_files, desc="Processing GameFactory videos"):
+        stem = meta_path.stem
+        if stem in processed_set:
+            continue
+        video_path = video_dir / (stem + ".mp4")
+        if not video_path.exists():
+            continue
+        try:
+            with meta_path.open("r") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+
+        actions_dict = meta.get("actions", {})
+        if not actions_dict:
+            continue
+        per_step_actions = build_action_matrix_gamefactory(actions_dict, angle_scale=angle_scale)
+        T = per_step_actions.shape[0]
+
+        try:
+            frames = [np.asarray(f) for f in iio.imiter(video_path)]
+        except Exception:
+            continue
+        F = len(frames)
+        if F < 2 or T < 1:
+            continue
+
+        step_to_frame = _safe_linspace_idx(T + 1, F, T + 1)
+
+        approx_native = 16.0
+        approx_dur_s = T / approx_native
+        if fps_target > 0:
+            target_states = max(2, int(round(approx_dur_s * fps_target)) + 1)
+        else:
+            target_states = T + 1
+        kept_states = np.round(np.linspace(0, T, min(T + 1, target_states))).astype(int)
+        kept_states = np.unique(np.append(kept_states, T))
+        if kept_states[0] != 0:
+            kept_states = np.insert(kept_states, 0, 0)
+        if kept_states.size < 2:
+            continue
+
+        kept_frame_idx = step_to_frame[kept_states]
+        kept_frames = [frames[i] for i in kept_frame_idx]
+
+        agg_actions = []
+        for i in range(len(kept_states) - 1):
+            s0, s1 = kept_states[i], kept_states[i + 1]
+            window = per_step_actions[s0:s1]
+            if window.shape[0] == 0:
+                agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(5, dtype=np.float32))
+                continue
+            pooled = np.mean(window, axis=0)
+            agg_actions.append(pooled.astype(np.float32))
+        actions = np.stack(agg_actions, axis=0)
+
+        if actions.shape[0] != len(kept_frames) - 1:
+            continue
+
+        T_kept = len(kept_frames)
+        resized = np.zeros((T_kept, IMAGE_HEIGHT, IMAGE_WIDTH, 3), dtype=np.uint8)
+        for i, img in enumerate(kept_frames):
+            im = Image.fromarray(img)
+            im = im.resize((IMAGE_WIDTH, IMAGE_HEIGHT), Image.BICUBIC)
+            resized[i] = np.asarray(im, dtype=np.uint8)
+
+        tokens_list = []
+        encoder.eval(); quantizer.eval()
+        with torch.no_grad():
+            for i in range(0, T_kept, encode_batch):
+                chunk = torch.from_numpy(resized[i:i+encode_batch]).permute(0,3,1,2).float() / 255.0
+                chunk = chunk.to(device)
+                z_e = encoder(chunk)
+                _, _, _, enc_idx = quantizer(z_e)
+                H, W = z_e.shape[2], z_e.shape[3]
+                enc_idx = enc_idx.view(-1, H, W)
+                tokens_list.append(enc_idx.cpu().to(torch.int32))
+        tokens = torch.cat(tokens_list, dim=0).numpy().astype(np.uint16)
+
+        out_name = f"{stem}.npz"
+        np.savez_compressed(out / out_name, tokens=tokens, actions=actions)
+        total += 1
+        processed_set.add(stem)
+        progress["processed"] = sorted(processed_set)
+        _save_progress(progress_path, progress)
+
+    print(f"\nProcessed {total} GameFactory videos into {out}")
+
+    _update_manifest(out)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--parent_dir", required=True,
-                   help="Path to MineRLNavigate-v0 parent directory")
+                   help="Path to GameFactory data_2003 directory (with metadata/ and video/)")
     p.add_argument("--out_dir", required=True,
                    help="Directory to save processed sequences")
-    p.add_argument("--fps_target", type=int, default=8,
-                   help="Target FPS after downsampling (default 8)")
-    p.add_argument("--size", type=int, default=64,
-                   help="Output frame size (default 64)")
-    p.add_argument("--skip_sec", type=float, default=0.0,
-                   help="Skip this many seconds at start (proportional)")
+    p.add_argument("--fps_target", type=int, default=16,
+                   help="Target FPS after downsampling (default 16)")
     p.add_argument("--vqvae_ckpt", type=str, default="vq_vae/checkpoints/vqvae_epoch_10.pt",
                    help="Path to trained VQ-VAE checkpoint for encoding frames")
     p.add_argument("--encode_batch", type=int, default=64,
                    help="Batch size for VQ-VAE encoding")
+    p.add_argument("--angle_scale", type=float, default=1.0,
+                   help="Scale factor for GameFactory yaw/pitch deltas before clipping to [-1,1]")
     args = p.parse_args()
     main(**vars(args))
