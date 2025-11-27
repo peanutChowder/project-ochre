@@ -110,12 +110,14 @@ Training (train.py + model):
 **v4.0**
 Dataset:
 - Changed to GameFactory, 69.6hrs with unbiased action sampling + focus on isolated actions
-- 16FPS, 640x360
+- Native 16FPS, 640x360 source videos → resized to 128x72 and encoded with VQ‑VAEv2.1.6 to 32x18 latent grids.
 
 Temporal Training:
 - Added mixed‑precision training (autocast + GradScaler) for more memory efficient rollouts.
 - Switched to streaming autoregressive loss over time steps (using `model.step`) to avoid storing all logits and reduce peak VRAM.
+- Updated world model to `action_dim=5` and latent dims `H=18, W=32`, `[yaw, pitch, move_x, move_z, jump]` actions aligned with GameFactory controls.
 
 Preprocessing
-- Adjusted for GameFactory dataset format (ws, ad, etc.)
-- Added persistent metadata on preprocessing format due to large size
+- New `preprocess.py` path for GameFactory: uses `metadata/*.json` + `video/*.mp4` and writes `preprocessedv4`.
+- Action encoding: `actions[t] = [yaw_delta, pitch_delta, move_x, move_z, jump]` where yaw/pitch are normalized deltas, `move_x/move_z` are in {−1,0,+1} from `ad/ws`, and `jump` comes from `scs` (Space).
+- Outputs per‑video `.npz` with `tokens: [K, 18, 32]` and `actions: [K−1, 5]`, plus a `manifest.json`

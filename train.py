@@ -11,13 +11,18 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
 from torch.amp.grad_scaler import GradScaler
-import wandb
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+    print("⚠️  wandb not found, logging disabled.")
 
 # ---------- CONFIG ----------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 BASE_SEQ_LEN = 15      # initial context
 MAX_SEQ_LEN = 40       # maximum unroll window
 EPOCHS = 50
@@ -27,16 +32,12 @@ SPIKE_LOSS = 7
 SPIKE_GRAD = 400
 
 PROJECT = "project-ochre"
-RUN_NAME = "v3.0-epoch0"
-MODEL_OUT_PREFIX = "ochre-"
+RUN_NAME = "v4.0-training"
+MODEL_OUT_PREFIX = "ochre-v4"
 resume_path = ""  
 
-
-wandb.init(project=PROJECT, name=RUN_NAME, resume="allow",
-           config=dict(batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS))
-
 # ---------- DATASET ----------
-class MineRLTokenDataset(Dataset):
+class GTTokenDataset(Dataset):
     """Loads pre-tokenized MineRL sequences for autoregressive world model training."""
     def __init__(self, manifest_path, root_dir, seq_len=6):
         with open(manifest_path, "r") as f:
@@ -46,6 +47,11 @@ class MineRLTokenDataset(Dataset):
         self.index_map = []
         for vid_idx, meta in enumerate(self.entries):
             L = meta["length"]
+            # We need seq_len inputs + 1 target.
+            # actions length is L-1.
+            # We need valid indices for tokens[start : start+seq_len+1]
+            # Max index is start+seq_len. This must be < L.
+            # So start < L - seq_len.
             if L > seq_len + 1:
                 for i in range(L - (seq_len + 1)):
                     self.index_map.append((vid_idx, i))
@@ -59,12 +65,13 @@ class MineRLTokenDataset(Dataset):
         path = os.path.join(self.root_dir, meta["file"])
         data = np.load(path)  # loads arrays like {"tokens": ..., "actions": ...}
         tokens = data["tokens"]   # shape (T, H, W) of discrete VQ-VAE indices over time
-        actions = data["actions"] # shape (T, A) of continuous action vectors per frame
+        actions = data["actions"] # shape (T-1, A) of continuous action vectors per frame
 
         # Take a window of length seq_len from this video.
         # Z_seq are the input tokens at times [t, ..., t+seq_len-1]
         # Z_target_seq are the next-step tokens [t+1, ..., t+seq_len]
         Z_seq = tokens[start:start + self.seq_len]
+        # actions[i] is action between tokens[i] and tokens[i+1]
         A_seq = actions[start:start + self.seq_len]
         Z_target_seq = tokens[start + 1:start + self.seq_len + 1]
 
@@ -77,8 +84,16 @@ class MineRLTokenDataset(Dataset):
             start                
         )
 
+# Initialize wandb
+if wandb:
+    wandb.init(project=PROJECT, name=RUN_NAME, resume="allow",
+                config=dict(batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS))
+else:
+    print("⚠️  wandb not found, logging disabled.")
+
 # ---------- MODEL ----------
-model = WorldModelConvFiLM().to(DEVICE)
+# Instantiate model with correct action dimension (5) and latent dims (18x32)
+model = WorldModelConvFiLM(action_dim=5, H=18, W=32).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 global_step = 0
@@ -106,15 +121,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
     print(f"🧩 Curriculum unrolling active → seq_len = {seq_len}")
 
     # Rebuild dataset and DataLoader each epoch to avoid stale worker state when seq_len changes
-    dataset = MineRLTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
+    dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
     if len(dataset) == 0:
         print(f"Warning: No sequences available for seq_len={seq_len}. Skipping epoch {epoch}.")
         continue
+    
     loader  = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=16,
         pin_memory=(DEVICE == "cuda"),
         persistent_workers=False,
     )
@@ -215,29 +231,32 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 conf_last = p_last.max(dim=1).values.mean().item()
 
             lr = optimizer.param_groups[0].get("lr", 0.0)
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/ppl": ppl,
-                "train/loss_first": loss_first,
-                "train/loss_last": loss_last,
-                "train/ppl_first": ppl_first,
-                "train/ppl_last": ppl_last,
-                "train/acc_last": acc_last,
-                "train/entropy_last": entropy_last,
-                "train/conf_last": conf_last,
-                "train/grad_norm": float(grad_norm),
-                "seq_len": seq_len,
-                "lr": lr,
-            }, step=global_step)
+            if wandb:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/ppl": ppl,
+                    "train/loss_first": loss_first,
+                    "train/loss_last": loss_last,
+                    "train/ppl_first": ppl_first,
+                    "train/ppl_last": ppl_last,
+                    "train/acc_last": acc_last,
+                    "train/entropy_last": entropy_last,
+                    "train/conf_last": conf_last,
+                    "train/grad_norm": float(grad_norm),
+                    "seq_len": seq_len,
+                    "lr": lr,
+                }, step=global_step)
 
     epoch_loss = total_loss / len(loader)
     print(f"Epoch {epoch}: mean loss {epoch_loss:.4f}")
-    wandb.log({
-        "epoch": epoch,
-        "mean_loss": epoch_loss,
-        "mean_ppl": math.exp(epoch_loss),
-    })
+    if wandb:
+        wandb.log({
+            "epoch": epoch,
+            "mean_loss": epoch_loss,
+            "mean_ppl": math.exp(epoch_loss),
+        })
 
+    # Save checkpoint to Kaggle working directory
     torch.save({
         "epoch": epoch,
         "global_step": global_step,
@@ -245,5 +264,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         "optimizer_state": optimizer.state_dict(),
     }, f"/kaggle/working/{MODEL_OUT_PREFIX}_epoch_{epoch}.pt")
 
-wandb.finish()
+if wandb:
+    wandb.finish()
 print("✅ Training complete.")
+
