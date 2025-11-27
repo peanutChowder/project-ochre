@@ -26,15 +26,23 @@ BATCH_SIZE = 16
 BASE_SEQ_LEN = 15      # initial context
 MAX_SEQ_LEN = 40       # maximum unroll window
 EPOCHS = 50
-LR = 3e-4
+LR = 3e-5             # Base learning rate after warmup
+WARMUP_STEPS = 500   # Number of steps for linear LR warmup
+MIN_LR = 1e-6         # Starting learning rate for warmup
 CURRICULUM_UNROLL = True  # gradually increase sequence length
-SPIKE_LOSS = 7
-SPIKE_GRAD = 400
+
 
 PROJECT = "project-ochre"
 RUN_NAME = "v4.0-training"
 MODEL_OUT_PREFIX = "ochre-v4"
 resume_path = ""  
+
+LOG_STEPS = 10
+REPORT_SPIKES = True
+SPIKE_LOSS = 9
+SPIKE_GRAD = 400
+EMERGENCY_SAVE_INTERVAL_HRS = 11.8  # Save a checkpoint every N hours
+
 
 # ---------- DATASET ----------
 class GTTokenDataset(Dataset):
@@ -109,7 +117,25 @@ if os.path.exists(resume_path):
 else:
     print(" No checkpoint found — starting fresh.")
 
+
+def save_checkpoint(epoch, global_step, model, optimizer, is_emergency=False):
+    """Saves a training checkpoint."""
+    base_name = f"{MODEL_OUT_PREFIX}_epoch_{epoch}"
+    suffix = "_emergency" if is_emergency else ""
+    save_path = f"/kaggle/working/{base_name}{suffix}.pt"
+    
+    save_type = "emergency" if is_emergency else "epoch"
+    print(f"⏰ Saving {save_type} checkpoint to {save_path}")
+    torch.save({
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+    }, save_path)
+
+
 # ---------- TRAINING LOOP ----------
+last_emergency_save_time = time.time()
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     total_loss = 0.0
@@ -130,7 +156,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=16,
+        num_workers=4,
         pin_memory=(DEVICE == "cuda"),
         persistent_workers=False,
     )
@@ -149,6 +175,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
         B, K, H, W = Z_seq.shape
         step_losses = []
         logits_last = None
+
+        # --- LR Scheduler: Warmup ---
+        if global_step < WARMUP_STEPS:
+            # Linear warmup from MIN_LR to LR
+            new_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lr
+        elif global_step == WARMUP_STEPS:
+            # Ensure LR is set to the base value after warmup
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = LR
+        # --- End LR Scheduler ---
 
         # Reset gradients for this batch.
         optimizer.zero_grad()
@@ -180,7 +218,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         scaler.step(optimizer)
         scaler.update()
 
-        if loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD:
+        if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
             print("\n Large spike --------------")
             print(f"  global_step={global_step}")
             print(f"  loss={loss.item():.4f}, grad_norm={float(grad_norm):.2f}")
@@ -212,7 +250,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
         total_loss += loss.item()
         global_step += 1
 
-        if global_step % 50 == 0:
+        # Emergency save if it's been a long time
+        if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
+            save_checkpoint(epoch, global_step, model, optimizer, is_emergency=True)
+            last_emergency_save_time = time.time()
+
+        if global_step % LOG_STEPS == 0:
             # Perplexity estimates (in nats -> exp(loss))
             loss_first = step_losses[0].item()
             loss_last = step_losses[-1].item()
@@ -257,12 +300,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         })
 
     # Save checkpoint to Kaggle working directory
-    torch.save({
-        "epoch": epoch,
-        "global_step": global_step,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-    }, f"/kaggle/working/{MODEL_OUT_PREFIX}_epoch_{epoch}.pt")
+    save_checkpoint(epoch, global_step, model, optimizer)
 
 if wandb:
     wandb.finish()
