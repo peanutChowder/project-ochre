@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ----------------------------
 # Core building blocks
@@ -10,16 +11,26 @@ class ConvGRUCell(nn.Module):
     def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
         p = kernel_size // 2
-        in_ch = channels
-        self.z_gate = nn.Conv2d(in_ch + channels, channels, kernel_size, padding=p)
-        self.r_gate = nn.Conv2d(in_ch + channels, channels, kernel_size, padding=p)
-        self.h_tilde = nn.Conv2d(in_ch + channels, channels, kernel_size, padding=p)
+        # Fused z and r gates: Input (in_ch + channels) -> Output (2 * channels)
+        # in_ch is assumed to be equal to channels here based on usage
+        self.zr_gate = nn.Conv2d(channels * 2, channels * 2, kernel_size, padding=p)
+        self.h_tilde_gate = nn.Conv2d(channels * 2, channels, kernel_size, padding=p)
 
     def forward(self, x, h):
         # x: (B,C,H,W), h: (B,C,H,W)
-        z = torch.sigmoid(self.z_gate(torch.cat([x, h], dim=1)))
-        r = torch.sigmoid(self.r_gate(torch.cat([x, h], dim=1)))
-        h_tilde = torch.tanh(self.h_tilde(torch.cat([x, r * h], dim=1)))
+        
+        # 1. Compute z and r gates together
+        combined_zr = torch.cat([x, h], dim=1)
+        zr = self.zr_gate(combined_zr)
+        z, r = zr.chunk(2, dim=1)
+        z = torch.sigmoid(z)
+        r = torch.sigmoid(r)
+
+        # 2. Compute candidate hidden state
+        combined_h = torch.cat([x, r * h], dim=1)
+        h_tilde = torch.tanh(self.h_tilde_gate(combined_h))
+
+        # 3. Update hidden state
         h_new = (1 - z) * h + z * h_tilde
         return h_new
 
@@ -43,18 +54,30 @@ class ActionFiLM(nn.Module):
 
     def forward(self, a):
         """
-        a: (B, A)
-        returns list of (gamma, beta), each of shape (B, C, 1, 1)
+        a: (B, A) or (B, T, A)
+        returns (gammas, betas) as stacked tensors.
+        gammas, betas: (L, B, C, 1, 1) or (L, B, T, C, 1, 1)
         """
-        outs = []
+        is_seq = a.dim() == 3
+        gammas = []
+        betas = []
         for mlp in self.mlps:
-            gb = mlp(a)
+            gb = mlp(a) # (B, 2C) or (B, T, 2C)
             g, b = gb.chunk(2, dim=-1)
-            # reshape for broadcasting over H,W
-            g = g.unsqueeze(-1).unsqueeze(-1)
-            b = b.unsqueeze(-1).unsqueeze(-1)
-            outs.append((g, b))
-        return outs
+            
+            if is_seq:
+                # (B, T, C) -> (B, T, C, 1, 1)
+                g = g.unsqueeze(-1).unsqueeze(-1)
+                b = b.unsqueeze(-1).unsqueeze(-1)
+            else:
+                # (B, C) -> (B, C, 1, 1)
+                g = g.unsqueeze(-1).unsqueeze(-1)
+                b = b.unsqueeze(-1).unsqueeze(-1)
+            
+            gammas.append(g)
+            betas.append(b)
+            
+        return torch.stack(gammas), torch.stack(betas)
 
 
 # ----------------------------
@@ -86,6 +109,7 @@ class WorldModelConvFiLM(nn.Module):
         action_dim: int = 4,
         use_delta: bool = False,
         zero_init_head: bool = True,
+        use_checkpointing: bool = False,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -104,6 +128,7 @@ class WorldModelConvFiLM(nn.Module):
         self.H, self.W = H, W
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
+        self.use_checkpointing = use_checkpointing
 
     def _embed_tokens(self, Z):
         # Z: (B,H,W) long
@@ -112,71 +137,121 @@ class WorldModelConvFiLM(nn.Module):
         x = self.in_proj(x)            # (B,C,H,W)
         return x
 
+    def compute_embeddings(self, Z_seq):
+        """
+        Pre-compute embeddings for a whole sequence.
+        Z_seq: (B, K, H, W)
+        Returns: (B, K, C, H, W)
+        """
+        B, K, H, W = Z_seq.shape
+        # Flatten time into batch for efficient computation
+        Z_flat = Z_seq.view(B * K, H, W)
+        x_flat = self._embed_tokens(Z_flat) # (B*K, C, H, W)
+        _, C, _, _ = x_flat.shape
+        return x_flat.view(B, K, C, H, W)
+
+    def compute_film(self, A_seq):
+        """
+        Pre-compute FiLM parameters for a whole sequence.
+        A_seq: (B, K, A)
+        Returns: (Gammas, Betas) stacked tensors (L, B, K, C, 1, 1)
+        """
+        return self.film(A_seq)
+
     @torch.no_grad()
     def init_state(self, batch_size, device=None):
         if device is None:
             device = next(self.parameters()).device
-        return [torch.zeros(batch_size, self.hidden_dim, self.H, self.W, device=device) for _ in range(self.n_layers)]
+        # Return stacked tensor (L, B, C, H, W)
+        return torch.zeros(self.n_layers, batch_size, self.hidden_dim, self.H, self.W, device=device)
 
-    def step(self, Z_t, a_t, h_list=None):
+    def step(self, Z_t, a_t, h_prev, x_t=None, gammas_t=None, betas_t=None):
         """
         One autoregressive step.
-          Z_t: (B,H,W) long indices for current frame
-          a_t: (B,A)   actions for transition t -> t+1
-          h_list: list of hidden states per layer or None
+          Z_t: (B,H,W) long indices for current frame (optional if x_t provided)
+          a_t: (B,A)   actions for transition t -> t+1 (optional if gammas/betas provided)
+          h_prev: (L, B, C, H, W) hidden states
+          x_t: (B,C,H,W) pre-computed embedding (optional)
+          gammas_t, betas_t: (L, B, C, 1, 1) (optional)
         Returns:
           logits: (B,codebook_size,H,W)
-          new_h: list of hidden states
+          new_h: (L, B, C, H, W)
         """
-        x = self._embed_tokens(Z_t)
-        if h_list is None:
-            h_list = [torch.zeros_like(x) for _ in range(self.n_layers)]
-        gammas_betas = self.film(a_t)  # list of (gamma, beta) per layer
+        # Use pre-computed x_t if available, otherwise compute from Z_t
+        if x_t is not None:
+            x = x_t
+        else:
+            x = self._embed_tokens(Z_t)
 
-        new_h = []
+        if h_prev is None:
+            # This case handles initialization if None passed, but signature expects tensor now.
+            # We assume h_prev is provided or we construct it. 
+            # But better to assume caller provides it.
+             pass 
+        
+        # Use pre-computed film if available
+        if gammas_t is not None and betas_t is not None:
+             pass
+        else:
+            gammas_t, betas_t = self.film(a_t)
+
+        new_h_list = []
         h = x
         for i, gru in enumerate(self.grus):
-            h_prev = h_list[i]
+            h_p = h_prev[i]
             
-            # 1. Compute the raw ConvGRU update based on input 'h' (from prev layer)
-            #    and state 'h_prev' (from prev time step).
-            #    This state is BOUNDED by the GRU's internal activations (tanh/sigmoid).
-            h_gru = gru(h, h_prev)
+            # 1. Compute the ConvGRU update
+            h_gru = gru(h, h_p)
             
-            # 2. Save this CLEAN, BOUNDED state for the next time step.
-            #    This prevents exponential explosion over long sequences.
-            new_h.append(h_gru)
+            # 2. Save this state for the next time step.
+            new_h_list.append(h_gru)
 
-            # 3. Apply FiLM modulation (Action Conditioning) only to the vertical flow
-            #    (input to the next layer).
-            g, b = gammas_betas[i]
+            # 3. Apply FiLM modulation
+            g = gammas_t[i]
+            b = betas_t[i]
             h = h_gru * (1.0 + g) + b
             
 
         logits = self.out(h)  # (B,Kc,H,W)
+        new_h = torch.stack(new_h_list)
         return logits, new_h
 
     def forward(self, Z_seq, A_seq, return_all: bool = False):
         """
         Unroll over a sequence with teacher forcing.
-
-        Z_seq: (B,K,H,W) tokens at times [t0 .. t0+K-1]
-        A_seq: (B,K,A)   actions for transitions [t0 .. t0+K-1] (each maps Z_t -> Z_{t+1})
-
-        Returns:
-          - logits for next frame after the last input (B,Kc,H,W) if return_all=False
-          - list[logits_t] for each step otherwise
         """
         B, K, H, W = Z_seq.shape
         assert (H, W) == (self.H, self.W), f"Got {(H,W)}, expected {(self.H,self.W)}"
         assert A_seq.shape[:2] == (B, K), "A_seq must align with Z_seq along time"
 
-        h_list = None
+        # Pre-compute for efficiency in unroll
+        X_seq = self.compute_embeddings(Z_seq)
+        Gammas_seq, Betas_seq = self.compute_film(A_seq)
+        
+        h = self.init_state(B)
         logits_list = []
         for k in range(K):
-            Z_t = Z_seq[:, k]
-            a_t = A_seq[:, k]
-            logits, h_list = self.step(Z_t, a_t, h_list)
+            # Extract step data
+            x_t = X_seq[:, k]
+            # (L, B, K, C, 1, 1) -> (L, B, C, 1, 1)
+            g_t = Gammas_seq[:, :, k]
+            b_t = Betas_seq[:, :, k]
+            
+            if self.use_checkpointing:
+                # checkpoint requires tensors. h is tensor, x_t is tensor, g_t, b_t are tensors.
+                # Z_t=None, a_t=None.
+                # We pass dummy None for Z_t, a_t if we rely on positional args
+                logits, h = checkpoint(self.step, torch.tensor(0), torch.tensor(0), h, x_t, g_t, b_t, use_reentrant=False)
+                # Note: We passed dummy tensors because passing None to checkpoint can be tricky with some versions
+                # But inside step we check if x_t is Not None.
+                # Let's ensure step handles dummy inputs gracefully.
+                # step signature: (Z_t, a_t, h_prev, x_t, gammas_t, betas_t)
+                # We passed: (tensor(0), tensor(0), h, x_t, g_t, b_t)
+                # inside step: x_t is not None, so Z_t ignored. gammas_t is not None, so a_t ignored.
+                # Perfect.
+            else:
+                logits, h = self.step(None, None, h, x_t, g_t, b_t)
+            
             logits_list.append(logits)
 
         if return_all:

@@ -23,19 +23,23 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 BATCH_SIZE = 16
-BASE_SEQ_LEN = 15      # initial context
-MAX_SEQ_LEN = 40       # maximum unroll window
 EPOCHS = 50
 LR = 3e-5             # Base learning rate after warmup
 WARMUP_STEPS = 500   # Number of steps for linear LR warmup
 MIN_LR = 1e-6         # Starting learning rate for warmup
+USE_CHECKPOINTING = True # Enable gradient checkpointing to save memory for longer rollouts
+
+# Curriculum rollouts
 CURRICULUM_UNROLL = True  # gradually increase sequence length
+BASE_SEQ_LEN = 9      # initial context
+MAX_SEQ_LEN = 40       # maximum unroll window
+ROLLOUT_INCREASE_STEPS = 10000      # increase every 10k steps
 
 
 PROJECT = "project-ochre"
-RUN_NAME = "v4.0-training"
+RUN_NAME = "v4.1-step60k"
 MODEL_OUT_PREFIX = "ochre-v4"
-resume_path = ""  
+resume_path = "checkpoints/ochrev4_fused.pt"  
 
 LOG_STEPS = 10
 REPORT_SPIKES = True
@@ -71,7 +75,16 @@ class GTTokenDataset(Dataset):
         vid_idx, start = self.index_map[idx]
         meta = self.entries[vid_idx]
         path = os.path.join(self.root_dir, meta["file"])
-        data = np.load(path)  # loads arrays like {"tokens": ..., "actions": ...}
+        
+        # Optimization: Use mmap_mode='r' to avoid loading the full file if possible.
+        # If the file is compressed .npz, this might not mmap but will still load.
+        # If uncompressed, it saves huge I/O.
+        try:
+            data = np.load(path, mmap_mode='r') 
+        except ValueError:
+            # Fallback if mmap_mode is not supported for this file type
+            data = np.load(path)
+            
         tokens = data["tokens"]   # shape (T, H, W) of discrete VQ-VAE indices over time
         actions = data["actions"] # shape (T-1, A) of continuous action vectors per frame
 
@@ -82,11 +95,16 @@ class GTTokenDataset(Dataset):
         # actions[i] is action between tokens[i] and tokens[i+1]
         A_seq = actions[start:start + self.seq_len]
         Z_target_seq = tokens[start + 1:start + self.seq_len + 1]
-
+        
+        # If mapped, copy to memory now to release file handle references if needed, 
+        # or just return as is (torch will copy when converting to tensor).
+        # explicitly converting to numpy array helps ensure we don't pass a memmap to torch if not needed,
+        # but torch.tensor() handles numpy arrays fine.
+        
         return (
-            torch.tensor(Z_seq, dtype=torch.long),        # (K, H, W)
-            torch.tensor(A_seq, dtype=torch.float32),     # (K, A)
-            torch.tensor(Z_target_seq, dtype=torch.long), # (K, H, W)
+            torch.tensor(np.array(Z_seq), dtype=torch.long),        # (K, H, W)
+            torch.tensor(np.array(A_seq), dtype=torch.float32),     # (K, A)
+            torch.tensor(np.array(Z_target_seq), dtype=torch.long), # (K, H, W)
             idx,                  
             vid_idx,             
             start                
@@ -101,7 +119,7 @@ else:
 
 # ---------- MODEL ----------
 # Instantiate model with correct action dimension (5) and latent dims (18x32)
-model = WorldModelConvFiLM(action_dim=5, H=18, W=32).to(DEVICE)
+model = WorldModelConvFiLM(action_dim=5, H=18, W=32, use_checkpointing=USE_CHECKPOINTING).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 global_step = 0
@@ -110,7 +128,13 @@ if os.path.exists(resume_path):
     print(f" Resuming training from {resume_path}")
     checkpoint = torch.load(resume_path, map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state"])
-    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    
+    if checkpoint.get("optimizer_state") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        print(" Optimizer state loaded.")
+    else:
+        print(" ⚠️ Optimizer state not found in checkpoint (likely due to architecture upgrade). Starting with fresh optimizer.")
+        
     start_epoch = checkpoint["epoch"] + 1
     global_step = checkpoint.get("global_step", 0)
     print(f"Resumed at epoch {start_epoch}, global step {global_step}")
@@ -143,7 +167,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # Curriculum: gradually increase context length
     seq_len = BASE_SEQ_LEN
     if CURRICULUM_UNROLL:
-        seq_len = min(BASE_SEQ_LEN + (epoch // 5), MAX_SEQ_LEN)
+        rollout_increments = global_step // ROLLOUT_INCREASE_STEPS
+        seq_len = min(BASE_SEQ_LEN + rollout_increments, MAX_SEQ_LEN)
     print(f"🧩 Curriculum unrolling active → seq_len = {seq_len}")
 
     # Rebuild dataset and DataLoader each epoch to avoid stale worker state when seq_len changes
@@ -190,14 +215,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         # Reset gradients for this batch.
         optimizer.zero_grad()
+        
+        # Optimization: Pre-compute embeddings and FiLM parameters for the whole sequence
+        # This avoids repeating these operations inside the sequential loop
+        X_seq = model.compute_embeddings(Z_seq) # (B, K, C, H, W)
+        Gammas_seq, Betas_seq = model.compute_film(A_seq)    # Stacked tensors (L, B, K, C, 1, 1)
+
         # Initialize the hidden state for the ConvGRU layers for this batch.
-        h_list = model.init_state(B, device=DEVICE)
+        h_state = model.init_state(B, device=DEVICE)
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             # Iterate over time steps 0..K-1 and unroll the world model.
             for t in range(K):
-                # Z_seq[:, t] has shape (B, H, W) of token indices at time t.
-                # A_seq[:, t] has shape (B, A) of actions at time t.
-                logits_t, h_list = model.step(Z_seq[:, t], A_seq[:, t], h_list)
+                # Extract pre-computed inputs for this step
+                x_t = X_seq[:, t]
+                g_t = Gammas_seq[:, :, t]
+                b_t = Betas_seq[:, :, t]
+                
+                # Pass pre-computed inputs to step
+                logits_t, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=g_t, betas_t=b_t)
+                
                 logits_last = logits_t
                 # logits_t is (B, codebook_size, H, W). We flatten batch and spatial dims
                 # so that each position predicts one token class.

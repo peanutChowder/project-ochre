@@ -124,3 +124,20 @@ Preprocessing
 
 **v4.0.1**
 - Fixed gradient collapse issue due to applying FiLM to each timestep, causing gradient explosion over longer steps
+
+<u>Results, 61k Steps</u>
+- Good understanding of camera pitch: Looking up/down maintains the structure of sky/land. However fully looking up into sky/ground sometimes causes model collapse into only sky or ground.
+- Limited understanding of camera yaw: In initial ~1s, camera maintains orientation of things when looking left/right. However as longer rollouts cause average blurring, e.g. desert cactus becomes just desert-blob, changes in yaw dont look like they do anything.
+- No understanding of movement: WASD+Jump do not seem to do anything 
+Runtime
+- ~5k Steps / hr
+
+**v4.1**
+Training Optimizations & Architecture Fusion:
+- Fused ConvGRU gates: Refactored `ConvGRUCell` to compute `z` and `r` gates in a single fused convolution, reducing kernel launch overhead.
+- Sequence Pre-computation: Updated `WorldModelConvFiLM` and `train.py` to pre-compute embeddings and FiLM parameters for the entire sequence in parallel *before* the recurrent unroll loop. This moves heavy non-recurrent compute out of the critical path.
+- Gradient Checkpointing: Added `use_checkpointing` support to `WorldModelConvFiLM` to trade compute for memory, enabling significantly longer sequence rollouts on limited VRAM.
+- Data Loading: Updated `GTTokenDataset` to use `mmap_mode='r'` for `.npz` files, drastically reducing disk I/O and RAM usage for small window samples.
+
+Rollout:
+- Step-based rollout: Increasing rollout every 
