@@ -137,10 +137,21 @@ class WorldModelConvFiLM(nn.Module):
         h = x
         for i, gru in enumerate(self.grus):
             h_prev = h_list[i]
-            h = gru(h, h_prev)
+            
+            # 1. Compute the raw ConvGRU update based on input 'h' (from prev layer)
+            #    and state 'h_prev' (from prev time step).
+            #    This state is BOUNDED by the GRU's internal activations (tanh/sigmoid).
+            h_gru = gru(h, h_prev)
+            
+            # 2. Save this CLEAN, BOUNDED state for the next time step.
+            #    This prevents exponential explosion over long sequences.
+            new_h.append(h_gru)
+
+            # 3. Apply FiLM modulation (Action Conditioning) only to the vertical flow
+            #    (input to the next layer).
             g, b = gammas_betas[i]
-            h = h * (1.0 + g) + b
-            new_h.append(h)
+            h = h_gru * (1.0 + g) + b
+            
 
         logits = self.out(h)  # (B,Kc,H,W)
         return logits, new_h
