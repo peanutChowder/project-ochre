@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
 from torch.amp.grad_scaler import GradScaler
+from torch.utils.checkpoint import checkpoint
 
 try:
     import wandb
@@ -22,7 +23,7 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 EPOCHS = 50
 LR = 3e-5             # Base learning rate after warmup
 WARMUP_STEPS = 500   # Number of steps for linear LR warmup
@@ -31,9 +32,9 @@ USE_CHECKPOINTING = True # Enable gradient checkpointing to save memory for long
 
 # Curriculum rollouts
 CURRICULUM_UNROLL = True  # gradually increase sequence length
-BASE_SEQ_LEN = 9      # initial context
-MAX_SEQ_LEN = 40       # maximum unroll window
-ROLLOUT_INCREASE_STEPS = 10000      # increase every 10k steps
+BASE_SEQ_LEN = 10      # initial context
+MAX_SEQ_LEN = 60       # maximum unroll window
+ROLLOUT_INCREASE_STEPS = 5000      # increase every 5k steps
 
 
 PROJECT = "project-ochre"
@@ -126,17 +127,17 @@ global_step = 0
 start_epoch = 1
 if os.path.exists(resume_path):
     print(f" Resuming training from {resume_path}")
-    checkpoint = torch.load(resume_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state"])
+    resume_checkpoint = torch.load(resume_path, map_location=DEVICE)
+    model.load_state_dict(resume_checkpoint["model_state"])
     
-    if checkpoint.get("optimizer_state") is not None:
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if resume_checkpoint.get("optimizer_state") is not None:
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
         print(" Optimizer state loaded.")
     else:
         print(" ⚠️ Optimizer state not found in checkpoint (likely due to architecture upgrade). Starting with fresh optimizer.")
         
-    start_epoch = checkpoint["epoch"] + 1
-    global_step = checkpoint.get("global_step", 0)
+    start_epoch = resume_checkpoint["epoch"] + 1
+    global_step = resume_checkpoint.get("global_step", 0)
     print(f"Resumed at epoch {start_epoch}, global step {global_step}")
 else:
     print(" No checkpoint found — starting fresh.")
@@ -181,13 +182,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=8,
         pin_memory=(DEVICE == "cuda"),
         persistent_workers=False,
     )
     print(f"Dataset loaded: {len(dataset)} sequence windows.")
 
     for batch_idx, batch in enumerate(loader):
+        t0_batch = time.time()
         # Each batch is a tuple of tensors/lists from __getitem__ stacked along batch dim.
         Z_seq, A_seq, Z_target_seq, idxs, vid_idxs, starts = batch
         # Move token sequences and actions to GPU/CPU device.
@@ -232,7 +234,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 b_t = Betas_seq[:, :, t]
                 
                 # Pass pre-computed inputs to step
-                logits_t, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=g_t, betas_t=b_t)
+                if USE_CHECKPOINTING:
+                    logits_t, h_state = checkpoint(
+                        model.step, 
+                        torch.tensor(0, device=DEVICE), 
+                        torch.tensor(0, device=DEVICE), 
+                        h_state, 
+                        x_t, 
+                        g_t, 
+                        b_t, 
+                        use_reentrant=False
+                    )
+                else:
+                    logits_t, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=g_t, betas_t=b_t)
                 
                 logits_last = logits_t
                 # logits_t is (B, codebook_size, H, W). We flatten batch and spatial dims
@@ -285,6 +299,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         total_loss += loss.item()
         global_step += 1
+        dt_batch = time.time() - t0_batch
+        throughput = BATCH_SIZE / dt_batch
 
         # Emergency save if it's been a long time
         if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
@@ -322,6 +338,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/entropy_last": entropy_last,
                     "train/conf_last": conf_last,
                     "train/grad_norm": float(grad_norm),
+                    "train/throughput": throughput,
                     "seq_len": seq_len,
                     "lr": lr,
                 }, step=global_step)

@@ -140,4 +140,9 @@ Training Optimizations & Architecture Fusion:
 - Data Loading: Updated `GTTokenDataset` to use `mmap_mode='r'` for `.npz` files, drastically reducing disk I/O and RAM usage for small window samples.
 
 Rollout:
-- Step-based rollout: Increasing rollout every 
+- Step-based rollout: Increasing rollout to every 10k steps
+
+**v4.1.1**
+- Enabled checkpointing: was being bypassed.
+- Increased batch size from 16 -> 64
+- Decreased rollout intervals to 5k steps
