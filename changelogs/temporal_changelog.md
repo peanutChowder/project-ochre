@@ -121,3 +121,6 @@ Preprocessing
 - New `preprocess.py` path for GameFactory: uses `metadata/*.json` + `video/*.mp4` and writes `preprocessedv4`.
 - Action encoding: `actions[t] = [yaw_delta, pitch_delta, move_x, move_z, jump]` where yaw/pitch are normalized deltas, `move_x/move_z` are in {−1,0,+1} from `ad/ws`, and `jump` comes from `scs` (Space).
 - Outputs per‑video `.npz` with `tokens: [K, 18, 32]` and `actions: [K−1, 5]`, plus a `manifest.json`
+
+**v4.1**
+- Fixed gradient collapse issue due to applying FiLM to each timestep, causing gradient explosion over longer steps
