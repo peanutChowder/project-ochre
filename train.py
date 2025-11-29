@@ -6,7 +6,7 @@ Checklist:
 - update vqvae checkpoint
 - update world model checkpoint
 """
-import os, time, json, math, numpy as np, torch
+import os, time, json, math, numpy as np, torch, random
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
@@ -23,18 +23,27 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 EPOCHS = 50
 LR = 3e-5             # Base learning rate after warmup
 WARMUP_STEPS = 500   # Number of steps for linear LR warmup
 MIN_LR = 1e-6         # Starting learning rate for warmup
-USE_CHECKPOINTING = True # Enable gradient checkpointing to save memory for longer rollouts
+USE_CHECKPOINTING = False # Disable to improve throughput; enable if OOM
 
-# Curriculum rollouts
-CURRICULUM_UNROLL = True  # gradually increase sequence length
-BASE_SEQ_LEN = 10      # initial context
-MAX_SEQ_LEN = 60       # maximum unroll window
-ROLLOUT_INCREASE_STEPS = 5000      # increase every 5k steps
+# --- CURRICULUM 1: SEQUENCE LENGTH (Context Window) ---
+# Gradually increases the BPTT horizon / memory length
+CURRICULUM_SEQ_LEN = True
+BASE_SEQ_LEN = 1       # Start with short context
+MAX_SEQ_LEN = 1        # Target max context
+SEQ_LEN_INCREASE_STEPS = 5000  # Increase seq_len by 1 every N steps
+
+# --- CURRICULUM 2: AUTOREGRESSIVE ROLLOUT (Deterministic Tail) ---
+# We gradually increase the number of frames at the END of the sequence
+# that are generated autoregressively (feeding predictions back in).
+CURRICULUM_AR = True
+AR_START_STEP = 0      # Step to start introducing AR frames
+AR_RAMP_STEPS = 10000    # Steps to reach AR_ROLLOUT_MAX
+AR_ROLLOUT_MAX = 25       # Max number of frames to generate autoregressively
 
 
 PROJECT = "project-ochre"
@@ -165,12 +174,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     total_loss = 0.0
 
-    # Curriculum: gradually increase context length
+    # --- 1. Sequence Length Curriculum ---
     seq_len = BASE_SEQ_LEN
-    if CURRICULUM_UNROLL:
-        rollout_increments = global_step // ROLLOUT_INCREASE_STEPS
+    if CURRICULUM_SEQ_LEN:
+        rollout_increments = global_step // SEQ_LEN_INCREASE_STEPS
         seq_len = min(BASE_SEQ_LEN + rollout_increments, MAX_SEQ_LEN)
-    print(f"🧩 Curriculum unrolling active → seq_len = {seq_len}")
+    
+    # --- 2. Autoregressive Rollout Curriculum ---
+    ar_len = 0
+    if CURRICULUM_AR and global_step > AR_START_STEP:
+        progress = (global_step - AR_START_STEP) / AR_RAMP_STEPS
+        progress = max(0.0, min(1.0, progress))
+        ar_len = int(progress * AR_ROLLOUT_MAX)
+    
+    # Ensure we assume at least 1 frame of context (Teacher Forcing) at the start
+    # so we don't AR from nothing at t=0
+    ar_len = min(ar_len, seq_len - 1)
+    if ar_len < 0: ar_len = 0
+
+    print(f"🧩 Curriculum: seq_len={seq_len}, ar_len={ar_len} (cutoff at t={seq_len - ar_len})")
 
     # Rebuild dataset and DataLoader each epoch to avoid stale worker state when seq_len changes
     dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
@@ -227,26 +249,49 @@ for epoch in range(start_epoch, EPOCHS + 1):
         h_state = model.init_state(B, device=DEVICE)
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             # Iterate over time steps 0..K-1 and unroll the world model.
+            # Define cutoff step: everything >= this step uses model prediction
+            ar_cutoff = K - ar_len
+            
             for t in range(K):
-                # Extract pre-computed inputs for this step
-                x_t = X_seq[:, t]
+                # Deterministic AR Logic:
+                # If t < ar_cutoff: Teacher Forcing (GT)
+                # If t >= ar_cutoff: Autoregressive (Model Pred)
+                # Note: t=0 is always GT because loop starts at 0 and ar_len <= K-1, so ar_cutoff >= 1
+                use_pred = (t >= ar_cutoff)
+
+                if use_pred:
+                    # Use predicted token indices from previous step.
+                    # We take argmax to get hard indices. This acts as a "detach" for the token choice,
+                    # but gradients still flow through h_state.
+                    z_in = logits_last.argmax(dim=1) # (B, H, W)
+                    x_in = None # Signal model.step to embed z_in
+                else:
+                    # Use Ground Truth (Teacher Forcing)
+                    # We use the pre-computed embeddings for efficiency.
+                    z_in = torch.tensor(0, device=DEVICE) # Dummy, ignored if x_in is provided
+                    x_in = X_seq[:, t]
+
+                # FiLM params always come from GT actions (actions are exogenous/observed)
                 g_t = Gammas_seq[:, :, t]
                 b_t = Betas_seq[:, :, t]
                 
-                # Pass pre-computed inputs to step
+                # Pass inputs to step
                 if USE_CHECKPOINTING:
+                    # checkpoint requires tensors. None is valid for x_in if it's not used for grad?
+                    # If x_in is None, we must pass it as None.
+                    # z_in is a tensor (indices).
                     logits_t, h_state = checkpoint(
                         model.step, 
-                        torch.tensor(0, device=DEVICE), 
-                        torch.tensor(0, device=DEVICE), 
+                        z_in, 
+                        torch.tensor(0, device=DEVICE), # a_t is unused as we pass g_t/b_t
                         h_state, 
-                        x_t, 
+                        x_in, 
                         g_t, 
                         b_t, 
                         use_reentrant=False
                     )
                 else:
-                    logits_t, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=g_t, betas_t=b_t)
+                    logits_t, h_state = model.step(z_in, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
                 
                 logits_last = logits_t
                 # logits_t is (B, codebook_size, H, W). We flatten batch and spatial dims
@@ -340,6 +385,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/grad_norm": float(grad_norm),
                     "train/throughput": throughput,
                     "seq_len": seq_len,
+                    "ar_len": ar_len,
                     "lr": lr,
                 }, step=global_step)
 
