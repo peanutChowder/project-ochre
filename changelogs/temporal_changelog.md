@@ -146,3 +146,8 @@ Rollout:
 - Enabled checkpointing: was being bypassed.
 - Increased batch size from 16 -> 64
 - Decreased rollout intervals to 5k steps
+
+Results:
+- Steps/hr **decreased**, ~5K/hr -> 1.4K/hr
+- Trained at 22 seq_len rollout
+- No discernible increase in quality
