@@ -144,10 +144,19 @@ Rollout:
 
 **v4.1.1**
 - Enabled checkpointing: was being bypassed.
-- Increased batch size from 16 -> 64
+- Increased batch size from 16 -> 32
 - Decreased rollout intervals to 5k steps
 
 Results:
 - Steps/hr **decreased**, ~5K/hr -> 1.4K/hr
 - Trained at 22 seq_len rollout
 - No discernible increase in quality
+
+**v4.2**
+live_inference.py
+- Added persistent hidden state to allow models to retain larger context window during inference
+
+train.py
+- Disabled gradient checkpointing due to poor tradeoff of saved memory but large speed slowdown
+- Added autoregressive unrolling curriculum - mistakenly confused previous seq_len (input context window) for AR unrolling curriculm
+  - `ar_len` ramps up from 0 to `AR_ROLLOUT_MAX` over `AR_RAMP_STEPS` starting after `AR_START_STEP`

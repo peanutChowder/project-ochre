@@ -32,9 +32,9 @@ USE_CHECKPOINTING = False # Disable to improve throughput; enable if OOM
 
 # --- CURRICULUM 1: SEQUENCE LENGTH (Context Window) ---
 # Gradually increases the BPTT horizon / memory length
-CURRICULUM_SEQ_LEN = True
+CURRICULUM_SEQ_LEN = False
 BASE_SEQ_LEN = 1       # Start with short context
-MAX_SEQ_LEN = 1        # Target max context
+MAX_SEQ_LEN = 50       # Target max context
 SEQ_LEN_INCREASE_STEPS = 5000  # Increase seq_len by 1 every N steps
 
 # --- CURRICULUM 2: AUTOREGRESSIVE ROLLOUT (Deterministic Tail) ---
@@ -42,8 +42,8 @@ SEQ_LEN_INCREASE_STEPS = 5000  # Increase seq_len by 1 every N steps
 # that are generated autoregressively (feeding predictions back in).
 CURRICULUM_AR = True
 AR_START_STEP = 0      # Step to start introducing AR frames
-AR_RAMP_STEPS = 10000    # Steps to reach AR_ROLLOUT_MAX
-AR_ROLLOUT_MAX = 25       # Max number of frames to generate autoregressively
+AR_RAMP_STEPS = 30000    # Steps to reach AR_ROLLOUT_MAX
+AR_ROLLOUT_MAX = 49       # Max number of frames to generate autoregressively (MAX_SEQ_LEN - 1)
 
 
 PROJECT = "project-ochre"
@@ -174,21 +174,26 @@ for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     total_loss = 0.0
 
-    # --- 1. Sequence Length Curriculum ---
-    seq_len = BASE_SEQ_LEN
-    if CURRICULUM_SEQ_LEN:
-        rollout_increments = global_step // SEQ_LEN_INCREASE_STEPS
-        seq_len = min(BASE_SEQ_LEN + rollout_increments, MAX_SEQ_LEN)
-    
-    # --- 2. Autoregressive Rollout Curriculum ---
+    # --- 1. Determine AR Length (Curriculum) ---
     ar_len = 0
     if CURRICULUM_AR and global_step > AR_START_STEP:
         progress = (global_step - AR_START_STEP) / AR_RAMP_STEPS
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
+
+    # --- 2. Determine Loaded Sequence Length ---
+    # We check if seq_len curriculum is active, otherwise default to BASE
+    current_base_seq_len = BASE_SEQ_LEN
+    if CURRICULUM_SEQ_LEN:
+         rollout_increments = global_step // SEQ_LEN_INCREASE_STEPS
+         current_base_seq_len = min(BASE_SEQ_LEN + rollout_increments, MAX_SEQ_LEN)
     
-    # Ensure we assume at least 1 frame of context (Teacher Forcing) at the start
-    # so we don't AR from nothing at t=0
+    # Dynamic Loading: Load max of (Base, AR+1)
+    # This ensures we always have 1 context frame + ar_len frames
+    seq_len = max(current_base_seq_len, ar_len + 1)
+    seq_len = min(seq_len, MAX_SEQ_LEN)
+    
+    # Cap AR len if it exceeds available sequence
     ar_len = min(ar_len, seq_len - 1)
     if ar_len < 0: ar_len = 0
 
