@@ -161,3 +161,6 @@ train.py
 - Added autoregressive unrolling curriculum - mistakenly confused previous seq_len (input context window) for AR unrolling curriculm
   - `ar_len` ramps up from 0 to `AR_ROLLOUT_MAX` over `AR_RAMP_STEPS` starting after `AR_START_STEP`
 - Moved FiLM modulation to before GRU to carry action information into hidden state
+
+**v4.2.1**
+- Decreased batch size 32 -> 16, v4.2 ran into OOM error.

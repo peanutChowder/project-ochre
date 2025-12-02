@@ -23,7 +23,7 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 EPOCHS = 50
 LR = 3e-5             # Base learning rate after warmup
 WARMUP_STEPS = 500   # Number of steps for linear LR warmup
@@ -47,8 +47,8 @@ AR_ROLLOUT_MAX = 49       # Max number of frames to generate autoregressively (M
 
 
 PROJECT = "project-ochre"
-RUN_NAME = "v4.1-step60k"
-MODEL_OUT_PREFIX = "ochre-v4"
+RUN_NAME = "v4.2-step60k"
+MODEL_OUT_PREFIX = "ochre-v4.2"
 resume_path = "checkpoints/ochrev4_fused.pt"  
 
 LOG_STEPS = 10
@@ -209,7 +209,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=8,
+        num_workers=4,
         pin_memory=(DEVICE == "cuda"),
         persistent_workers=False,
     )
