@@ -196,23 +196,35 @@ class WorldModelConvFiLM(nn.Module):
             gammas_t, betas_t = self.film(a_t)
 
         new_h_list = []
-        h = x
+        # 'current_layer_input' here is the input feature map for the current ConvGRU layer.
+        # For the first layer, it's 'x' (the embedded visual token).
+        # For subsequent layers, it's the output of the previous ConvGRU layer.
+        current_layer_input = x 
+
         for i, gru in enumerate(self.grus):
-            h_p = h_prev[i]
+            h_p = h_prev[i] # This is the hidden state from the *previous time step* for *this* ConvGRU layer.
             
-            # 1. Compute the ConvGRU update
-            h_gru = gru(h, h_p)
-            
-            # 2. Save this state for the next time step.
-            new_h_list.append(h_gru)
+            # Get FiLM parameters for this layer and current time step
+            g = gammas_t[i] # (B, C, 1, 1)
+            b = betas_t[i]  # (B, C, 1, 1)
 
-            # 3. Apply FiLM modulation
-            g = gammas_t[i]
-            b = betas_t[i]
-            h = h_gru * (1.0 + g) + b
+            # Apply FiLM modulation to the *input* of the current ConvGRU layer.
+            # This ensures the action influences the GRU's gates and candidate state calculation.
+            modulated_input_to_gru = current_layer_input * (1.0 + g) + b
+
+            # Compute the new hidden state for *this* GRU layer at *this* time step.
+            # This is the recurrent state that will be passed to the *next time step*.
+            h_new_recurrent_state = gru(modulated_input_to_gru, h_p)
+            
+            # Store this new recurrent state.
+            new_h_list.append(h_new_recurrent_state)
+            
+            # The output of this GRU layer (`h_new_recurrent_state`) becomes the
+            # `current_layer_input` for the *next GRU layer* in the stack (same time step).
+            current_layer_input = h_new_recurrent_state
             
 
-        logits = self.out(h)  # (B,Kc,H,W)
+        logits = self.out(current_layer_input)  # (B,Kc,H,W)
         new_h = torch.stack(new_h_list)
         return logits, new_h
 
