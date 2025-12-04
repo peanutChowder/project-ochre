@@ -165,6 +165,10 @@ train.py
 **v4.2.1**
 - Decreased batch size 32 -> 16, v4.2 ran into OOM error.
 
+live_inference.py
+- Added stochastic sampling option
+- replaced rolling token/action window with single current token +action per step
+
 Results:
 - Frame quality: outputs are sharper, but are only made up of "ground"
   - e.g.: in desert biomes, no cacti or blocks are present - instead, a sandy terraria-like environment has a sharp boundary with the sky, but no biome features.

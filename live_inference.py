@@ -51,6 +51,38 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 
+def sample_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
+    """
+    Sample discrete VQ‑VAE token indices from logits.
+    logits: (B, C, H, W)
+    Returns: (B, H, W) long
+    """
+    B, C, H, W = logits.shape
+    # Guard against tiny / negative temperatures.
+    temperature = max(float(temperature), 1e-3)
+    logits = logits / temperature
+
+    # (B, C, H, W) -> (B, HW, C)
+    logits_flat = logits.view(B, C, H * W).permute(0, 2, 1)
+
+    if top_k is not None and top_k > 0 and top_k < C:
+        k = int(top_k)
+        topk_vals, topk_idx = torch.topk(logits_flat, k, dim=-1)  # (B, HW, k)
+        probs = torch.softmax(topk_vals, dim=-1)
+        sampled_rel = torch.multinomial(
+            probs.view(-1, k), num_samples=1
+        ).view(B, -1)  # (B, HW)
+        chosen = topk_idx.gather(-1, sampled_rel.unsqueeze(-1)).squeeze(-1)
+    else:
+        probs = torch.softmax(logits_flat, dim=-1)  # (B, HW, C)
+        sampled = torch.multinomial(
+            probs.view(-1, C), num_samples=1
+        ).view(B, -1)  # (B, HW)
+        chosen = sampled
+
+    return chosen.view(B, H, W).long()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True, help="WorldModelConvFiLM checkpoint (.pt)")
@@ -61,6 +93,9 @@ def main():
     p.add_argument("--no_mouse", action="store_true", help="Disable mouse look; use arrow keys instead")
     p.add_argument("--mouse_sens", type=float, default=60.0, help="Divisor for mouse dx/dy → [-1,1]")
     p.add_argument("--key_look_gain", type=float, default=0.5, help="Arrow key look gain added to yaw/pitch")
+    p.add_argument("--greedy", action="store_true", help="Use argmax decoding (no sampling)")
+    p.add_argument("--temperature", type=float, default=1.05, help="Sampling temperature (>0); 1.0 ≈ unbiased")
+    p.add_argument("--topk", type=int, default=32, help="Top‑k sampling cutoff (0 = disable)")
     args = p.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -78,40 +113,64 @@ def main():
     try_load_state_dict(model, args.checkpoint, device)
     model.eval()
 
-    # --- Initialize rolling context (tokens/actions) ---
+    # --- Initialize state ---
+    h_state = model.init_state(1, device=device)
+    
+    # Warmup if context provided
     if args.context_npz and os.path.exists(args.context_npz):
+        print(f"Seeding from {args.context_npz}...")
         data = np.load(args.context_npz)
-        tokens = torch.tensor(data["tokens"], dtype=torch.long, device=device)  # (T,H,W)
-        actions = torch.tensor(data["actions"], dtype=torch.float32, device=device)  # (T,A)
+        # Load context tokens and actions
+        # We need to run the model through these to build up h_state
         
-        # Adjust loaded action dimension if necessary
-        if actions.shape[1] < ACTION_DIM:
-            pad_size = ACTION_DIM - actions.shape[1]
-            actions = torch.cat([actions, torch.zeros(actions.shape[0], pad_size, device=device)], dim=1)
-        elif actions.shape[1] > ACTION_DIM:
-            actions = actions[:, :ACTION_DIM]
+        # Take up to last 60 frames or so to build state, don't need infinite history for warmup
+        # But actually, we just need to run through them.
+        tokens_ctx = torch.tensor(data["tokens"], dtype=torch.long, device=device)
+        actions_ctx = torch.tensor(data["actions"], dtype=torch.float32, device=device)
+        
+        # Adjust dimensions
+        if actions_ctx.shape[1] < ACTION_DIM:
+             pad = torch.zeros(actions_ctx.shape[0], ACTION_DIM - actions_ctx.shape[1], device=device)
+             actions_ctx = torch.cat([actions_ctx, pad], dim=1)
+        
+        # Run through context to prime h_state
+        # We can use the efficient forward unroll since we just want the final state
+        # Z_seq needs to be (1, K, H, W), A_seq (1, K, A)
+        
+        # Limit to reasonable warmup length (e.g. 30 frames) to avoid wait
+        warmup_len = min(60, tokens_ctx.shape[0], actions_ctx.shape[0])
+        start_idx = 0 # or -warmup_len
+        
+        z_warmup = tokens_ctx[start_idx : start_idx+warmup_len].unsqueeze(0)
+        a_warmup = actions_ctx[start_idx : start_idx+warmup_len].unsqueeze(0)
+        
+        with torch.no_grad():
+            # model.forward returns logits, but we need the hidden state.
+            # model.forward unrolls but discards intermediate states unless we change it.
+            # Actually, model.forward calls model.init_state internally.
+            # We need to modify how we get the state out, or just loop step() manually.
+            # Looping step manually is safer to ensure we have the final h_state.
+            
+            print(f"Priming hidden state with {warmup_len} frames...")
+            for i in range(warmup_len):
+                z_t = z_warmup[:, i] # (1, H, W)
+                a_t = a_warmup[:, i] # (1, A)
+                _, h_state = model.step(z_t, a_t, h_state)
+        
+        # Set current token to the last one from context
+        current_z = z_warmup[:, -1]
+        print("State primed.")
 
-        if tokens.size(0) >= CTX_LEN:
-            Z_seq = tokens[:CTX_LEN].unsqueeze(0)  # (1,K,H,W)
-        else:
-            pad = CTX_LEN - tokens.size(0)
-            Z_seq = torch.cat([tokens, torch.randint(0, 2048, (pad, LATENT_H, LATENT_W), device=device)], dim=0).unsqueeze(0)
-        if actions.size(0) >= CTX_LEN:
-            A_seq = actions[:CTX_LEN].unsqueeze(0)  # (1,K,A)
-        else:
-            pad = CTX_LEN - actions.size(0)
-            A_seq = torch.cat([actions, torch.zeros(pad, ACTION_DIM, device=device)], dim=0).unsqueeze(0)
-        print(f"Seeded from {args.context_npz}")
     else:
-        Z_seq = torch.randint(0, 2048, (1, CTX_LEN, LATENT_H, LATENT_W), device=device)
-        A_seq = torch.zeros((1, CTX_LEN, ACTION_DIM), device=device)
-        print("⚠️ No context provided — starting from random tokens")
+        print("⚠️ No context provided — starting from random state")
+        current_z = torch.randint(0, 2048, (1, LATENT_H, LATENT_W), device=device)
+        # h_state is already zeros
 
     # --- Pygame setup ---
     pygame.init()
     width, height = FRAME_W * args.scale, FRAME_H * args.scale
     screen = pygame.display.set_mode((width, height))
-    pygame.display.set_caption("Project Ochre — Live Inference")
+    pygame.display.set_caption("Project Ochre — Live Inference (Stateful)")
     clock = pygame.time.Clock()
     pygame.font.init()
     hud_font = pygame.font.SysFont("Arial", max(10, int(10 * args.scale / 5)))
@@ -154,17 +213,31 @@ def main():
             elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
 
+        # 1. Get Action
         act = get_action_vec()
-        A_seq = torch.cat([A_seq[:, 1:], torch.tensor([[act]], device=device)], dim=1)  # (1,K,A)
+        current_a = torch.tensor([act], dtype=torch.float32, device=device) # (1, 5)
 
+        # 2. Step Model
         with torch.no_grad():
-            logits = model(Z_seq, A_seq)               # (B,2048,H,W)
-            pred_tokens = logits.argmax(dim=1)         # (B,H,W)
+            # z_t: (1, H, W), a_t: (1, A), h_prev: (...)
+            logits, h_state = model.step(current_z, current_a, h_state)
+
+            # 3. Choose next tokens
+            if args.greedy:
+                # Old behavior: pure argmax decoding
+                pred_tokens = logits.argmax(dim=1)  # (1, H, W)
+            else:
+                # Default: stochastic sampling for more diverse scenes
+                pred_tokens = sample_tokens(
+                    logits, temperature=args.temperature, top_k=args.topk
+                )  # (1, H, W)
+
+            # 4. Decode
             frame = vqvae.decode_code(pred_tokens)[0]  # (3,H_img,W_img)
             img = (frame.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-        # update token window
-        Z_seq = torch.cat([Z_seq[:, 1:], pred_tokens.unsqueeze(1)], dim=1)
+        # Update state for next loop
+        current_z = pred_tokens
 
         # draw
         surf = pygame.image.frombuffer(img.tobytes(), (FRAME_W, FRAME_H), "RGB")
