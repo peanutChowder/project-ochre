@@ -107,7 +107,7 @@ Training (train.py + model):
 - Still confused by detailed terrain like bushes
 - Beginning to learn unwanted details, e.g. the pixel-ness of the VAE
 
-**v4.0**
+### v4.0
 Dataset:
 - Changed to GameFactory, 69.6hrs with unbiased action sampling + focus on isolated actions
 - Native 16FPS, 640x360 source videos → resized to 128x72 and encoded with VQ‑VAEv2.1.6 to 32x18 latent grids.
@@ -164,3 +164,12 @@ train.py
 
 **v4.2.1**
 - Decreased batch size 32 -> 16, v4.2 ran into OOM error.
+
+Results:
+- Frame quality: outputs are sharper, but are only made up of "ground"
+  - e.g.: in desert biomes, no cacti or blocks are present - instead, a sandy terraria-like environment has a sharp boundary with the sky, but no biome features.
+  - e.g.: in grass/forest biomes, a greenish average appears. Indistuinguishable features, only made up of a green blur.
+- Frame quality: Some scenes are beginning to over-learn the vqvae's grid pattern
+- Movement: Even without movement, the scene has constant localized shifts - e.g. little spikes in the ground shift around, but general scene remains stable
+  - Cannot discern whether new action conditioning is working due to this constant shifting
+- Camera rollout: Excellect maintenance of ground/sky when looking up/down, but looking left/right is not discernible due to lack of detail and the constant shifting spikes in scene.
