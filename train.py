@@ -332,10 +332,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             with torch.no_grad():
                 last_logits = logits_last
+                last_logits_f32 = last_logits.float()
                 last_target = Z_target_seq[:, -1]
                 pred_last = last_logits.argmax(dim=1)
                 acc_last = (pred_last == last_target).float().mean().item()
-                p_last = torch.softmax(last_logits, dim=1)
+                p_last = torch.softmax(last_logits_f32, dim=1)
                 entropy_last = (-p_last * torch.log(torch.clamp(p_last, min=1e-9))).sum(dim=1).mean().item()
                 conf_last = p_last.max(dim=1).values.mean().item()
 
