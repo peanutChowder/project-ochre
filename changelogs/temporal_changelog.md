@@ -199,3 +199,10 @@ Results, 250k steps:
 - Context window: Increased to 16 frames
 - AR curriculum additive: Modified overall context window to increase when AR curriculum increases to prevent AR "consuming" GT input frames
 - Memory: Turned on checkpointing and changed semantic loss to be calculated in batches
+
+Results:
+- continuously collapsing to unique_codes == 1
+
+**v4.3.3**
+- Codebook collapse: introduced codebook regularization
+- Normalized codebook in semantic loss calc

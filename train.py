@@ -32,13 +32,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
 VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-MODEL_OUT_PREFIX = "ochre-v4.3.2"
+MODEL_OUT_PREFIX = "ochre-v4.3.3"
 RESUME_PATH = ""  
 
 # --- TRAINING HYPERPARAMETERS ---
 BATCH_SIZE = 16
 EPOCHS = 50           # Total number of "Pseudo-Epochs" to run
-STEPS_PER_EPOCH = 10000 # Force curriculum update/dataset refresh every N steps
+STEPS_PER_EPOCH = 5000 # Force curriculum update/dataset refresh every N steps
 LR = 3e-5             
 WARMUP_STEPS = 500   
 MIN_LR = 1e-6         
@@ -52,19 +52,20 @@ MAX_SEQ_LEN = 100
 CURRICULUM_AR = True
 AR_START_STEP = 0      
 AR_ROLLOUT_MAX = 49    
-AR_RAMP_EPOCHS = 5     
+AR_RAMP_EPOCHS = 2   
 
 # --- DUAL LOSS WEIGHTS ---
-SEMANTIC_WEIGHT = 10.0  
+SEMANTIC_WEIGHT = 5.0   
 NEIGHBOR_WEIGHT = 1.0   
 NEIGHBOR_KERNEL = 3     
-NEIGHBOR_EXACT_MIX = 0.1 
+NEIGHBOR_EXACT_MIX = 0.5
+ENTROPY_WEIGHT = 0.01   # Start small. If collapse persists, try 0.05.
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.3.2-epoch0"
+RUN_NAME = "v4.3.3-epoch0"
 LOG_STEPS = 10
-IMAGE_LOG_STEPS = 10000 
+IMAGE_LOG_STEPS = 1000 
 REPORT_SPIKES = True
 SPIKE_LOSS = 15.0 
 SPIKE_GRAD = 400
@@ -77,47 +78,37 @@ EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 class SemanticCodebookLoss(nn.Module):
     def __init__(self, codebook_tensor):
         super().__init__()
-        self.register_buffer('codebook', codebook_tensor.clone().detach())
+        # FIX 1: Normalize Codebook to unit sphere
+        # This ensures MSE is bounded between 0 and 4 (if vectors are opposite)
+        # preventing the loss from exploding due to vector magnitude.
+        self.register_buffer('codebook', F.normalize(codebook_tensor, p=2, dim=1))
 
     def forward(self, logits, target_indices):
-        """
-        Memory Efficient (Chunked) Forward Pass.
-        Handles both (B, C, H, W) and (B, H, W, C) logits automatically.
-        """
-        # [FIX] Handle Permutation:
-        # If logits are (B, C, H, W), move C to the end -> (B, H, W, C)
         if logits.dim() == 4 and logits.shape[1] == self.codebook.shape[0]:
              logits = logits.permute(0, 2, 3, 1)
         
-        # Flatten batch/spatial dims for chunking
-        # Now shape is guaranteed to be (..., Codebook_Size)
-        logits_flat = logits.reshape(-1, logits.size(-1)) # (N, 1024)
-        targets_flat = target_indices.reshape(-1)         # (N)
+        logits_flat = logits.reshape(-1, logits.size(-1)) 
+        targets_flat = target_indices.reshape(-1)         
         
-        # Chunk size: Process 4096 pixels at a time
         CHUNK_SIZE = 4096 
         total_loss = 0.0
         n_samples = logits_flat.size(0)
         
-        # Iterate in chunks to keep peak memory low
         for i in range(0, n_samples, CHUNK_SIZE):
             end = min(i + CHUNK_SIZE, n_samples)
             logits_chunk = logits_flat[i : end]
             target_chunk = targets_flat[i : end]
             
-            # 1. Softmax -> Expected Vector
             probs = F.softmax(logits_chunk, dim=-1)
             pred_vectors = torch.matmul(probs, self.codebook)
             
-            # 2. Ground Truth Vector
+            # FIX 2: Embedding lookup on Normalized Codebook
             target_vectors = F.embedding(target_chunk, self.codebook)
             
-            # 3. MSE (Sum reduction, we divide by total later)
             chunk_loss = F.mse_loss(pred_vectors, target_vectors, reduction='sum')
             total_loss += chunk_loss
 
-        # Average over total samples
-        return total_loss / (n_samples * self.codebook.shape[1])
+        return total_loss / n_samples
 
 def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
     B, C, H, W = logits.shape
@@ -391,18 +382,33 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 
                 logits_last = logits_t
                 
-                # --- Loss Calculation ---
                 # 1. Spatial Loss
                 loss_space = neighborhood_token_loss(
                     logits_t, Z_target[:, t],
                     kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
                 )
                 
-                # 2. Semantic Loss (Chunked for Memory Safety)
-                # Reshaping handled inside the class now
+                # 2. Semantic Loss
                 loss_texture = semantic_criterion(logits_t, Z_target[:, t])
+
+                # 3. Entropy Regularization (The Anti-Collapse)
+                # Calculate probability distribution across the codebook
+                probs = F.softmax(logits_t, dim=1)
                 
-                loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture)
+                # Calculate Entropy: -sum(p * log(p))
+                # High entropy = uncertain/diverse. Low entropy = confident/collapsed.
+                entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=1).mean()
+                
+                # We want to MAXIMIZE entropy to fight collapse.
+                # Since we minimize loss, we add NEGATIVE entropy.
+                loss_entropy = -ENTROPY_WEIGHT * entropy
+
+                # 4. Total Step Loss
+                # HERE is where the constant is used:
+                loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
+                            (SEMANTIC_WEIGHT * loss_texture) + \
+                            loss_entropy
+                            
                 step_losses.append(loss_step)
 
             loss = torch.stack(step_losses).mean()
@@ -431,6 +437,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/loss": loss.item(),
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
+                    "train/loss_entropy": loss_entropy.item(),
                     "diagnostics/entropy": entropy.item(),
                     "diagnostics/confidence": confidence.item(),
                     "diagnostics/unique_codes": unique_codes,
