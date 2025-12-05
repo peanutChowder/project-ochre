@@ -198,3 +198,4 @@ Results, 250k steps:
 - Fixed bug in loading VQVAE decoder that prevented wandb visual logging
 - Context window: Increased to 16 frames
 - AR curriculum additive: Modified overall context window to increase when AR curriculum increases to prevent AR "consuming" GT input frames
+- Memory: Turned on checkpointing and changed semantic loss to be calculated in batches

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """
-Full World Model Training Script with Semantic & Spatial Loss.
-------------------------------------------------------------
 Checklist before running:
 1. Ensure 'WorldModelConvFiLM' class is defined/imported.
 2. Ensure 'VQVAE' class (and dependencies) is defined/imported.
@@ -31,8 +29,8 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- PATHS ---
-DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
-VQVAE_PATH = "/kaggle/working/vqvae.pt"
+DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
+VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 MODEL_OUT_PREFIX = "ochre-v4.3.2"
 RESUME_PATH = ""  
@@ -44,11 +42,11 @@ STEPS_PER_EPOCH = 10000 # Force curriculum update/dataset refresh every N steps
 LR = 3e-5             
 WARMUP_STEPS = 500   
 MIN_LR = 1e-6         
-USE_CHECKPOINTING = False 
+USE_CHECKPOINTING = True 
 
 # --- CONTEXT WINDOW SETTINGS ---
 GT_CONTEXT_LEN = 16       
-MAX_SEQ_LEN = 100 # Hard cap on total VRAM usage (GT + AR)
+MAX_SEQ_LEN = 100 
 
 # Autoregressive Rollout 
 CURRICULUM_AR = True
@@ -82,10 +80,44 @@ class SemanticCodebookLoss(nn.Module):
         self.register_buffer('codebook', codebook_tensor.clone().detach())
 
     def forward(self, logits, target_indices):
-        probs = F.softmax(logits, dim=-1) 
-        pred_vectors = torch.matmul(probs, self.codebook) 
-        target_vectors = F.embedding(target_indices, self.codebook) 
-        return F.mse_loss(pred_vectors, target_vectors)
+        """
+        Memory Efficient (Chunked) Forward Pass.
+        Handles both (B, C, H, W) and (B, H, W, C) logits automatically.
+        """
+        # [FIX] Handle Permutation:
+        # If logits are (B, C, H, W), move C to the end -> (B, H, W, C)
+        if logits.dim() == 4 and logits.shape[1] == self.codebook.shape[0]:
+             logits = logits.permute(0, 2, 3, 1)
+        
+        # Flatten batch/spatial dims for chunking
+        # Now shape is guaranteed to be (..., Codebook_Size)
+        logits_flat = logits.reshape(-1, logits.size(-1)) # (N, 1024)
+        targets_flat = target_indices.reshape(-1)         # (N)
+        
+        # Chunk size: Process 4096 pixels at a time
+        CHUNK_SIZE = 4096 
+        total_loss = 0.0
+        n_samples = logits_flat.size(0)
+        
+        # Iterate in chunks to keep peak memory low
+        for i in range(0, n_samples, CHUNK_SIZE):
+            end = min(i + CHUNK_SIZE, n_samples)
+            logits_chunk = logits_flat[i : end]
+            target_chunk = targets_flat[i : end]
+            
+            # 1. Softmax -> Expected Vector
+            probs = F.softmax(logits_chunk, dim=-1)
+            pred_vectors = torch.matmul(probs, self.codebook)
+            
+            # 2. Ground Truth Vector
+            target_vectors = F.embedding(target_chunk, self.codebook)
+            
+            # 3. MSE (Sum reduction, we divide by total later)
+            chunk_loss = F.mse_loss(pred_vectors, target_vectors, reduction='sum')
+            total_loss += chunk_loss
+
+        # Average over total samples
+        return total_loss / (n_samples * self.codebook.shape[1])
 
 def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
     B, C, H, W = logits.shape
@@ -192,7 +224,6 @@ LOADED_CB_SIZE = conf.get("codebook_size", 1024)
 print(f"   Detected VQ-VAE Config -> Dim: {LOADED_EMB_DIM}, Codebook Size: {LOADED_CB_SIZE}")
 
 # 2. Instantiate VQ-VAE
-# Note: Ensure VQVAE class definition is available in this scope or imported
 vqvae_model = VQVAE(
     embedding_dim=LOADED_EMB_DIM,
     num_embeddings=LOADED_CB_SIZE
@@ -214,7 +245,6 @@ vqvae_model.eval()
 vqvae_model.requires_grad_(False)
 
 # --- B. Initialize World Model ---
-# Note: Ensure WorldModelConvFiLM class definition is available
 model = WorldModelConvFiLM(
     action_dim=5, 
     H=18, 
@@ -279,16 +309,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
     
-    # [FIX] Additive Logic: Ensure we always have GT_CONTEXT_LEN frames of Reality
     seq_len = GT_CONTEXT_LEN + ar_len
-    
-    # Cap total length at Max VRAM capacity
     if seq_len > MAX_SEQ_LEN:
         seq_len = MAX_SEQ_LEN
-        # If we hit max VRAM, we start sacrificing GT context to maintain AR rollout
-        # But we hope MAX_SEQ_LEN is large enough that this rarely happens
-        
-    # Cap AR len if it consumes the entire sequence (shouldn't happen with additive logic)
+    
+    # Cap AR len if it consumes the entire sequence
     ar_len = min(ar_len, seq_len - 1)
     if ar_len < 0: ar_len = 0
     
@@ -318,7 +343,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         optimizer.zero_grad()
         
-        # Embeddings & FiLM
+        # Pre-compute Embeddings & FiLM
         X_seq = model.compute_embeddings(Z_seq)
         Gammas_seq, Betas_seq = model.compute_film(A_seq)
         h_state = model.init_state(B, device=DEVICE)
@@ -326,34 +351,56 @@ for epoch in range(start_epoch, EPOCHS + 1):
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             ar_cutoff = K - ar_len
             
+            # Create a dummy tensor that requires grad for checkpoint consistency
+            # This is never used mathematically if x_t is passed, but ensures signature validity
+            dummy_z = torch.tensor(0, device=DEVICE)
+            dummy_a = torch.tensor(0, device=DEVICE)
+
             for t in range(K):
+                # Prepare Inputs
                 if t >= ar_cutoff:
-                    z_in = logits_last.argmax(dim=1) 
-                    x_in = None 
+                    # AR Mode: Use previous prediction
+                    z_idx = logits_last.argmax(dim=1) 
+                    
+                    # [CHECKPOINT SAFETY FIX]
+                    # Compute embedding HERE so we always pass a tensor to model.step
+                    # instead of passing None. This ensures 'checkpoint' works correctly.
+                    x_in = model._embed_tokens(z_idx) 
                 else:
-                    z_in = torch.tensor(0, device=DEVICE)
+                    # Teacher Forcing: Use pre-computed embedding
                     x_in = X_seq[:, t]
 
                 g_t = Gammas_seq[:, :, t]
                 b_t = Betas_seq[:, :, t]
                 
                 if USE_CHECKPOINTING:
-                    logits_t, h_state = checkpoint(model.step, z_in, torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
+                    # We pass x_in (Embedding) which has requires_grad=True
+                    # We pass dummy_z, dummy_a which are ignored inside step because x_in is present
+                    logits_t, h_state = checkpoint(
+                        model.step, 
+                        dummy_z, 
+                        dummy_a, 
+                        h_state, 
+                        x_in, 
+                        g_t, 
+                        b_t, 
+                        use_reentrant=False
+                    )
                 else:
-                    logits_t, h_state = model.step(z_in, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+                    logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
                 
                 logits_last = logits_t
                 
-                # Spatial Loss
+                # --- Loss Calculation ---
+                # 1. Spatial Loss
                 loss_space = neighborhood_token_loss(
                     logits_t, Z_target[:, t],
                     kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
                 )
                 
-                # Semantic Loss
-                logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                target_flat = Z_target[:, t].reshape(-1)
-                loss_texture = semantic_criterion(logits_flat, target_flat)
+                # 2. Semantic Loss (Chunked for Memory Safety)
+                # Reshaping handled inside the class now
+                loss_texture = semantic_criterion(logits_t, Z_target[:, t])
                 
                 loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture)
                 step_losses.append(loss_step)
@@ -368,7 +415,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
             print(f"\n⚡ Spike: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
-            print(f"   (Space: {loss_space.item():.4f}, Tex: {loss_texture.item():.4f})")
 
         total_loss += loss.item()
         
