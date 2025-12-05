@@ -106,6 +106,7 @@ def main():
     vqvae = load_vqvae(args.vqvae_ckpt, device)
     # Instantiate with correct dimensions from training
     model = WorldModelConvFiLM(
+        codebook_size=1024,
         action_dim=ACTION_DIM, 
         H=LATENT_H, 
         W=LATENT_W

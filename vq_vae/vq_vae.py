@@ -215,7 +215,7 @@ class VQVAE(nn.Module):
     def __init__(self, embedding_dim=256, num_embeddings=2048, commitment_cost=0.25, decay=0.99):
         super().__init__()
         self.encoder = Encoder(3, embedding_dim)
-        self.pre_vq_conv = nn.Identity()  # no extra conv before quantization
+        self.pre_vq_conv = nn.Identity()
         self.vq_vae = VectorQuantizerEMA(embedding_dim, num_embeddings, commitment_cost, decay)
         self.decoder = Decoder(embedding_dim, 3)
 
@@ -230,24 +230,30 @@ class VQVAE(nn.Module):
         """
         Decode from discrete code indices back into an RGB image.
         code_indices: (B, H, W) or (H, W)
-        Returns (B, 3, IMAGE_HEIGHT, IMAGE_WIDTH) in [0,1] when trained at that size.
+        Returns (B, 3, IMAGE_HEIGHT, IMAGE_WIDTH)
         """
+        # 1. Handle single image (H, W) -> (1, H, W)
         if code_indices.dim() == 2:
             code_indices = code_indices.unsqueeze(0)
-        elif code_indices.dim() == 3 and code_indices.size(0) == 1:
-            # ensure consistent dtype and batch dimension
-            code_indices = code_indices.clone()
+        
+        # 2. Handle batch (B, H, W) - REMOVED the "size(0) == 1" restriction here
+        elif code_indices.dim() == 3:
+            pass # Valid shape
+            
         else:
             raise ValueError(f"Unexpected shape for code_indices: {tuple(code_indices.shape)}")
 
-        code_indices = code_indices.long()  # ensure integer indices
-        emb = self.vq_vae.embedding  # (D, K)
-        # F.embedding expects (...,) and adds trailing dimension D
-        z_q = F.embedding(code_indices, emb.t())  # (B, H, W, D)
-        if z_q.dim() == 3:  # safety fallback if batch dim squeezed
-            z_q = z_q.unsqueeze(0)
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()  # (B, D, H, W)
+        code_indices = code_indices.long()
+        emb = self.vq_vae.embedding 
+        
+        # VQVAE embedding is (Dim, Tokens), F.embedding needs (Tokens, Dim) -> Transpose
+        z_q = F.embedding(code_indices, emb.t()) # (B, H, W, D)
+        
+        # Permute to (B, D, H, W) for decoder
+        z_q = z_q.permute(0, 3, 1, 2).contiguous() 
+        
         return self.decoder(z_q)
+
 
 
 class FlatFolderDataset(Dataset):

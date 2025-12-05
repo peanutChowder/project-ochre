@@ -177,3 +177,14 @@ Results:
 - Movement: Even without movement, the scene has constant localized shifts - e.g. little spikes in the ground shift around, but general scene remains stable
   - Cannot discern whether new action conditioning is working due to this constant shifting
 - Camera rollout: Excellect maintenance of ground/sky when looking up/down, but looking left/right is not discernible due to lack of detail and the constant shifting spikes in scene.
+
+**v4.3**
+train.py
+- Dual Loss: Implemented SemanticCodebookLoss (Embedding MSE) to fix "blurry" texture predictions and neighborhood_token_loss to tolerate spatial jitter.
+- Shape Correction: Dynamically loads codebook_size (1024) from the VQ-VAE checkpoint and passes it to the World Model (fixing the default 2048 mismatch).
+
+vqvae.py 
+- Batch Support: Updated decode_code to allow batched inputs (B, H, W) by removing the restriction size(0) == 1 to enable visualization logs
+
+live_inference.py
+- Shape correction: Fixed the codebook_size to 1024
