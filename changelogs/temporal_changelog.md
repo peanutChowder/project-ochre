@@ -188,3 +188,13 @@ vqvae.py
 
 live_inference.py
 - Shape correction: Fixed the codebook_size to 1024
+
+Results, 250k steps:
+- Ran into OOM after 6hr
+- Checkpoint showed strong initial details, but due to bug in AR rollout calculation it stayed at 0
+
+**v4.3.2**
+- Added artificial epoch limiter to allow DataLoader to reset for AR curriculum increases
+- Fixed bug in loading VQVAE decoder that prevented wandb visual logging
+- Context window: Increased to 16 frames
+- AR curriculum additive: Modified overall context window to increase when AR curriculum increases to prevent AR "consuming" GT input frames
