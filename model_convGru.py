@@ -44,13 +44,15 @@ class ActionFiLM(nn.Module):
         self.n_layers = n_layers
         self.mlps = nn.ModuleList()
         for _ in range(n_layers):
-            self.mlps.append(
-                nn.Sequential(
-                    nn.Linear(action_dim, hidden_dim),
-                    nn.SiLU(),
-                    nn.Linear(hidden_dim, 2 * hidden_dim),
-                )
+            mlp = nn.Sequential(
+                nn.Linear(action_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 2 * hidden_dim),
             )
+            # Initialize output layer to zeros for identity modulation at start
+            nn.init.zeros_(mlp[-1].weight)
+            nn.init.zeros_(mlp[-1].bias)
+            self.mlps.append(mlp)
 
     def forward(self, a):
         """

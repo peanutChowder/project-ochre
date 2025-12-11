@@ -32,7 +32,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
 VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-MODEL_OUT_PREFIX = "ochre-v4.3.3"
+MODEL_OUT_PREFIX = "ochre-v4.3.5"
 RESUME_PATH = ""  
 
 # --- TRAINING HYPERPARAMETERS ---
@@ -59,11 +59,11 @@ SEMANTIC_WEIGHT = 5.0
 NEIGHBOR_WEIGHT = 1.0   
 NEIGHBOR_KERNEL = 3     
 NEIGHBOR_EXACT_MIX = 0.5
-ENTROPY_WEIGHT = 0.01   # Start small. If collapse persists, try 0.05.
+ENTROPY_WEIGHT = 0.1   # Adjusted for Codebook Diversity (Perplexity) logic
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.3.3-epoch0"
+RUN_NAME = "v4.3.5-epoch0"
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000 
 REPORT_SPIKES = True
@@ -393,15 +393,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
                 # 3. Entropy Regularization (The Anti-Collapse)
                 # Calculate probability distribution across the codebook
-                probs = F.softmax(logits_t, dim=1)
-                
-                # Calculate Entropy: -sum(p * log(p))
-                # High entropy = uncertain/diverse. Low entropy = confident/collapsed.
-                entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=1).mean()
-                
-                # We want to MAXIMIZE entropy to fight collapse.
-                # Since we minimize loss, we add NEGATIVE entropy.
-                loss_entropy = -ENTROPY_WEIGHT * entropy
+                probs = F.softmax(logits_t, dim=1) # Shape: [Batch, CodebookSize, H, W]
+
+                # A. Calculate Global Batch Usage (Average probability of each code across batch AND spatial dims)
+                # We want to maximize the entropy of the *average* code distribution to ensure all codes are used.
+                avg_probs = probs.mean(dim=[0, 2, 3]) # Shape: [CodebookSize]
+
+                # B. Calculate Entropy of the Usage Distribution
+                # High entropy = codes are used evenly. Low = only one code is used.
+                codebook_entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-9))
+
+                # We want to MAXIMIZE this diversity, so we minimize negative entropy
+                loss_entropy = -ENTROPY_WEIGHT * codebook_entropy
 
                 # 4. Total Step Loss
                 # HERE is where the constant is used:

@@ -206,3 +206,8 @@ Results:
 **v4.3.3**
 - Codebook collapse: introduced codebook regularization
 - Normalized codebook in semantic loss calc
+
+**v4.3.5**
+- Entropy Fix: Corrected entropy calculation to average over spatial dimensions (`dim=[0,2,3]`), penalizing global codebook collapse instead of local per-pixel certainty (blur).
+- Increased `ENTROPY_WEIGHT` to 0.1.
+- Stability: Zero-initialized FiLM action modulation to prevent initial gradient shocks.
