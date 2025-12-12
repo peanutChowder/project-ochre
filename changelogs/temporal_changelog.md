@@ -191,10 +191,11 @@ live_inference.py
 
 **v4.4**
 train.py
+- AR Curriculum fix: Dataloader now reloads with recomputed `ar_len`, `seq_len` change. v4.3 previously had AR permanently set to 0.
 - Scheduled Sampling: Implemented inverse sigmoid curriculum for teacher forcing probability (lines 77-86), addresses exposure bias by gradually transitioning from teacher forcing (95%) to autoregressive (5%) over 30k steps
 - AR Curriculum Optimization: Reduced AR_ROLLOUT_MAX from 49->24 steps and AR_RAMP_STEPS from 30k->20k for gentler learning curve; increased BASE_SEQ_LEN from 1→16 for better context
-- AR Loss Gap Tracking: Added separate loss tracking for teacher-forced vs autoregressive steps 
-- Action Diagnostics: Implemented FiLM magnitude tracking (gamma/beta) and action sensitivity testing via perturbation analysis
+- AR Loss Gap Tracking: Added separate loss tracking for teacher-forced vs autoregressive steps to quantify exposure bias
+- Action Diagnostics: Implemented FiLM magnitude tracking (gamma/beta) and action sensitivity testing via perturbation analysis every 100 steps
 
 model_convGru.py
 - Public Embedding Method: Added _embed_tokens() helper (lines 133-142) to support scheduled sampling by enabling re-embedding of predicted tokens during autoregressive rollout

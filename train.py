@@ -21,7 +21,7 @@ try:
     import wandb
 except ImportError:
     wandb = None
-    print("⚠️  wandb not found, logging disabled.")
+    print("WARNING: wandb not found, logging disabled.")
 
 
 # ==========================================
@@ -249,12 +249,12 @@ elif "quantizer" in vqvae_ckpt: # Legacy check
 try:
     vqvae_model.load_state_dict(state_dict, strict=False)
 except Exception as e:
-    print(f"⚠️ Note: strict loading failed ({e}). Attempting non-strict...")
+    print(f"WARNING: strict loading failed ({e}). Attempting non-strict...")
     # This is fine for us as long as decoder and quantizer.embedding load
     
 vqvae_model.eval()
 vqvae_model.requires_grad_(False)
-print("✅ VQ-VAE Loaded.")
+print("VQ-VAE Loaded.")
 
 # B. Initialize World Model
 model = WorldModelConvFiLM(action_dim=5, H=18, W=32, use_checkpointing=USE_CHECKPOINTING).to(DEVICE)
@@ -265,7 +265,7 @@ scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 # The codebook tensor is typically: vqvae_model.vq_vae.embedding
 codebook = vqvae_model.vq_vae.embedding.clone().detach()
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
-print(f"✅ Semantic Loss Initialized with codebook shape {codebook.shape}")
+print(f"Semantic Loss Initialized with codebook shape {codebook.shape}")
 
 # D. Resume Logic
 global_step = 0
@@ -294,34 +294,60 @@ def save_checkpoint(epoch, global_step, is_emergency=False):
 # --- TRAINING ---
 last_emergency_save_time = time.time()
 
-for epoch in range(start_epoch, EPOCHS + 1):
-    model.train()
-    total_loss = 0.0
-
-    # Curriculum update
+# Helper function to compute curriculum params
+def compute_curriculum_params(step):
     ar_len = 0
-    if CURRICULUM_AR and global_step > AR_START_STEP:
-        progress = (global_step - AR_START_STEP) / AR_RAMP_STEPS
+    if CURRICULUM_AR and step > AR_START_STEP:
+        progress = (step - AR_START_STEP) / AR_RAMP_STEPS
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
 
     current_base = BASE_SEQ_LEN
     if CURRICULUM_SEQ_LEN:
-         current_base = min(BASE_SEQ_LEN + (global_step // SEQ_LEN_INCREASE_STEPS), MAX_SEQ_LEN)
-    
+        current_base = min(BASE_SEQ_LEN + (step // SEQ_LEN_INCREASE_STEPS), MAX_SEQ_LEN)
+
     seq_len = min(max(current_base, ar_len + 1), MAX_SEQ_LEN)
     ar_len = min(ar_len, seq_len - 1)
     if ar_len < 0: ar_len = 0
-    
-    print(f"🧩 Curriculum: seq_len={seq_len}, ar_len={ar_len}")
 
-    dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
-    if len(dataset) == 0: continue
-    
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                        num_workers=4, pin_memory=True, persistent_workers=False)
+    return seq_len, ar_len
 
-    for batch_idx, batch in enumerate(loader):
+# Initialize curriculum
+prev_seq_len, prev_ar_len = compute_curriculum_params(global_step)
+dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                    num_workers=4, pin_memory=True, persistent_workers=False)
+loader_iter = iter(loader)
+print(f"Initial Curriculum: seq_len={prev_seq_len}, ar_len={prev_ar_len}")
+
+for epoch in range(start_epoch, EPOCHS + 1):
+    model.train()
+    total_loss = 0.0
+
+    # Infinite batch loop (dataloader reloads when curriculum changes)
+    while True:
+        # Check if curriculum needs update
+        seq_len, ar_len = compute_curriculum_params(global_step)
+
+        if seq_len != prev_seq_len:
+            print(f"Curriculum changed: seq_len {prev_seq_len}->{seq_len}, ar_len {prev_ar_len}->{ar_len}")
+            prev_seq_len, prev_ar_len = seq_len, ar_len
+            # Reload dataset and dataloader
+            dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
+            if len(dataset) == 0:
+                print("WARNING: Empty dataset, breaking epoch")
+                break
+            loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=4, pin_memory=True, persistent_workers=False)
+            loader_iter = iter(loader)
+
+        # Get next batch
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            # Epoch complete
+            break
+
         t0_batch = time.time()
         Z_seq, A_seq, Z_target, _, _, _ = batch
         Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
@@ -418,7 +444,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         # --- DIAGNOSTICS & LOGGING ---
         if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
-            print(f"\n⚡ Spike: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
+            print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
             print(f"   (Space: {loss_space.item():.4f}, Tex: {loss_texture.item():.4f})")
 
         total_loss += loss.item()
@@ -504,4 +530,4 @@ for epoch in range(start_epoch, EPOCHS + 1):
     save_checkpoint(epoch, global_step)
 
 if wandb: wandb.finish()
-print("✅ Training complete.")
+print("Training complete.")
