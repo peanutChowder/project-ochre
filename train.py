@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
+Full World Model Training Script with Semantic & Spatial Loss.
+------------------------------------------------------------
 Checklist before running:
 1. Ensure 'WorldModelConvFiLM' class is defined/imported.
-2. Ensure 'VQVAE' class (and dependencies) is defined/imported.
-3. Update VQVAE_PATH to point to your trained 'vqvae.pt'.
-4. Update DATA_DIR to your dataset location.
+2. Update VQVAE_PATH to point to your trained 'vqvae.pt'.
+3. Update DATA_DIR to your dataset location.
 """
 
 import os, time, json, math, numpy as np, torch, random
@@ -28,44 +29,46 @@ except ImportError:
 # ==========================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- PATHS ---
-DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
-VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt"
+# --- PATHS (UPDATE THESE) ---
+DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
+VQVAE_PATH = "/kaggle/working/vqvae.pt" # Points to the checkpoint saved by your VQVAE script
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
-MODEL_OUT_PREFIX = "ochre-v4.3.5"
-RESUME_PATH = ""  
 
-# --- TRAINING HYPERPARAMETERS ---
+# --- HYPERPARAMETERS ---
 BATCH_SIZE = 16
-EPOCHS = 50           # Total number of "Pseudo-Epochs" to run
-STEPS_PER_EPOCH = 5000 # Force curriculum update/dataset refresh every N steps
+EPOCHS = 50
 LR = 3e-5             
 WARMUP_STEPS = 500   
 MIN_LR = 1e-6         
-USE_CHECKPOINTING = True 
-
-# --- CONTEXT WINDOW SETTINGS ---
-GT_CONTEXT_LEN = 16       
-MAX_SEQ_LEN = 100 
-
-# Autoregressive Rollout 
-CURRICULUM_AR = True
-AR_START_STEP = 0      
-AR_ROLLOUT_MAX = 49    
-AR_RAMP_EPOCHS = 2   
+USE_CHECKPOINTING = False 
 
 # --- DUAL LOSS WEIGHTS ---
-SEMANTIC_WEIGHT = 5.0   
+# SEMANTIC: Punishes "wrong color/texture" (Embedding MSE)
+SEMANTIC_WEIGHT = 10.0  
+# NEIGHBOR: Tolerates "1-pixel spatial shift" (Spatial Cross Entropy)
 NEIGHBOR_WEIGHT = 1.0   
 NEIGHBOR_KERNEL = 3     
-NEIGHBOR_EXACT_MIX = 0.5
-ENTROPY_WEIGHT = 0.1   # Adjusted for Codebook Diversity (Perplexity) logic
+NEIGHBOR_EXACT_MIX = 0.1 # 10% strict exact-pixel loss, 90% neighbor tolerant
+
+# --- CURRICULUM ---
+CURRICULUM_SEQ_LEN = False
+BASE_SEQ_LEN = 1       
+MAX_SEQ_LEN = 50       
+SEQ_LEN_INCREASE_STEPS = 5000  
+
+CURRICULUM_AR = True
+AR_START_STEP = 0      
+AR_RAMP_STEPS = 30000    
+AR_ROLLOUT_MAX = 49       
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.3.5-epoch0"
+RUN_NAME = "v4.5-semantic-vis"
+MODEL_OUT_PREFIX = "ochre-v4.5"
+RESUME_PATH = ""  
+
 LOG_STEPS = 10
-IMAGE_LOG_STEPS = 1000 
+IMAGE_LOG_STEPS = 500 # Log visual reconstruction every N steps
 REPORT_SPIKES = True
 SPIKE_LOSS = 15.0 
 SPIKE_GRAD = 400
@@ -76,79 +79,88 @@ EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 # ==========================================
 
 class SemanticCodebookLoss(nn.Module):
+    """
+    Computes MSE in Embedding Space.
+    Prevents "Gray Soup" by rewarding visually similar textures.
+    """
     def __init__(self, codebook_tensor):
         super().__init__()
-        # FIX 1: Normalize Codebook to unit sphere
-        # This ensures MSE is bounded between 0 and 4 (if vectors are opposite)
-        # preventing the loss from exploding due to vector magnitude.
-        self.register_buffer('codebook', F.normalize(codebook_tensor, p=2, dim=1))
+        # codebook_tensor: (Num_Embeddings, Embedding_Dim)
+        self.register_buffer('codebook', codebook_tensor.clone().detach())
 
     def forward(self, logits, target_indices):
-        if logits.dim() == 4 and logits.shape[1] == self.codebook.shape[0]:
-             logits = logits.permute(0, 2, 3, 1)
+        # 1. Softmax -> Expected Vector
+        probs = F.softmax(logits, dim=-1) 
+        pred_vectors = torch.matmul(probs, self.codebook) # (B*S, Emb_Dim)
         
-        logits_flat = logits.reshape(-1, logits.size(-1)) 
-        targets_flat = target_indices.reshape(-1)         
+        # 2. Ground Truth Vector
+        target_vectors = F.embedding(target_indices, self.codebook) # (B*S, Emb_Dim)
         
-        CHUNK_SIZE = 4096 
-        total_loss = 0.0
-        n_samples = logits_flat.size(0)
-        
-        for i in range(0, n_samples, CHUNK_SIZE):
-            end = min(i + CHUNK_SIZE, n_samples)
-            logits_chunk = logits_flat[i : end]
-            target_chunk = targets_flat[i : end]
-            
-            probs = F.softmax(logits_chunk, dim=-1)
-            pred_vectors = torch.matmul(probs, self.codebook)
-            
-            # FIX 2: Embedding lookup on Normalized Codebook
-            target_vectors = F.embedding(target_chunk, self.codebook)
-            
-            chunk_loss = F.mse_loss(pred_vectors, target_vectors, reduction='sum')
-            total_loss += chunk_loss
-
-        return total_loss / n_samples
+        # 3. MSE
+        return F.mse_loss(pred_vectors, target_vectors)
 
 def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
+    """
+    Spatially tolerant Cross Entropy.
+    Prevents penalty for 1-pixel jitter.
+    """
     B, C, H, W = logits.shape
     log_probs = F.log_softmax(logits, dim=1)          
     log_probs_flat = log_probs.view(B, C, H * W)      
 
     k = kernel_size
     pad = k // 2
+    # Create windows of neighbors for every pixel
     target_patches = F.unfold(
         target.float().unsqueeze(1), kernel_size=k, padding=pad
-    ).long()
+    ).long() # (B, K*K, HW)
 
-    neighbors = target_patches.permute(0, 2, 1) 
-    lp = log_probs_flat.permute(0, 2, 1)        
+    neighbors = target_patches.permute(0, 2, 1) # (B, HW, K*K)
+    lp = log_probs_flat.permute(0, 2, 1)        # (B, HW, C)
+    
+    # Gather log-probs of all valid neighbors
     lp_neighbors = lp.gather(dim=2, index=neighbors)
+    
+    # "Did we predict ANY of the neighbors?" (LogSumExp)
     log_p_any = torch.logsumexp(lp_neighbors, dim=2)
     loss_neigh = -log_p_any.mean()
 
     if mix_exact <= 0.0: return loss_neigh
 
+    # Mix with strict loss
     logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)
     target_flat = target.reshape(-1)
     loss_exact = F.cross_entropy(logits_flat, target_flat)
 
     return mix_exact * loss_exact + (1.0 - mix_exact) * loss_neigh
 
+def sample_with_temperature(logits, temperature=1.0):
+    if temperature < 1e-5: return logits.argmax(dim=-1)
+    probs = F.softmax(logits / temperature, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
 def log_images_to_wandb(vqvae, Z_target, logits, global_step):
+    """
+    Visualizes Ground Truth vs Prediction.
+    """
     if wandb is None: return
     with torch.no_grad():
+        # Take the last frame of the sequence
         gt_indices = Z_target[:, -1] 
         pred_indices = logits.argmax(dim=1) 
         
+        # Decode
         gt_rgb = vqvae.decode_code(gt_indices)
         pred_rgb = vqvae.decode_code(pred_indices)
         
+        # Visualize first 4
         n = min(4, gt_rgb.size(0))
         vis_gt = gt_rgb[:n].detach().cpu()
         vis_pred = pred_rgb[:n].detach().cpu()
         
+        # Stack: Top=GT, Bottom=Pred
         grid = make_grid(torch.cat([vis_gt, vis_pred], dim=0), nrow=n, normalize=False)
+        
         wandb.log({
             "visuals/reconstruction": wandb.Image(grid, caption="Top: GT | Bottom: Pred")
         }, step=global_step)
@@ -179,6 +191,7 @@ class GTTokenDataset(Dataset):
         except ValueError:
             data = np.load(path)
         
+        # Slicing
         tokens = data["tokens"]   
         actions = data["actions"] 
 
@@ -193,84 +206,66 @@ class GTTokenDataset(Dataset):
             idx, vid_idx, start                
         )
 
-# ==========================================
-# 5. SETUP & TRAINING LOOP
-# ==========================================
-
 if wandb:
     wandb.init(project=PROJECT, name=RUN_NAME, resume="allow",
                 config=dict(batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS))
 
-# --- A. Load VQ-VAE (Frozen) ---
+# A. Load VQ-VAE (Frozen) for Loss & Vis
 print(f"📥 Loading VQ-VAE from {VQVAE_PATH}...")
 if not os.path.exists(VQVAE_PATH):
     raise FileNotFoundError(f"VQVAE checkpoint not found at {VQVAE_PATH}")
 
 vqvae_ckpt = torch.load(VQVAE_PATH, map_location=DEVICE)
 
-# 1. Extract Config
+# Instantiate VQVAE using the config found in the checkpoint or defaults
+# We assume the user's provided VQVAE class structure matches the checkpoint
 conf = vqvae_ckpt.get("config", {})
-LOADED_EMB_DIM = conf.get("embedding_dim", 384)
-LOADED_CB_SIZE = conf.get("codebook_size", 1024) 
-print(f"   Detected VQ-VAE Config -> Dim: {LOADED_EMB_DIM}, Codebook Size: {LOADED_CB_SIZE}")
-
-# 2. Instantiate VQ-VAE
 vqvae_model = VQVAE(
-    embedding_dim=LOADED_EMB_DIM,
-    num_embeddings=LOADED_CB_SIZE
+    embedding_dim=conf.get("embedding_dim", 256), # Default to standard if missing
+    num_embeddings=conf.get("codebook_size", 1024)
 ).to(DEVICE)
 
-# 3. Load Weights Correctly
-try:
-    print("   Loading VQ-VAE sub-modules...")
-    vqvae_model.encoder.load_state_dict(vqvae_ckpt["encoder"])
-    vqvae_model.decoder.load_state_dict(vqvae_ckpt["decoder"])
-    vqvae_model.vq_vae.load_state_dict(vqvae_ckpt["quantizer"])
-    print("✅ VQ-VAE Weights Loaded Successfully.")
-except KeyError as e:
-    print(f"⚠️ Standard loading failed ({e}). Attempting fallback to full state_dict...")
-    if "model_state" in vqvae_ckpt:
-        vqvae_model.load_state_dict(vqvae_ckpt["model_state"], strict=False)
+# Load state dict (handle potential key mismatches)
+state_dict = vqvae_ckpt
+if "model_state" in vqvae_ckpt: state_dict = vqvae_ckpt["model_state"]
+elif "quantizer" in vqvae_ckpt: # Legacy check
+    # If the user saved separate dicts, we might need to reconstruct, but
+    # standard VQVAE script saves the whole model in root or model_state
+    pass 
 
+# Clean up keys if necessary (e.g. remove 'module.' prefix)
+# Then load
+try:
+    vqvae_model.load_state_dict(state_dict, strict=False)
+except Exception as e:
+    print(f"⚠️ Note: strict loading failed ({e}). Attempting non-strict...")
+    # This is fine for us as long as decoder and quantizer.embedding load
+    
 vqvae_model.eval()
 vqvae_model.requires_grad_(False)
+print("✅ VQ-VAE Loaded.")
 
-# --- B. Initialize World Model ---
-model = WorldModelConvFiLM(
-    action_dim=5, 
-    H=18, 
-    W=32, 
-    codebook_size=LOADED_CB_SIZE,
-    use_checkpointing=USE_CHECKPOINTING
-).to(DEVICE)
-
+# B. Initialize World Model
+model = WorldModelConvFiLM(action_dim=5, H=18, W=32, use_checkpointing=USE_CHECKPOINTING).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 
-# --- C. Setup Semantic Loss ---
-codebook_raw = vqvae_model.vq_vae.embedding.clone().detach() 
-if codebook_raw.shape[0] == LOADED_EMB_DIM and codebook_raw.shape[1] == LOADED_CB_SIZE:
-    codebook = codebook_raw.t() 
-else:
-    codebook = codebook_raw
-
+# C. Setup Semantic Loss with loaded codebook
+# The codebook tensor is typically: vqvae_model.vq_vae.embedding
+codebook = vqvae_model.vq_vae.embedding.clone().detach()
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
-print(f"✅ Semantic Loss Initialized. Shape: {codebook.shape}")
+print(f"✅ Semantic Loss Initialized with codebook shape {codebook.shape}")
 
-# --- D. Resume Logic ---
+# D. Resume Logic
 global_step = 0
 start_epoch = 1
-
 if RESUME_PATH and os.path.exists(RESUME_PATH):
-    print(f"🔄 Resuming training from {RESUME_PATH}")
+    print(f" Resuming training from {RESUME_PATH}")
     ckpt = torch.load(RESUME_PATH, map_location=DEVICE)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     start_epoch = ckpt["epoch"] + 1
     global_step = ckpt.get("global_step", 0)
-    print(f"   Resumed at Global Step: {global_step}")
-else:
-    print("⚠️  No resume path found. Starting from Step 0.")
 
 def save_checkpoint(epoch, global_step, is_emergency=False):
     base_name = f"{MODEL_OUT_PREFIX}_epoch_{epoch}"
@@ -285,40 +280,35 @@ def save_checkpoint(epoch, global_step, is_emergency=False):
     }, save_path)
 
 
-# --- E. TRAINING LOOP ---
+# --- TRAINING ---
 last_emergency_save_time = time.time()
 
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     total_loss = 0.0
 
-    # --- Curriculum Calculation ---
+    # Curriculum update
     ar_len = 0
     if CURRICULUM_AR and global_step > AR_START_STEP:
-        total_ramp_steps = AR_RAMP_EPOCHS * STEPS_PER_EPOCH
-        progress = (global_step - AR_START_STEP) / total_ramp_steps
+        progress = (global_step - AR_START_STEP) / AR_RAMP_STEPS
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
+
+    current_base = BASE_SEQ_LEN
+    if CURRICULUM_SEQ_LEN:
+         current_base = min(BASE_SEQ_LEN + (global_step // SEQ_LEN_INCREASE_STEPS), MAX_SEQ_LEN)
     
-    seq_len = GT_CONTEXT_LEN + ar_len
-    if seq_len > MAX_SEQ_LEN:
-        seq_len = MAX_SEQ_LEN
-    
-    # Cap AR len if it consumes the entire sequence
+    seq_len = min(max(current_base, ar_len + 1), MAX_SEQ_LEN)
     ar_len = min(ar_len, seq_len - 1)
     if ar_len < 0: ar_len = 0
     
-    print(f"🧩 Curriculum: seq_len={seq_len}, ar_len={ar_len}, gt_ctx={seq_len - ar_len} (Step {global_step})")
+    print(f"🧩 Curriculum: seq_len={seq_len}, ar_len={ar_len}")
 
     dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
-    if len(dataset) == 0: 
-        print(f"⚠️ Dataset empty. Skipping epoch.")
-        continue
+    if len(dataset) == 0: continue
     
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
                         num_workers=4, pin_memory=True, persistent_workers=False)
-
-    steps_in_this_epoch = 0
 
     for batch_idx, batch in enumerate(loader):
         t0_batch = time.time()
@@ -328,13 +318,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
         step_losses = []
         logits_last = None
 
+        # LR Warmup
         if global_step <= WARMUP_STEPS:
             new_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
             for pg in optimizer.param_groups: pg['lr'] = new_lr
 
         optimizer.zero_grad()
         
-        # Pre-compute Embeddings & FiLM
+        # Embeddings & FiLM
         X_seq = model.compute_embeddings(Z_seq)
         Gammas_seq, Betas_seq = model.compute_film(A_seq)
         h_state = model.init_state(B, device=DEVICE)
@@ -342,76 +333,43 @@ for epoch in range(start_epoch, EPOCHS + 1):
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             ar_cutoff = K - ar_len
             
-            # Create a dummy tensor that requires grad for checkpoint consistency
-            # This is never used mathematically if x_t is passed, but ensures signature validity
-            dummy_z = torch.tensor(0, device=DEVICE)
-            dummy_a = torch.tensor(0, device=DEVICE)
-
             for t in range(K):
-                # Prepare Inputs
+                # Autoregressive Switch
                 if t >= ar_cutoff:
-                    # AR Mode: Use previous prediction
-                    z_idx = logits_last.argmax(dim=1) 
-                    
-                    # [CHECKPOINT SAFETY FIX]
-                    # Compute embedding HERE so we always pass a tensor to model.step
-                    # instead of passing None. This ensures 'checkpoint' works correctly.
-                    x_in = model._embed_tokens(z_idx) 
+                    # In training, we use hard argmax or gumbel. 
+                    # Using argmax here for simplicity in 'Stateful' simulation
+                    z_in = logits_last.argmax(dim=1) 
+                    x_in = None 
                 else:
-                    # Teacher Forcing: Use pre-computed embedding
+                    z_in = torch.tensor(0, device=DEVICE)
                     x_in = X_seq[:, t]
 
+                # Step
                 g_t = Gammas_seq[:, :, t]
                 b_t = Betas_seq[:, :, t]
                 
                 if USE_CHECKPOINTING:
-                    # We pass x_in (Embedding) which has requires_grad=True
-                    # We pass dummy_z, dummy_a which are ignored inside step because x_in is present
-                    logits_t, h_state = checkpoint(
-                        model.step, 
-                        dummy_z, 
-                        dummy_a, 
-                        h_state, 
-                        x_in, 
-                        g_t, 
-                        b_t, 
-                        use_reentrant=False
-                    )
+                    logits_t, h_state = checkpoint(model.step, z_in, torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
                 else:
-                    logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+                    logits_t, h_state = model.step(z_in, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
                 
                 logits_last = logits_t
                 
-                # 1. Spatial Loss
+                # --- LOSS CALCULATION ---
+                # 1. Spatial Loss (Handle Jitter)
                 loss_space = neighborhood_token_loss(
                     logits_t, Z_target[:, t],
                     kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
                 )
                 
-                # 2. Semantic Loss
-                loss_texture = semantic_criterion(logits_t, Z_target[:, t])
-
-                # 3. Entropy Regularization (The Anti-Collapse)
-                # Calculate probability distribution across the codebook
-                probs = F.softmax(logits_t, dim=1) # Shape: [Batch, CodebookSize, H, W]
-
-                # A. Calculate Global Batch Usage (Average probability of each code across batch AND spatial dims)
-                # We want to maximize the entropy of the *average* code distribution to ensure all codes are used.
-                avg_probs = probs.mean(dim=[0, 2, 3]) # Shape: [CodebookSize]
-
-                # B. Calculate Entropy of the Usage Distribution
-                # High entropy = codes are used evenly. Low = only one code is used.
-                codebook_entropy = -torch.sum(avg_probs * torch.log(avg_probs + 1e-9))
-
-                # We want to MAXIMIZE this diversity, so we minimize negative entropy
-                loss_entropy = -ENTROPY_WEIGHT * codebook_entropy
-
-                # 4. Total Step Loss
-                # HERE is where the constant is used:
-                loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
-                            (SEMANTIC_WEIGHT * loss_texture) + \
-                            loss_entropy
-                            
+                # 2. Semantic Loss (Handle Blur)
+                # Flatten for codebook processing
+                logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                target_flat = Z_target[:, t].reshape(-1)
+                loss_texture = semantic_criterion(logits_flat, target_flat)
+                
+                # Weighted Sum
+                loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture)
                 step_losses.append(loss_step)
 
             loss = torch.stack(step_losses).mean()
@@ -422,15 +380,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
         scaler.step(optimizer)
         scaler.update()
 
+        # --- DIAGNOSTICS & LOGGING ---
         if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
             print(f"\n⚡ Spike: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
+            print(f"   (Space: {loss_space.item():.4f}, Tex: {loss_texture.item():.4f})")
 
         total_loss += loss.item()
         
-        # Logs
+        # Periodic Logs
         if global_step % LOG_STEPS == 0:
+            # Calculate Entropy (Uncertainty)
             with torch.no_grad():
-                probs = F.softmax(logits_last.float(), dim=1)
+                probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
                 entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
                 confidence = probs.max(dim=1)[0].mean()
                 unique_codes = logits_last.argmax(dim=1).unique().numel()
@@ -440,7 +401,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/loss": loss.item(),
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
-                    "train/loss_entropy": loss_entropy.item(),
                     "diagnostics/entropy": entropy.item(),
                     "diagnostics/confidence": confidence.item(),
                     "diagnostics/unique_codes": unique_codes,
@@ -449,21 +409,18 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "ar_len": ar_len,
                 }, step=global_step)
 
+        # Image Logs (Visual Confirmation)
         if global_step % IMAGE_LOG_STEPS == 0:
             log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
 
+        # Emergency Save
         if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
             save_checkpoint(epoch, global_step, is_emergency=True)
             last_emergency_save_time = time.time()
             
         global_step += 1
-        steps_in_this_epoch += 1
 
-        if steps_in_this_epoch >= STEPS_PER_EPOCH:
-            print(f"🔄 Pseudo-epoch limit reached ({STEPS_PER_EPOCH} steps). Updating curriculum...")
-            break 
-
-    print(f"Epoch {epoch}: mean loss {total_loss / (len(loader) + 1e-6):.4f}")
+    print(f"Epoch {epoch}: mean loss {total_loss / len(loader):.4f}")
     save_checkpoint(epoch, global_step)
 
 if wandb: wandb.finish()

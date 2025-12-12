@@ -188,26 +188,3 @@ vqvae.py
 
 live_inference.py
 - Shape correction: Fixed the codebook_size to 1024
-
-Results, 250k steps:
-- Ran into OOM after 6hr
-- Checkpoint showed strong initial details, but due to bug in AR rollout calculation it stayed at 0
-
-**v4.3.2**
-- Added artificial epoch limiter to allow DataLoader to reset for AR curriculum increases
-- Fixed bug in loading VQVAE decoder that prevented wandb visual logging
-- Context window: Increased to 16 frames
-- AR curriculum additive: Modified overall context window to increase when AR curriculum increases to prevent AR "consuming" GT input frames
-- Memory: Turned on checkpointing and changed semantic loss to be calculated in batches
-
-Results:
-- continuously collapsing to unique_codes == 1
-
-**v4.3.3**
-- Codebook collapse: introduced codebook regularization
-- Normalized codebook in semantic loss calc
-
-**v4.3.5**
-- Entropy Fix: Corrected entropy calculation to average over spatial dimensions (`dim=[0,2,3]`), penalizing global codebook collapse instead of local per-pixel certainty (blur).
-- Increased `ENTROPY_WEIGHT` to 0.1.
-- Stability: Zero-initialized FiLM action modulation to prevent initial gradient shocks.
