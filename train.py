@@ -51,28 +51,39 @@ NEIGHBOR_KERNEL = 3
 NEIGHBOR_EXACT_MIX = 0.1 # 10% strict exact-pixel loss, 90% neighbor tolerant
 
 # --- CURRICULUM ---
-CURRICULUM_SEQ_LEN = False
-BASE_SEQ_LEN = 1       
-MAX_SEQ_LEN = 50       
-SEQ_LEN_INCREASE_STEPS = 5000  
+CURRICULUM_SEQ_LEN = False      # Keep disabled (GPU memory risk)
+BASE_SEQ_LEN = 16               # Increase context from 1 to 16
+MAX_SEQ_LEN = 50                # Keep same
+SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
 CURRICULUM_AR = True
-AR_START_STEP = 0      
-AR_RAMP_STEPS = 30000    
-AR_ROLLOUT_MAX = 49       
+AR_START_STEP = 0
+AR_RAMP_STEPS = 20000           # CHANGE: Slower ramp (was 30000)
+AR_ROLLOUT_MAX = 24             # CHANGE: Start conservative (was 49)       
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.5-semantic-vis"
-MODEL_OUT_PREFIX = "ochre-v4.5"
+RUN_NAME = "v4.4-epoch0"
+MODEL_OUT_PREFIX = "ochre-v4.4"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 500 # Log visual reconstruction every N steps
 REPORT_SPIKES = True
-SPIKE_LOSS = 15.0 
+SPIKE_LOSS = 15.0
 SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
+
+# --- SCHEDULED SAMPLING ---
+ENABLE_SCHEDULED_SAMPLING = True
+SS_K_STEEPNESS = 6000.0              # Controls decay rate
+SS_MIDPOINT_STEP = 15000             # Step where teacher_prob = 0.5
+SS_MIN_TEACHER_PROB = 0.05           # Never fully remove teacher forcing
+
+def get_sampling_probability(step, k=SS_K_STEEPNESS, s=SS_MIDPOINT_STEP):
+    """Returns probability of using teacher forcing (inverse sigmoid)"""
+    prob = k / (k + np.exp((step - s) / k))
+    return max(SS_MIN_TEACHER_PROB, min(0.95, prob))
 
 # ==========================================
 # LOSS & HELPER FUNCTIONS
@@ -316,7 +327,6 @@ for epoch in range(start_epoch, EPOCHS + 1):
         Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
         B, K, H, W = Z_seq.shape
         step_losses = []
-        logits_last = None
 
         # LR Warmup
         if global_step <= WARMUP_STEPS:
@@ -324,35 +334,55 @@ for epoch in range(start_epoch, EPOCHS + 1):
             for pg in optimizer.param_groups: pg['lr'] = new_lr
 
         optimizer.zero_grad()
-        
+
         # Embeddings & FiLM
         X_seq = model.compute_embeddings(Z_seq)
         Gammas_seq, Betas_seq = model.compute_film(A_seq)
         h_state = model.init_state(B, device=DEVICE)
-        
+
+        # Scheduled sampling setup
+        if ENABLE_SCHEDULED_SAMPLING:
+            teacher_force_prob = get_sampling_probability(global_step)
+        else:
+            teacher_force_prob = 1.0  # Fallback to original behavior
+
+        teacher_loss_steps = []
+        ar_loss_steps = []
+        logits_last = None
+
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             ar_cutoff = K - ar_len
-            
+
             for t in range(K):
-                # Autoregressive Switch
-                if t >= ar_cutoff:
-                    # In training, we use hard argmax or gumbel. 
-                    # Using argmax here for simplicity in 'Stateful' simulation
-                    z_in = logits_last.argmax(dim=1) 
-                    x_in = None 
-                else:
-                    z_in = torch.tensor(0, device=DEVICE)
+                # Determine if this step uses teacher forcing
+                if t < ar_cutoff:
+                    # Always use GT for context portion
+                    use_teacher = True
                     x_in = X_seq[:, t]
+                else:
+                    # Scheduled sampling for AR portion
+                    use_teacher = (torch.rand(1).item() < teacher_force_prob) if ENABLE_SCHEDULED_SAMPLING else False
+
+                    if use_teacher:
+                        x_in = X_seq[:, t]
+                    else:
+                        # Use previous prediction
+                        if logits_last is not None:
+                            z_pred = logits_last.argmax(dim=1)
+                            x_in = model._embed_tokens(z_pred)
+                        else:
+                            # Fallback to GT for first AR step
+                            x_in = X_seq[:, t]
 
                 # Step
                 g_t = Gammas_seq[:, :, t]
                 b_t = Betas_seq[:, :, t]
-                
+
                 if USE_CHECKPOINTING:
-                    logits_t, h_state = checkpoint(model.step, z_in, torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
+                    logits_t, h_state = checkpoint(model.step, torch.tensor(0, device=DEVICE), torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
                 else:
-                    logits_t, h_state = model.step(z_in, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-                
+                    logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+
                 logits_last = logits_t
                 
                 # --- LOSS CALCULATION ---
@@ -372,6 +402,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture)
                 step_losses.append(loss_step)
 
+                # Track teacher vs AR loss separately
+                if use_teacher:
+                    teacher_loss_steps.append(loss_step)
+                else:
+                    ar_loss_steps.append(loss_step)
+
             loss = torch.stack(step_losses).mean()
 
         scaler.scale(loss).backward()
@@ -389,6 +425,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
         
         # Periodic Logs
         if global_step % LOG_STEPS == 0:
+            # Calculate AR loss gap
+            if len(teacher_loss_steps) > 0 and len(ar_loss_steps) > 0:
+                teacher_loss_avg = torch.stack(teacher_loss_steps).mean().item()
+                ar_loss_avg = torch.stack(ar_loss_steps).mean().item()
+                ar_loss_gap = ar_loss_avg - teacher_loss_avg
+            else:
+                teacher_loss_avg = 0.0
+                ar_loss_avg = 0.0
+                ar_loss_gap = 0.0
+
             # Calculate Entropy (Uncertainty)
             with torch.no_grad():
                 probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
@@ -396,11 +442,45 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 confidence = probs.max(dim=1)[0].mean()
                 unique_codes = logits_last.argmax(dim=1).unique().numel()
 
+                # Action responsiveness diagnostics
+                gamma_magnitude = Gammas_seq.abs().mean().item()
+                beta_magnitude = Betas_seq.abs().mean().item()
+
+                # Action perturbation test (every 100 steps to save compute)
+                if global_step % 100 == 0:
+                    # Compare prediction with vs without actions
+                    A_seq_zero = torch.zeros_like(A_seq)
+                    Gammas_zero, Betas_zero = model.compute_film(A_seq_zero)
+
+                    # Re-run last timestep with zero actions
+                    logits_zero, _ = model.step(None, None, h_state, x_t=x_in,
+                                               gammas_t=Gammas_zero[:, :, -1],
+                                               betas_t=Betas_zero[:, :, -1])
+
+                    # Measure sensitivity
+                    action_sensitivity = (logits_last - logits_zero).abs().mean().item()
+                else:
+                    action_sensitivity = 0.0
+
             if wandb:
                 wandb.log({
+                    # Existing metrics
                     "train/loss": loss.item(),
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
+
+                    # New scheduled sampling metrics
+                    "curriculum/teacher_force_prob": teacher_force_prob,
+                    "curriculum/ar_loss_gap": ar_loss_gap,
+                    "curriculum/teacher_loss": teacher_loss_avg,
+                    "curriculum/ar_loss": ar_loss_avg,
+
+                    # Action diagnostics
+                    "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
+                    "action_diagnostics/film_beta_magnitude": beta_magnitude,
+                    "action_diagnostics/sensitivity": action_sensitivity,
+
+                    # Existing diagnostics
                     "diagnostics/entropy": entropy.item(),
                     "diagnostics/confidence": confidence.item(),
                     "diagnostics/unique_codes": unique_codes,

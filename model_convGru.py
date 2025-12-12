@@ -131,7 +131,11 @@ class WorldModelConvFiLM(nn.Module):
         self.use_checkpointing = use_checkpointing
 
     def _embed_tokens(self, Z):
-        # Z: (B,H,W) long
+        """
+        Public wrapper for token embedding (needed for scheduled sampling).
+        Z: (B,H,W) long
+        Returns: (B,C,H,W)
+        """
         x = self.embed(Z)              # (B,H,W,E)
         x = x.permute(0, 3, 1, 2)      # (B,E,H,W)
         x = self.in_proj(x)            # (B,C,H,W)
