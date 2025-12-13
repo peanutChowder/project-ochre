@@ -206,3 +206,15 @@ Results:
 **v4.4.1**
 - Fixed CUDA assertion error due to bug causing world model to initialize `codebook_size=embedding_dim=384` instead of `codebook_size=1024`
 - Scheduled Sampling Formula Fix: Corrected inverse sigmoid to use `1/(1+exp(...))` instead of `k/(k+exp(...))` for proper decay curve
+
+Results, 40k steps:
+- with `--greedy` flag
+  - Maintains general shape and colors of biome - e.g. desert scenes are blurry sand land, looking up away from land temporarily and back still maintains land shape
+  - Tracks camera movement fairly well
+  - Small localized shaky changes throughout terrain without movement input - e.g. little bumps forming in a flat grassland and disappearing
+  - Still lacks most biome terrain details - e.g. 3D hills, block shapes, trees, cacti... etc. Only exception is water - looking left and right in a grass biome can eventually lead to small blue spots that eventually evolve into shapes of lakes.
+  - Visual quality is too blurry to discern if movement has an impact
+- with `--temperature 0.1`
+  - Performs similarly to `--greedy` flag
+- with default flags (only checkpoints and context provided)
+  - Entire world always has constant shifting, has less blur and more intense visuals but land/sky border dissolves. In grassy biomes brown dirt/tree textures phase in and out, even without any input
