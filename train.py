@@ -30,8 +30,8 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- PATHS (UPDATE THESE) ---
-DATA_DIR = "/kaggle/input/minerl-64x64-vqvae-latents-wasd-pitch-yaw"
-VQVAE_PATH = "/kaggle/working/vqvae.pt" # Points to the checkpoint saved by your VQVAE script
+DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
+VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt" 
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
@@ -63,8 +63,8 @@ AR_ROLLOUT_MAX = 24             # CHANGE: Start conservative (was 49)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.4-epoch0"
-MODEL_OUT_PREFIX = "ochre-v4.4"
+RUN_NAME = "v4.4.1-epoch0"
+MODEL_OUT_PREFIX = "ochre-v4.4.1"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -82,7 +82,7 @@ SS_MIN_TEACHER_PROB = 0.05           # Never fully remove teacher forcing
 
 def get_sampling_probability(step, k=SS_K_STEEPNESS, s=SS_MIDPOINT_STEP):
     """Returns probability of using teacher forcing (inverse sigmoid)"""
-    prob = k / (k + np.exp((step - s) / k))
+    prob = 1.0 / (1.0 + np.exp((step - s) / k))
     return max(SS_MIN_TEACHER_PROB, min(0.95, prob))
 
 # ==========================================
@@ -256,14 +256,26 @@ vqvae_model.eval()
 vqvae_model.requires_grad_(False)
 print("VQ-VAE Loaded.")
 
-# B. Initialize World Model
-model = WorldModelConvFiLM(action_dim=5, H=18, W=32, use_checkpointing=USE_CHECKPOINTING).to(DEVICE)
+# B. Extract codebook info from VQ-VAE
+# VQ-VAE stores embedding as (embedding_dim, num_embeddings), but SemanticCodebookLoss expects (num_embeddings, embedding_dim)
+codebook_raw = vqvae_model.vq_vae.embedding.clone().detach()  # (D, K)
+codebook = codebook_raw.t()  # Transpose to (K, D)
+codebook_size = codebook.shape[0]  # Now correctly extracts num_embeddings
+print(f"VQ-VAE codebook shape (after transpose): {codebook.shape}, size: {codebook_size}")
+
+# C. Initialize World Model with correct codebook size
+model = WorldModelConvFiLM(
+    codebook_size=codebook_size,
+    action_dim=5,
+    H=18,
+    W=32,
+    use_checkpointing=USE_CHECKPOINTING,
+    zero_init_head=False  # Disable zero-init to prevent mode collapse at cold start
+).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 
-# C. Setup Semantic Loss with loaded codebook
-# The codebook tensor is typically: vqvae_model.vq_vae.embedding
-codebook = vqvae_model.vq_vae.embedding.clone().detach()
+# D. Setup Semantic Loss with loaded codebook
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
 print(f"Semantic Loss Initialized with codebook shape {codebook.shape}")
 

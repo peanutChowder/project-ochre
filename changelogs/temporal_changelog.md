@@ -199,3 +199,10 @@ train.py
 
 model_convGru.py
 - Public Embedding Method: Added _embed_tokens() helper (lines 133-142) to support scheduled sampling by enabling re-embedding of predicted tokens during autoregressive rollout
+
+Results:
+- `unique_codes` collapses to 0 by step 70. Does not change at all.
+
+**v4.4.1**
+- Fixed CUDA assertion error due to bug causing world model to initialize `codebook_size=embedding_dim=384` instead of `codebook_size=1024`
+- Scheduled Sampling Formula Fix: Corrected inverse sigmoid to use `1/(1+exp(...))` instead of `k/(k+exp(...))` for proper decay curve
