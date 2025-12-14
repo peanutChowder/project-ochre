@@ -68,8 +68,8 @@ AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 me
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.5-epoch0"
-MODEL_OUT_PREFIX = "ochre-v4.5"
+RUN_NAME = "v4.5.2-epoch0"
+MODEL_OUT_PREFIX = "ochre-v4.5.2"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -183,12 +183,16 @@ def temporal_consistency_loss(logits_t, logits_prev):
     Reduces shaky artifacts when no action is applied.
 
     logits_t: current timestep logits (B, C, H, W)
-    logits_prev: previous timestep logits (B, C, H, W), detached
+    logits_prev: previous timestep logits (B, C, H, W)
     """
     if logits_prev is None:
         return torch.tensor(0.0, device=logits_t.device)
+
+    # v4.5.2: Add safety guard to prevent gradient leakage through logits_prev
+    with torch.no_grad():
+        probs_prev = F.softmax(logits_prev, dim=1)
+
     probs_t = F.softmax(logits_t, dim=1)
-    probs_prev = F.softmax(logits_prev, dim=1)
     # KL divergence: sum over classes, mean over batch and spatial
     kl = F.kl_div(
         torch.log(probs_t + 1e-9),
@@ -214,8 +218,8 @@ def log_images_to_wandb(vqvae, Z_target, logits, global_step):
         pred_indices = logits.argmax(dim=1)  # (B, H, W)
 
         # Decode - VQ-VAE decoder outputs in [0, 1] range (sigmoid activation)
-        gt_rgb = vqvae.decode_code(gt_indices)  # (B, 3, 128, 72)
-        pred_rgb = vqvae.decode_code(pred_indices)  # (B, 3, 128, 72)
+        gt_rgb = vqvae.decode_code(gt_indices)  # (B, 3, IMAGE_H, IMAGE_W)
+        pred_rgb = vqvae.decode_code(pred_indices)  # (B, 3, IMAGE_H, IMAGE_W)
 
         # Visualize first 4 samples
         n = min(4, gt_rgb.size(0))
@@ -297,32 +301,33 @@ if not os.path.exists(VQVAE_PATH):
 vqvae_ckpt = torch.load(VQVAE_PATH, map_location=DEVICE)
 
 # Instantiate VQVAE using the config found in the checkpoint or defaults
-# We assume the user's provided VQVAE class structure matches the checkpoint
 conf = vqvae_ckpt.get("config", {})
 vqvae_model = VQVAE(
-    embedding_dim=conf.get("embedding_dim", 256), # Default to standard if missing
+    embedding_dim=conf.get("embedding_dim", 384),
     num_embeddings=conf.get("codebook_size", 1024)
 ).to(DEVICE)
 
-# Load state dict (handle potential key mismatches)
-state_dict = vqvae_ckpt
-if "model_state" in vqvae_ckpt: state_dict = vqvae_ckpt["model_state"]
-elif "quantizer" in vqvae_ckpt: # Legacy check
-    # If the user saved separate dicts, we might need to reconstruct, but
-    # standard VQVAE script saves the whole model in root or model_state
-    pass 
+# v4.5.2: Fix VQ-VAE loading - checkpoint has separate encoder/quantizer/decoder dicts
+if "encoder" in vqvae_ckpt and "decoder" in vqvae_ckpt and "quantizer" in vqvae_ckpt:
+    # Load component-wise (v2.1.6 format)
+    vqvae_model.encoder.load_state_dict(vqvae_ckpt["encoder"])
+    vqvae_model.decoder.load_state_dict(vqvae_ckpt["decoder"])
+    # Load quantizer state (embedding, cluster_size, embedding_avg)
+    for key, value in vqvae_ckpt["quantizer"].items():
+        if hasattr(vqvae_model.vq_vae, key):
+            getattr(vqvae_model.vq_vae, key).copy_(value)
+    print("✅ VQ-VAE loaded from component-wise checkpoint")
+elif "model_state" in vqvae_ckpt:
+    # Unified state dict format
+    vqvae_model.load_state_dict(vqvae_ckpt["model_state"], strict=False)
+    print("✅ VQ-VAE loaded from model_state")
+else:
+    # Try loading directly (legacy fallback)
+    vqvae_model.load_state_dict(vqvae_ckpt, strict=False)
+    print("⚠️  VQ-VAE loaded from root dict (legacy)")
 
-# Clean up keys if necessary (e.g. remove 'module.' prefix)
-# Then load
-try:
-    vqvae_model.load_state_dict(state_dict, strict=False)
-except Exception as e:
-    print(f"WARNING: strict loading failed ({e}). Attempting non-strict...")
-    # This is fine for us as long as decoder and quantizer.embedding load
-    
 vqvae_model.eval()
 vqvae_model.requires_grad_(False)
-print("VQ-VAE Loaded.")
 
 # B. Extract codebook info from VQ-VAE
 # VQ-VAE stores embedding as (embedding_dim, num_embeddings), but SemanticCodebookLoss expects (num_embeddings, embedding_dim)
@@ -398,7 +403,7 @@ def compute_curriculum_params(step):
 prev_seq_len, prev_ar_len = compute_curriculum_params(global_step)
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                    num_workers=4, pin_memory=True, persistent_workers=False)
+                    num_workers=4, pin_memory=True, persistent_workers=True)  # v4.5.2: Keep workers alive
 loader_iter = iter(loader)
 print(f"Initial Curriculum: seq_len={prev_seq_len}, ar_len={prev_ar_len}")
 
@@ -420,7 +425,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 print("WARNING: Empty dataset, breaking epoch")
                 break
             loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4, pin_memory=True, persistent_workers=False)
+                              num_workers=4, pin_memory=True, persistent_workers=True)  # v4.5.2: Keep workers alive
             loader_iter = iter(loader)
 
         # Get next batch
@@ -518,8 +523,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                             loss_entropy + loss_sharp + loss_temporal
                 step_losses.append(loss_step)
 
-                # Update previous logits for next step (detach to prevent gradient accumulation)
-                logits_prev = logits_t.detach()
+                # Update previous logits for next step
+                # v4.5.2: Removed detach() - temporal_consistency_loss handles gradient blocking
+                logits_prev = logits_t
 
                 # Track teacher vs AR loss separately
                 if use_teacher:
@@ -584,8 +590,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 gamma_magnitude = Gammas_seq.abs().mean().item()
                 beta_magnitude = Betas_seq.abs().mean().item()
 
-                # Action perturbation test (every 100 steps to save compute)
-                if global_step % 100 == 0:
+                # Action perturbation test (v4.5.2: reduced from every 100 to every 500 steps)
+                if global_step % 500 == 0:
                     # Compare prediction with vs without actions
                     A_seq_zero = torch.zeros_like(A_seq)
                     Gammas_zero, Betas_zero = model.compute_film(A_seq_zero)
@@ -598,7 +604,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     # Measure sensitivity
                     action_sensitivity = (logits_last - logits_zero).abs().mean().item()
                 else:
-                    action_sensitivity = 0.0
+                    # Use FiLM magnitude as instant proxy
+                    action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
             if wandb:
                 wandb.log({

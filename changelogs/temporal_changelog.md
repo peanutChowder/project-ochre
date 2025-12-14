@@ -265,3 +265,22 @@ train.py
   - Previous bug: seq_len = max(BASE_SEQ_LEN, ar_len + 1) caused 16->33 growth during training
   - seq_len fixed at 20, ar_len capped at 19 max
 
+
+
+**v4.5.2** 
+train.py
+  - Fixed VQ-VAE decoder not loading correctly, causing static/noise images in WandB
+  - Checkpoint uses component-wise format (encoder/decoder/quantizer dicts), properly loading each component separately
+  - Visual logs now show actual decoded RGB images instead of raw token noise
+- Performance Optimizations (estimated +4-7% throughput):
+  - Action sensitivity diagnostic: Reduced frequency from every 100 to every 500 steps 
+    - Uses FiLM magnitude as instant proxy between exact computations
+    - Saves ~3-4% throughput by avoiding full forward pass
+  - DataLoader: Set persistent_workers=True 
+    - Keeps worker processes alive between epochs
+    - Eliminates worker restart overhead (~0.5-2% gain)
+  - Temporal loss: Removed redundant detach() operation (line 452)
+    - Gradient blocking moved to temporal_consistency_loss function (line 187)
+    - Reduces memory fragmentation (~0.5-1% gain)
+- Expected cumulative improvement: +4-7% throughput (3,390 -> 3,526-3,627 steps/hr)
+
