@@ -248,3 +248,20 @@ Target Improvements:
 - Spatial gradient: Increase (sharper predictions)
 - Visual quality: More committed/sharp details, reduced blurriness
 - Temporal stability: Reduced shaky artifacts without input
+
+Results after 7.7k steps:
+- OOM after 7.7k steps
+- Unique code decrease from v4.4: ~85 -> ~60 
+- Entropy increase from v4.4: ~2.5 -> ~3.5
+- Overall loss decrease from v4.4: ~6 -> ~5
+
+
+**v4.5.1** 
+train.py
+- OOM Fixes: 
+  - BASE_SEQ_LEN: 16 -> 20 (accommodate AR rollout)
+  - AR_ROLLOUT_MAX: 32 -> 18 (fit P100 memory constraints)
+  - Fixed compute_curriculum_params() to lock seq_len at BASE_SEQ_LEN 
+  - Previous bug: seq_len = max(BASE_SEQ_LEN, ar_len + 1) caused 16->33 growth during training
+  - seq_len fixed at 20, ar_len capped at 19 max
+

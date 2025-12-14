@@ -57,14 +57,14 @@ TEMPORAL_WEIGHT = 0.1       # Reduces shaky artifacts
 
 # --- CURRICULUM ---
 CURRICULUM_SEQ_LEN = False      # Keep disabled (GPU memory risk)
-BASE_SEQ_LEN = 16               # Increase context from 1 to 16
+BASE_SEQ_LEN = 20               # v4.5.1 OOM fix: Increased from 16 to accommodate AR rollout
 MAX_SEQ_LEN = 50                # Keep same
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
 CURRICULUM_AR = True
 AR_START_STEP = 0
-AR_RAMP_STEPS = 10000           # v4.5: Faster ramp (was 20000)
-AR_ROLLOUT_MAX = 32             # v4.5: Longer coherence (was 24)       
+AR_RAMP_STEPS = 10000           # v4.5.1: Faster ramp (was 20000)
+AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 memory (seq_len - 2)       
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
@@ -382,12 +382,14 @@ def compute_curriculum_params(step):
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
 
+    # v4.5 OOM fix: Lock seq_len to BASE_SEQ_LEN to prevent memory growth
+    # Previous logic allowed seq_len to grow with ar_len, causing OOM
     current_base = BASE_SEQ_LEN
     if CURRICULUM_SEQ_LEN:
         current_base = min(BASE_SEQ_LEN + (step // SEQ_LEN_INCREASE_STEPS), MAX_SEQ_LEN)
 
-    seq_len = min(max(current_base, ar_len + 1), MAX_SEQ_LEN)
-    ar_len = min(ar_len, seq_len - 1)
+    seq_len = current_base  # Fixed at BASE_SEQ_LEN (16)
+    ar_len = min(ar_len, seq_len - 1)  # Cap ar_len to seq_len - 1
     if ar_len < 0: ar_len = 0
 
     return seq_len, ar_len
