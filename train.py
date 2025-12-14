@@ -44,11 +44,16 @@ USE_CHECKPOINTING = False
 
 # --- DUAL LOSS WEIGHTS ---
 # SEMANTIC: Punishes "wrong color/texture" (Embedding MSE)
-SEMANTIC_WEIGHT = 10.0  
+SEMANTIC_WEIGHT = 3.0   # v4.5: Reduced from 10.0 to prevent averaging/blurry predictions
 # NEIGHBOR: Tolerates "1-pixel spatial shift" (Spatial Cross Entropy)
-NEIGHBOR_WEIGHT = 1.0   
-NEIGHBOR_KERNEL = 3     
-NEIGHBOR_EXACT_MIX = 0.1 # 10% strict exact-pixel loss, 90% neighbor tolerant
+NEIGHBOR_WEIGHT = 2.0   # v4.5: Increased from 1.0 for more spatial precision
+NEIGHBOR_KERNEL = 3
+NEIGHBOR_EXACT_MIX = 0.3 # v4.5: Increased from 0.1 for more exact-pixel pressure
+
+# --- NEW LOSS WEIGHTS (v4.5) ---
+ENTROPY_REG_WEIGHT = 0.1    # Encourages codebook exploration
+SHARPNESS_WEIGHT = 0.3      # Rewards committed predictions
+TEMPORAL_WEIGHT = 0.1       # Reduces shaky artifacts
 
 # --- CURRICULUM ---
 CURRICULUM_SEQ_LEN = False      # Keep disabled (GPU memory risk)
@@ -58,13 +63,13 @@ SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
 CURRICULUM_AR = True
 AR_START_STEP = 0
-AR_RAMP_STEPS = 20000           # CHANGE: Slower ramp (was 30000)
-AR_ROLLOUT_MAX = 24             # CHANGE: Start conservative (was 49)       
+AR_RAMP_STEPS = 10000           # v4.5: Faster ramp (was 20000)
+AR_ROLLOUT_MAX = 32             # v4.5: Longer coherence (was 24)       
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.4.1-epoch0"
-MODEL_OUT_PREFIX = "ochre-v4.4.1"
+RUN_NAME = "v4.5-epoch0"
+MODEL_OUT_PREFIX = "ochre-v4.5"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -76,9 +81,9 @@ EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 
 # --- SCHEDULED SAMPLING ---
 ENABLE_SCHEDULED_SAMPLING = True
-SS_K_STEEPNESS = 6000.0              # Controls decay rate
-SS_MIDPOINT_STEP = 15000             # Step where teacher_prob = 0.5
-SS_MIN_TEACHER_PROB = 0.05           # Never fully remove teacher forcing
+SS_K_STEEPNESS = 4000.0              # v4.5: Faster decay (was 6000)
+SS_MIDPOINT_STEP = 10000             # v4.5: Earlier transition (was 15000)
+SS_MIN_TEACHER_PROB = 0.15           # v4.5: Keep more teacher signal (was 0.05)
 
 def get_sampling_probability(step, k=SS_K_STEEPNESS, s=SS_MIDPOINT_STEP):
     """Returns probability of using teacher forcing (inverse sigmoid)"""
@@ -145,6 +150,53 @@ def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
 
     return mix_exact * loss_exact + (1.0 - mix_exact) * loss_neigh
 
+# --- NEW LOSS FUNCTIONS (v4.5) ---
+
+def entropy_regularization_loss(logits, target_entropy=4.5):
+    """
+    Penalizes overconfident predictions that collapse to few codes.
+    Only applies penalty when entropy is BELOW target.
+
+    logits: (B, C, H, W)
+    target_entropy: desired minimum entropy level
+    """
+    probs = F.softmax(logits, dim=1)
+    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
+    if entropy < target_entropy:
+        return ENTROPY_REG_WEIGHT * (target_entropy - entropy) ** 2
+    return torch.tensor(0.0, device=logits.device)
+
+def sharpness_loss(logits):
+    """
+    Rewards high-confidence, committed predictions.
+    Penalizes hedging/averaging behavior that causes blur.
+
+    logits: (B, C, H, W)
+    """
+    probs = F.softmax(logits, dim=1)
+    max_probs = probs.max(dim=1)[0]  # (B, H, W)
+    return SHARPNESS_WEIGHT * (1.0 - max_probs.mean())
+
+def temporal_consistency_loss(logits_t, logits_prev):
+    """
+    Penalizes rapid prediction changes between consecutive timesteps.
+    Reduces shaky artifacts when no action is applied.
+
+    logits_t: current timestep logits (B, C, H, W)
+    logits_prev: previous timestep logits (B, C, H, W), detached
+    """
+    if logits_prev is None:
+        return torch.tensor(0.0, device=logits_t.device)
+    probs_t = F.softmax(logits_t, dim=1)
+    probs_prev = F.softmax(logits_prev, dim=1)
+    # KL divergence: sum over classes, mean over batch and spatial
+    kl = F.kl_div(
+        torch.log(probs_t + 1e-9),
+        probs_prev,
+        reduction='batchmean'
+    )
+    return TEMPORAL_WEIGHT * kl
+
 def sample_with_temperature(logits, temperature=1.0):
     if temperature < 1e-5: return logits.argmax(dim=-1)
     probs = F.softmax(logits / temperature, dim=-1)
@@ -153,27 +205,43 @@ def sample_with_temperature(logits, temperature=1.0):
 def log_images_to_wandb(vqvae, Z_target, logits, global_step):
     """
     Visualizes Ground Truth vs Prediction.
+    Shows interleaved GT/Pred pairs for easier comparison.
     """
     if wandb is None: return
     with torch.no_grad():
         # Take the last frame of the sequence
-        gt_indices = Z_target[:, -1] 
-        pred_indices = logits.argmax(dim=1) 
-        
-        # Decode
-        gt_rgb = vqvae.decode_code(gt_indices)
-        pred_rgb = vqvae.decode_code(pred_indices)
-        
-        # Visualize first 4
+        gt_indices = Z_target[:, -1]  # (B, H, W)
+        pred_indices = logits.argmax(dim=1)  # (B, H, W)
+
+        # Decode - VQ-VAE decoder outputs in [0, 1] range (sigmoid activation)
+        gt_rgb = vqvae.decode_code(gt_indices)  # (B, 3, 128, 72)
+        pred_rgb = vqvae.decode_code(pred_indices)  # (B, 3, 128, 72)
+
+        # Visualize first 4 samples
         n = min(4, gt_rgb.size(0))
         vis_gt = gt_rgb[:n].detach().cpu()
         vis_pred = pred_rgb[:n].detach().cpu()
-        
-        # Stack: Top=GT, Bottom=Pred
-        grid = make_grid(torch.cat([vis_gt, vis_pred], dim=0), nrow=n, normalize=False)
-        
+
+        # Clamp to [0, 1] range to ensure proper visualization
+        vis_gt = torch.clamp(vis_gt, 0.0, 1.0)
+        vis_pred = torch.clamp(vis_pred, 0.0, 1.0)
+
+        # Interleave GT and Pred for side-by-side comparison
+        # Pattern: [GT0, Pred0, GT1, Pred1, GT2, Pred2, GT3, Pred3]
+        interleaved = []
+        for i in range(n):
+            interleaved.append(vis_gt[i])
+            interleaved.append(vis_pred[i])
+        interleaved_tensor = torch.stack(interleaved, dim=0)
+
+        # Create grid: 2 columns (GT | Pred), n rows (samples)
+        grid = make_grid(interleaved_tensor, nrow=2, normalize=False, value_range=(0, 1), padding=2)
+
+        # Convert from (C, H, W) to (H, W, C) and scale to [0, 255] for wandb
+        grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
         wandb.log({
-            "visuals/reconstruction": wandb.Image(grid, caption="Top: GT | Bottom: Pred")
+            "visuals/reconstruction": wandb.Image(grid_np, caption=f"Left: GT | Right: Pred (Step {global_step})")
         }, step=global_step)
 
 
@@ -387,6 +455,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         teacher_loss_steps = []
         ar_loss_steps = []
         logits_last = None
+        logits_prev = None  # v4.5: Track previous logits for temporal consistency
 
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             ar_cutoff = K - ar_len
@@ -429,16 +498,26 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     logits_t, Z_target[:, t],
                     kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
                 )
-                
+
                 # 2. Semantic Loss (Handle Blur)
                 # Flatten for codebook processing
                 logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
                 target_flat = Z_target[:, t].reshape(-1)
                 loss_texture = semantic_criterion(logits_flat, target_flat)
-                
+
+                # 3. NEW v4.5 Losses
+                loss_entropy = entropy_regularization_loss(logits_t)
+                loss_sharp = sharpness_loss(logits_t)
+                loss_temporal = temporal_consistency_loss(logits_t, logits_prev)
+
                 # Weighted Sum
-                loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture)
+                loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
+                            (SEMANTIC_WEIGHT * loss_texture) + \
+                            loss_entropy + loss_sharp + loss_temporal
                 step_losses.append(loss_step)
+
+                # Update previous logits for next step (detach to prevent gradient accumulation)
+                logits_prev = logits_t.detach()
 
                 # Track teacher vs AR loss separately
                 if use_teacher:
@@ -450,7 +529,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -475,10 +554,29 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             # Calculate Entropy (Uncertainty)
             with torch.no_grad():
-                probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
-                entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
-                confidence = probs.max(dim=1)[0].mean()
-                unique_codes = logits_last.argmax(dim=1).unique().numel()
+                if logits_last is not None:
+                    probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
+                    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
+                    confidence = probs.max(dim=1)[0].mean()
+                    unique_codes = logits_last.argmax(dim=1).unique().numel()
+
+                    # v4.5: NEW Spatial Gradient Magnitude (sharpness proxy)
+                    spatial_grad_x = (logits_last[:, :, :, 1:] - logits_last[:, :, :, :-1]).abs().mean()
+                    spatial_grad_y = (logits_last[:, :, 1:, :] - logits_last[:, :, :-1, :]).abs().mean()
+                    spatial_gradient = (spatial_grad_x + spatial_grad_y) / 2
+
+                    # v4.5: NEW Confidence distribution stats
+                    top1_conf = probs.max(dim=1)[0]
+                    confidence_std = top1_conf.std()
+                    confidence_min = top1_conf.min()
+                else:
+                    # Fallback values for first step
+                    entropy = torch.tensor(0.0)
+                    confidence = torch.tensor(0.0)
+                    unique_codes = 0
+                    spatial_gradient = torch.tensor(0.0)
+                    confidence_std = torch.tensor(0.0)
+                    confidence_min = torch.tensor(0.0)
 
                 # Action responsiveness diagnostics
                 gamma_magnitude = Gammas_seq.abs().mean().item()
@@ -507,6 +605,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
 
+                    # v4.5: NEW loss components
+                    "train/loss_entropy": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else 0,
+                    "train/loss_sharpness": loss_sharp.item(),
+                    "train/loss_temporal": loss_temporal.item() if isinstance(loss_temporal, torch.Tensor) else 0,
+
                     # New scheduled sampling metrics
                     "curriculum/teacher_force_prob": teacher_force_prob,
                     "curriculum/ar_loss_gap": ar_loss_gap,
@@ -522,6 +625,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "diagnostics/entropy": entropy.item(),
                     "diagnostics/confidence": confidence.item(),
                     "diagnostics/unique_codes": unique_codes,
+
+                    # v4.5: NEW diagnostics
+                    "diagnostics/spatial_gradient": spatial_gradient.item(),
+                    "diagnostics/confidence_std": confidence_std.item(),
+                    "diagnostics/confidence_min": confidence_min.item(),
+
                     "train/grad_norm": float(grad_norm),
                     "seq_len": seq_len,
                     "ar_len": ar_len,

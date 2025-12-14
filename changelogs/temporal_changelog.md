@@ -218,3 +218,33 @@ Results, 40k steps:
   - Performs similarly to `--greedy` flag
 - with default flags (only checkpoints and context provided)
   - Entire world always has constant shifting, has less blur and more intense visuals but land/sky border dissolves. In grassy biomes brown dirt/tree textures phase in and out, even without any input
+
+**v4.5**
+train.py
+- Loss Rebalancing: Adjusted weights to prevent model averaging/hedging behavior
+  - SEMANTIC_WEIGHT: 10.0 -> 3.0 (reduce dominance of embedding-space loss)
+  - NEIGHBOR_WEIGHT: 1.0 -> 2.0 (increase spatial precision)
+  - NEIGHBOR_EXACT_MIX: 0.1 -> 0.3 (more exact-pixel pressure)
+- New Loss Functions:
+  - `entropy_regularization_loss()`: Penalizes overconfident predictions below target entropy (4.5), encourages codebook exploration
+  - `sharpness_loss()`: Rewards high-confidence committed predictions, discourages blurry averaging
+  - `temporal_consistency_loss()`: Penalizes rapid prediction changes between timesteps via KL divergence, reduces shaky artifacts
+- Curriculum Acceleration:
+  - AR_RAMP_STEPS: 20k -> 10k steps (Faster AR ramp)
+  - AR_ROLLOUT_MAX: 24 -> 32 steps 
+  - SS_K_STEEPNESS: 6000 -> 4000 (faster scheduled sampling decay)
+  - SS_MIDPOINT_STEP: 15k -> 10k (earlier teacher forcing transition)
+  - SS_MIN_TEACHER_PROB: 0.05 -> 0.15 (maintain more teacher signal to reduce exposure bias)
+- Gradient Stability: Tighter gradient clipping (1.0 -> 0.5) to address sporadic spikes
+- Diagnostics:
+  - `spatial_gradient`: Spatial gradient magnitude as sharpness proxy
+  - `confidence_std`, `confidence_min`: Confidence distribution statistics
+  - Individual loss component tracking: `loss_entropy`, `loss_sharpness`, `loss_temporal`
+- Wandb visualization fix: Fixed WandB image logging to properly convert [0,1] float tensors to uint8 numpy arrays
+
+Target Improvements:
+- Entropy: Increase from 2.5-3.0 toward 4.0-4.5 (more exploration)
+- AR loss gap: Stabilize or decrease from 2.0 (reduce exposure bias)
+- Spatial gradient: Increase (sharper predictions)
+- Visual quality: More committed/sharp details, reduced blurriness
+- Temporal stability: Reduced shaky artifacts without input
