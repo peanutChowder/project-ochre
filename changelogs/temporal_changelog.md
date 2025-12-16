@@ -284,3 +284,16 @@ train.py
     - Reduces memory fragmentation (~0.5-1% gain)
 - Expected cumulative improvement: +4-7% throughput (3,390 -> 3,526-3,627 steps/hr)
 
+Results, step 68k:
+- Visual Quality (`--greedy`): Highly blurry outputs, vague terrain shapes but no definitive features or recognizable objects. Some semblance of biomes (possible forests) but not a significant step up from previous versions despite metric improvements.
+- Issues:
+  - `unique_codes`: Dropped 35-40% (95-100 → 60-75) - severe mode collapse
+  - `loss_texture`: Collapsed to near-zero (~0.05 vs v4.4's ~0.7-0.9) - extreme confidence in limited vocabulary
+  - `sensitivity`: Dropped 75-90% (0.5 → 0.05-0.2) - model barely responding to action inputs despite stronger FiLM magnitudes
+  - `grad_norm`: Increased instability (spikes to 10 vs v4.4's stable ~1-2) - optimization struggling with multiple loss objectives
+- Positive Changes:
+  - Curriculum losses improved: `teacher_loss` (8→2-3), `ar_loss` (10→3-4), `ar_loss_gap` (1→0.5-1)
+  - `spatial_gradient` increased (0.15→0.22-0.25) but doesn't translate to visual quality
+- Diagnosis: Model solving losses by overfitting to narrow solution space - high confidence on few codes rather than diverse exploration. Visual blur + low sensitivity suggest losses not aligned with perceptual quality or action conditioning goals.
+- Potential fix?: Increase entropy regularization weight/target to force broader codebook usage, potentially rebalance loss weights to prioritize diversity over confidence.
+
