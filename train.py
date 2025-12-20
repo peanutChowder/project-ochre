@@ -69,8 +69,8 @@ AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 me
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.1-step38k"
-MODEL_OUT_PREFIX = "ochre-v4.6.1"
+RUN_NAME = "v4.6.2-step38k"
+MODEL_OUT_PREFIX = "ochre-v4.6.2"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -432,6 +432,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
         teacher_loss_steps = []
         ar_loss_steps = []
+        lpips_loss_steps = []  # v4.6.2: Track LPIPS losses across sequence
         logits_last = None
         logits_prev = None  # v4.5: Track previous logits for temporal consistency
 
@@ -482,24 +483,40 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 target_flat = Z_target[:, t].reshape(-1)
                 loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
 
-                # 3. LPIPS Perceptual Loss (v4.6.1: Fixed gradient flow)
+                # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
                 if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
-                    # v4.6.1 FIX: Only disable grad for argmax, not entire computation
-                    with torch.no_grad():
-                        pred_tokens = logits_t.argmax(dim=1)  # (B, H, W)
-                        target_tokens = Z_target[:, t]  # (B, H, W)
+                    # v4.6.2 FIX: Use Gumbel-Softmax for differentiable token selection
+                    # Reuse same tau as semantic loss for consistency
+                    tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
 
-                    # Decode with gradients enabled (for LPIPS backprop)
-                    pred_rgb = vqvae_model.decode_code(pred_tokens)  # (B, 3, 128, 72)
-                    target_rgb = vqvae_model.decode_code(target_tokens)  # (B, 3, 128, 72)
+                    # Get soft token probabilities (differentiable)
+                    logits_flat_lpips = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))  # (B*H*W, C)
+                    probs = F.gumbel_softmax(logits_flat_lpips, tau=tau, hard=False, dim=-1)  # (B*H*W, C)
+                    probs = probs.reshape(logits_t.size(0), logits_t.size(2), logits_t.size(3), -1)  # (B, H, W, C)
+
+                    # Soft embedding lookup: weighted sum over VQ-VAE codebook
+                    # codebook is already transposed (K, D) from line 295
+                    soft_embeddings = torch.matmul(probs, codebook)  # (B, H, W, D)
+                    soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, D, H, W)
+
+                    # Decode soft embeddings directly (gradients flow!)
+                    pred_rgb = vqvae_model.decoder(soft_embeddings)  # (B, 3, 128, 72)
+
+                    # Target (no gradients needed)
+                    with torch.no_grad():
+                        target_tokens = Z_target[:, t]  # (B, H, W)
+                        target_rgb = vqvae_model.decode_code(target_tokens)  # (B, 3, 128, 72)
 
                     # LPIPS expects inputs in [-1, 1] range
                     pred_rgb_norm = pred_rgb * 2.0 - 1.0
                     target_rgb_norm = target_rgb * 2.0 - 1.0
 
-                    # Compute perceptual loss (gradients flow through pred_rgb)
+                    # Compute perceptual loss (gradients now flow through entire chain!)
                     loss_lpips = lpips_criterion(pred_rgb_norm, target_rgb_norm).mean()
+
+                    # Track LPIPS for averaging
+                    lpips_loss_steps.append(loss_lpips)
 
                 # Weighted Sum (v4.6.0: Simplified - only 3 components)
                 loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
@@ -539,6 +556,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 teacher_loss_avg = 0.0
                 ar_loss_avg = 0.0
                 ar_loss_gap = 0.0
+
+            # Calculate LPIPS average (v4.6.2)
+            if len(lpips_loss_steps) > 0:
+                lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
+            else:
+                lpips_loss_avg = 0.0
 
             # Calculate Entropy (Uncertainty)
             with torch.no_grad():
@@ -594,8 +617,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
 
-                    # v4.6.0: LPIPS perceptual loss
-                    "train/loss_lpips": loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else 0,
+                    # v4.6.2: LPIPS perceptual loss (averaged across sequence)
+                    "train/loss_lpips": lpips_loss_avg,
 
                     # v4.6.0: Gumbel-Softmax tau annealing
                     "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),

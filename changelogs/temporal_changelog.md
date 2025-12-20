@@ -408,8 +408,11 @@ train.py
   - v4.6.0 bug: `with torch.no_grad():` wrapped entire LPIPS computation block (lines 489-499)
 - Increased batch size to 28, since v4.6.0 stayed at ~50% gpu memory usage
 
-Expected Outcomes @ ~60k steps:
-- loss_lpips should be fixed from 0.0 to measurable values (0.1-0.5 range)
-- Sharpness beyond v4.6.0: More texture details in desert/forest scenes
-- unique_codes may increase slightly if LPIPS encourages diversity
-
+**v4.6.2**
+train.py
+- LPIPS Gradient Flow Fix (ATTEMPT 2 - COMPLETE): Use Gumbel-Softmax for differentiable token selection
+  - Replaced argmax with soft Gumbel-Softmax probabilities (`hard=False`)
+  - Soft embedding lookup via weighted sum over VQ-VAE codebook
+  - Decode soft embeddings directly through VQ-VAE decoder (bypassing quantizer)
+  - Gradients now flow: `loss_lpips → pred_rgb → decoder → soft_embeddings → probs → logits_t`
+  - Uses same tau annealing schedule as semantic loss for consistency
