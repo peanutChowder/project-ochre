@@ -297,3 +297,107 @@ Results, step 68k:
 - Diagnosis: Model solving losses by overfitting to narrow solution space - high confidence on few codes rather than diverse exploration. Visual blur + low sensitivity suggest losses not aligned with perceptual quality or action conditioning goals.
 - Potential fix?: Increase entropy regularization weight/target to force broader codebook usage, potentially rebalance loss weights to prioritize diversity over confidence.
 
+
+**v4.6.0**
+train.py
+- Loss Rebalancing: Reverted to v4.4.1 baseline to remove conflicting gradients
+  - SEMANTIC_WEIGHT: 3.0 → 10.0 (back to v4.4.1 stable baseline)
+  - NEIGHBOR_WEIGHT: 2.0 → 1.0 (back to v4.4.1)
+  - NEIGHBOR_EXACT_MIX: 0.3 → 0.1 (back to v4.4.1)
+- Removed v4.5 Loss Functions: Deleted entropy_regularization_loss(), sharpness_loss(), temporal_consistency_loss()
+  - These created conflicting gradients in v4.5/v4.5.2 causing mode collapse
+  - Sharpness (↑ confidence) vs Entropy (↑ diversity) = opposing forces
+  - Temporal (↓ changes) vs Sensitivity (↑ responsiveness) = contradiction
+- New Loss: Gumbel-Softmax in SemanticCodebookLoss
+  - Forces discrete token selection during forward pass (hard=True)
+  - Prevents soft averaging that causes blur
+  - Annealing schedule: tau 1.0 → 0.1 over 20k steps (GUMBEL_TAU_STEPS)
+  - Maintains differentiability through Gumbel gradient estimator
+- New Loss: LPIPS Perceptual Loss (LPIPS_WEIGHT = 0.3)
+  - Learns from VQ-VAE v2.1.5 success: LPIPS fixed identical blur/averaging problem
+  - Decodes predicted and target tokens to RGB, computes perceptual distance
+  - Applied every 5 timesteps for efficiency (LPIPS_FREQ = 5)
+  - VQ-VAE decoder already loaded for visualization → no additional memory cost
+  - LPIPS expects inputs in [-1, 1] range (pred_rgb * 2.0 - 1.0)
+- Simplified Loss Calculation: Only 3 components (was 5 in v4.5.2)
+  - loss_step = (NEIGHBOR_WEIGHT * loss_space) + (SEMANTIC_WEIGHT * loss_texture) + (LPIPS_WEIGHT * loss_lpips)
+- Updated Logging:
+  - Added: train/loss_lpips (track perceptual loss)
+  - Added: train/gumbel_tau (monitor annealing progress)
+  - Removed: v4.5 loss component logs (loss_entropy, loss_sharpness, loss_temporal)
+
+Hypothesis:
+- Gumbel-Softmax forces discrete commitments → prevents averaging
+- LPIPS provides perceptual sharpness signal → what "sharp" looks like in pixel space
+- Complementary mechanisms: discrete selection + perceptual feedback = sharp predictions
+- Based on VQ-VAE empirical proof that LPIPS fixes MSE-based blur
+
+Expected Outcomes:
+- Conservative: Recover to v4.4.1 levels (unique_codes ~90-110, stable but still blurry)
+- Optimistic: Significantly exceed v4.4.1, approaching VQ-VAE sharpness levels
+- Visual: Sharp recognizable features (trees, blocks, textures)
+- Metrics: loss_lpips should decrease, gumbel_tau should anneal 1.0→0.1
+
+Critical Context:
+- **No world model version has achieved true sharpness yet** (v4.4.1 was blurry blob)
+- VQ-VAE produces sharp GT images → proves capability exists
+- World model uses MSE semantic loss → same failure mode as early VQ-VAE
+- VQ-VAE v2.1.5 changelog: "Grey averaging fixed! Sharpness fixed!" with LPIPS
+- This approach targets root cause: token-space MSE loss insufficient for sharpness
+
+Results, step 38k:
+- **Metrics (WandB Charts)**:
+  - `unique_codes`: 60-75 range throughout training (stable, no collapse vs v4.5.2, but lower than v4.4.1's 95-100)
+  - `entropy`: ~1.5-2.0 stable (lower than v4.4.1's 2.5-3.0, suggests more confident predictions)
+  - `confidence`: ~0.6-0.65 (healthy range, not overconfident)
+  - `spatial_gradient`: Increased from 0.05→0.32 (sharpness proxy improving)
+  - `loss_lpips`: Flat at ~0.0 throughout training (LPIPS not contributing signal - likely issue)
+  - `gumbel_tau`: Clean annealing from 1.0→0.1 over 20k steps as designed
+  - `loss_texture`: 0.04-0.08 range (very low, similar confidence issue as v4.5.2)
+  - `loss_space`: Decreased 5.0→0.2 (spatial loss improving)
+  - `train/loss`: Overall loss decreased 6.0→0.8 (smooth learning curve)
+  - `grad_norm`: Stable 0.5-1.5 (no spikes, healthy gradients vs v4.5.2's instability)
+  - `teacher_force_prob`: Clean decay 0.95→0.15 (scheduled sampling working)
+  - `ar_loss_gap`: 0.2-0.6 range (exposure bias well controlled)
+  - `action_diagnostics/sensitivity`: 0.5-0.6 stable (MUCH better than v4.5.2's 0.05-0.2)
+  - `film_gamma_magnitude`: 0.85-0.95 (strong FiLM signal)
+  - `film_beta_magnitude`: 0.16-0.22 (healthy modulation)
+
+- **Visual Quality (live_inference.py --greedy @ 38k steps)**:
+  - **Best visual acuity achieved so far** in any world model version
+  - Grassland scenes: Beginning to show **texture details** - dirt visible underneath green top of grass blocks (first time seeing block-level detail!)
+  - Desert scenes: Still blurry mess, no texture detail
+  - Water scenes: Maintains coherent blue regions, better than v4.4.1
+  - Forest/dense biomes: Still struggle with detail, but trees more distinguishable than v4.4.1
+  - Overall: Still blurry, but **incremental improvement** - some scenes show micro-textures
+  - Camera tracking: Maintains orientation well, stable over time
+  - Temporal stability: Reduced shaky artifacts vs v4.4.1
+
+- **WandB Visual Logging (GT vs Pred comparisons)**:
+  - Step 38k samples show predictions maintaining general color/structure
+  - GT images remain sharp (VQ-VAE working correctly)
+  - Pred images show some texture attempting to form, but still averaged
+  - Better than v4.4.1 samples (less blob-like), worse than GT (still blurry)
+
+- **Key Observations**:
+  - **Gumbel-Softmax worked**: No mode collapse, stable training, better gradients
+  - **LPIPS did NOT work**: loss_lpips stayed at ~0.0 (likely implementation issue - may need debugging)
+  - `loss_texture` extremely low (0.04-0.08) suggests model very confident in narrow predictions
+  - `unique_codes` only 60-75 (vs 95-100 in v4.4.1) - still some mode restriction
+  - **Visual improvement despite LPIPS failure** - Gumbel-Softmax alone helped
+  - Action sensitivity MUCH better (0.5-0.6 vs v4.5.2's 0.05-0.2)
+
+- **Diagnosis**:
+  - Gumbel-Softmax successfully forces discrete commitments → prevents soft averaging
+  - LPIPS flat at zero → either (1) not being computed correctly, (2) pred_rgb == target_rgb exactly (unlikely), or (3) gradient flow issue
+  - Model learning but still constrained to ~60-75 codes → need broader exploration
+  - Texture detail emerging in some biomes (grass) but not others (desert) → biome-specific learning
+  - Still far from VQ-VAE sharpness, but **clear incremental progress**
+
+- **Next Steps**:
+  1. Debug LPIPS implementation - check if loss is actually being computed
+  2. If LPIPS working: Increase LPIPS_WEIGHT from 0.3 to 1.0
+  3. If LPIPS broken: Fix computation, ensure gradients flow
+  4. Consider increasing unique_codes target - maybe reduce Gumbel tau annealing speed
+  5. Continue training to 50k-60k steps to see if texture detail improves further
+

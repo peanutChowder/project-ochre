@@ -43,17 +43,18 @@ MIN_LR = 1e-6
 USE_CHECKPOINTING = False 
 
 # --- DUAL LOSS WEIGHTS ---
+# v4.6.0: Revert to v4.4.1 baseline + add LPIPS
 # SEMANTIC: Punishes "wrong color/texture" (Embedding MSE)
-SEMANTIC_WEIGHT = 3.0   # v4.5: Reduced from 10.0 to prevent averaging/blurry predictions
+SEMANTIC_WEIGHT = 10.0   # v4.6.0: Back to v4.4.1 baseline (was 3.0 in v4.5)
 # NEIGHBOR: Tolerates "1-pixel spatial shift" (Spatial Cross Entropy)
-NEIGHBOR_WEIGHT = 2.0   # v4.5: Increased from 1.0 for more spatial precision
+NEIGHBOR_WEIGHT = 1.0    # v4.6.0: Back to v4.4.1 baseline (was 2.0 in v4.5)
 NEIGHBOR_KERNEL = 3
-NEIGHBOR_EXACT_MIX = 0.3 # v4.5: Increased from 0.1 for more exact-pixel pressure
+NEIGHBOR_EXACT_MIX = 0.1 # v4.6.0: Back to v4.4.1 baseline (was 0.3 in v4.5)
 
-# --- NEW LOSS WEIGHTS (v4.5) ---
-ENTROPY_REG_WEIGHT = 0.1    # Encourages codebook exploration
-SHARPNESS_WEIGHT = 0.3      # Rewards committed predictions
-TEMPORAL_WEIGHT = 0.1       # Reduces shaky artifacts
+# --- NEW LOSS (v4.6.0) ---
+LPIPS_WEIGHT = 0.3       # Perceptual loss (learn from VQ-VAE success)
+LPIPS_FREQ = 5           # Compute LPIPS every N timesteps for efficiency
+GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
 
 # --- CURRICULUM ---
 CURRICULUM_SEQ_LEN = False      # Keep disabled (GPU memory risk)
@@ -68,8 +69,8 @@ AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 me
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.5.2-epoch0"
-MODEL_OUT_PREFIX = "ochre-v4.5.2"
+RUN_NAME = "v4.6.0-epoch0"
+MODEL_OUT_PREFIX = "ochre-v4.6.0"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -96,22 +97,28 @@ def get_sampling_probability(step, k=SS_K_STEEPNESS, s=SS_MIDPOINT_STEP):
 
 class SemanticCodebookLoss(nn.Module):
     """
-    Computes MSE in Embedding Space.
+    v4.6.0: Computes MSE in Embedding Space with Gumbel-Softmax.
     Prevents "Gray Soup" by rewarding visually similar textures.
+    Gumbel-Softmax forces discrete commitments during forward pass.
     """
     def __init__(self, codebook_tensor):
         super().__init__()
         # codebook_tensor: (Num_Embeddings, Embedding_Dim)
         self.register_buffer('codebook', codebook_tensor.clone().detach())
+        self.codebook_size = codebook_tensor.shape[0]
 
-    def forward(self, logits, target_indices):
-        # 1. Softmax -> Expected Vector
-        probs = F.softmax(logits, dim=-1) 
+    def forward(self, logits, target_indices, global_step=0):
+        # v4.6.0: Gumbel-Softmax with annealing
+        # tau: 1.0 (soft) → 0.1 (hard) over GUMBEL_TAU_STEPS
+        tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
+
+        # 1. Gumbel-Softmax -> Discrete (hard=True) selection
+        probs = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
         pred_vectors = torch.matmul(probs, self.codebook) # (B*S, Emb_Dim)
-        
+
         # 2. Ground Truth Vector
         target_vectors = F.embedding(target_indices, self.codebook) # (B*S, Emb_Dim)
-        
+
         # 3. MSE
         return F.mse_loss(pred_vectors, target_vectors)
 
@@ -150,56 +157,9 @@ def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
 
     return mix_exact * loss_exact + (1.0 - mix_exact) * loss_neigh
 
-# --- NEW LOSS FUNCTIONS (v4.5) ---
-
-def entropy_regularization_loss(logits, target_entropy=4.5):
-    """
-    Penalizes overconfident predictions that collapse to few codes.
-    Only applies penalty when entropy is BELOW target.
-
-    logits: (B, C, H, W)
-    target_entropy: desired minimum entropy level
-    """
-    probs = F.softmax(logits, dim=1)
-    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
-    if entropy < target_entropy:
-        return ENTROPY_REG_WEIGHT * (target_entropy - entropy) ** 2
-    return torch.tensor(0.0, device=logits.device)
-
-def sharpness_loss(logits):
-    """
-    Rewards high-confidence, committed predictions.
-    Penalizes hedging/averaging behavior that causes blur.
-
-    logits: (B, C, H, W)
-    """
-    probs = F.softmax(logits, dim=1)
-    max_probs = probs.max(dim=1)[0]  # (B, H, W)
-    return SHARPNESS_WEIGHT * (1.0 - max_probs.mean())
-
-def temporal_consistency_loss(logits_t, logits_prev):
-    """
-    Penalizes rapid prediction changes between consecutive timesteps.
-    Reduces shaky artifacts when no action is applied.
-
-    logits_t: current timestep logits (B, C, H, W)
-    logits_prev: previous timestep logits (B, C, H, W)
-    """
-    if logits_prev is None:
-        return torch.tensor(0.0, device=logits_t.device)
-
-    # v4.5.2: Add safety guard to prevent gradient leakage through logits_prev
-    with torch.no_grad():
-        probs_prev = F.softmax(logits_prev, dim=1)
-
-    probs_t = F.softmax(logits_t, dim=1)
-    # KL divergence: sum over classes, mean over batch and spatial
-    kl = F.kl_div(
-        torch.log(probs_t + 1e-9),
-        probs_prev,
-        reduction='batchmean'
-    )
-    return TEMPORAL_WEIGHT * kl
+# --- v4.5 LOSS FUNCTIONS REMOVED IN v4.6.0 ---
+# Removed: entropy_regularization_loss, sharpness_loss, temporal_consistency_loss
+# These created conflicting gradients causing mode collapse in v4.5.2
 
 def sample_with_temperature(logits, temperature=1.0):
     if temperature < 1e-5: return logits.argmax(dim=-1)
@@ -352,7 +312,18 @@ scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
 print(f"Semantic Loss Initialized with codebook shape {codebook.shape}")
 
-# D. Resume Logic
+# E. Setup LPIPS Perceptual Loss (v4.6.0)
+try:
+    import lpips
+    lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE)
+    lpips_criterion.eval()  # Frozen, only for loss computation
+    lpips_criterion.requires_grad_(False)
+    print(f"✅ LPIPS Loss Initialized (AlexNet backend)")
+except ImportError:
+    print("⚠️  LPIPS not installed, will skip perceptual loss")
+    lpips_criterion = None
+
+# F. Resume Logic
 global_step = 0
 start_epoch = 1
 if RESUME_PATH and os.path.exists(RESUME_PATH):
@@ -499,33 +470,39 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
                 logits_last = logits_t
                 
-                # --- LOSS CALCULATION ---
+                # --- LOSS CALCULATION (v4.6.0) ---
                 # 1. Spatial Loss (Handle Jitter)
                 loss_space = neighborhood_token_loss(
                     logits_t, Z_target[:, t],
                     kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
                 )
 
-                # 2. Semantic Loss (Handle Blur)
-                # Flatten for codebook processing
+                # 2. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
                 logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
                 target_flat = Z_target[:, t].reshape(-1)
-                loss_texture = semantic_criterion(logits_flat, target_flat)
+                loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
 
-                # 3. NEW v4.5 Losses
-                loss_entropy = entropy_regularization_loss(logits_t)
-                loss_sharp = sharpness_loss(logits_t)
-                loss_temporal = temporal_consistency_loss(logits_t, logits_prev)
+                # 3. LPIPS Perceptual Loss (v4.6.0: Learn from VQ-VAE success)
+                loss_lpips = torch.tensor(0.0, device=DEVICE)
+                if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
+                    # Decode predicted and target tokens to RGB
+                    with torch.no_grad():
+                        pred_tokens = logits_t.argmax(dim=1)  # (B, H, W)
+                    pred_rgb = vqvae_model.decode_code(pred_tokens)  # (B, 3, 128, 72)
+                    target_rgb = vqvae_model.decode_code(Z_target[:, t])  # (B, 3, 128, 72)
 
-                # Weighted Sum
+                    # LPIPS expects inputs in [-1, 1] range
+                    pred_rgb_norm = pred_rgb * 2.0 - 1.0
+                    target_rgb_norm = target_rgb * 2.0 - 1.0
+
+                    # Compute perceptual loss
+                    loss_lpips = lpips_criterion(pred_rgb_norm, target_rgb_norm).mean()
+
+                # Weighted Sum (v4.6.0: Simplified - only 3 components)
                 loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
                             (SEMANTIC_WEIGHT * loss_texture) + \
-                            loss_entropy + loss_sharp + loss_temporal
+                            (LPIPS_WEIGHT * loss_lpips)
                 step_losses.append(loss_step)
-
-                # Update previous logits for next step
-                # v4.5.2: Removed detach() - temporal_consistency_loss handles gradient blocking
-                logits_prev = logits_t
 
                 # Track teacher vs AR loss separately
                 if use_teacher:
@@ -614,10 +591,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
 
-                    # v4.5: NEW loss components
-                    "train/loss_entropy": loss_entropy.item() if isinstance(loss_entropy, torch.Tensor) else 0,
-                    "train/loss_sharpness": loss_sharp.item(),
-                    "train/loss_temporal": loss_temporal.item() if isinstance(loss_temporal, torch.Tensor) else 0,
+                    # v4.6.0: LPIPS perceptual loss
+                    "train/loss_lpips": loss_lpips.item() if isinstance(loss_lpips, torch.Tensor) else 0,
+
+                    # v4.6.0: Gumbel-Softmax tau annealing
+                    "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
                     # New scheduled sampling metrics
                     "curriculum/teacher_force_prob": teacher_force_prob,
