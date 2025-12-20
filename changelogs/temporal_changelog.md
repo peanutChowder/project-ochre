@@ -401,3 +401,15 @@ Results, step 38k:
   4. Consider increasing unique_codes target - maybe reduce Gumbel tau annealing speed
   5. Continue training to 50k-60k steps to see if texture detail improves further
 
+
+**v4.6.1**
+train.py
+- LPIPS Gradient Flow Fix: Corrected critical bug preventing LPIPS from contributing to training
+  - v4.6.0 bug: `with torch.no_grad():` wrapped entire LPIPS computation block (lines 489-499)
+- Increased batch size to 28, since v4.6.0 stayed at ~50% gpu memory usage
+
+Expected Outcomes @ ~60k steps:
+- loss_lpips should be fixed from 0.0 to measurable values (0.1-0.5 range)
+- Sharpness beyond v4.6.0: More texture details in desert/forest scenes
+- unique_codes may increase slightly if LPIPS encourages diversity
+

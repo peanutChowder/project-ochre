@@ -35,7 +35,7 @@ VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
-BATCH_SIZE = 16
+BATCH_SIZE = 28
 EPOCHS = 50
 LR = 3e-5             
 WARMUP_STEPS = 500   
@@ -69,8 +69,8 @@ AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 me
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.0-epoch0"
-MODEL_OUT_PREFIX = "ochre-v4.6.0"
+RUN_NAME = "v4.6.1-step38k"
+MODEL_OUT_PREFIX = "ochre-v4.6.1"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -482,20 +482,23 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 target_flat = Z_target[:, t].reshape(-1)
                 loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
 
-                # 3. LPIPS Perceptual Loss (v4.6.0: Learn from VQ-VAE success)
+                # 3. LPIPS Perceptual Loss (v4.6.1: Fixed gradient flow)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
                 if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
-                    # Decode predicted and target tokens to RGB
+                    # v4.6.1 FIX: Only disable grad for argmax, not entire computation
                     with torch.no_grad():
                         pred_tokens = logits_t.argmax(dim=1)  # (B, H, W)
+                        target_tokens = Z_target[:, t]  # (B, H, W)
+
+                    # Decode with gradients enabled (for LPIPS backprop)
                     pred_rgb = vqvae_model.decode_code(pred_tokens)  # (B, 3, 128, 72)
-                    target_rgb = vqvae_model.decode_code(Z_target[:, t])  # (B, 3, 128, 72)
+                    target_rgb = vqvae_model.decode_code(target_tokens)  # (B, 3, 128, 72)
 
                     # LPIPS expects inputs in [-1, 1] range
                     pred_rgb_norm = pred_rgb * 2.0 - 1.0
                     target_rgb_norm = target_rgb * 2.0 - 1.0
 
-                    # Compute perceptual loss
+                    # Compute perceptual loss (gradients flow through pred_rgb)
                     loss_lpips = lpips_criterion(pred_rgb_norm, target_rgb_norm).mean()
 
                 # Weighted Sum (v4.6.0: Simplified - only 3 components)
