@@ -416,3 +416,34 @@ train.py
   - Decode soft embeddings directly through VQ-VAE decoder (bypassing quantizer)
   - Gradients now flow: `loss_lpips → pred_rgb → decoder → soft_embeddings → probs → logits_t`
   - Uses same tau annealing schedule as semantic loss for consistency
+
+Results, step 59k:
+- Visual quality improvements
+  - First version showing recognizable micro-features: sand hills, sand crevices, trees, cacti
+  - Transitioned from "land vs sky blobs" to distinct environmental details
+  - Features phase in/out during inference but maintain coherence
+  - Significant improvement over all previous versions
+  - Best visual quality achieved so far
+  - Not yet at VQ-VAE GT quality but clear trajectory toward it
+
+
+- Temperature Sensitivity:
+  - Greedy/low temp: Best accuracy, minimal flickering, fewer unique features
+  - High temp (1.0): More diverse features (sand hills, vegetation), increased flickering BUT significantly reduced vs previous versions
+  - Previous versions at temp=1.0: "massive mess of colors" - v4.6.2 maintains coherent features
+  - Temperature resilience demonstrates robust learned representations
+
+- Action Response:
+  - Best camera input response across all versions
+  - Clear reaction to yaw/pitch/movement in live_inference.py
+  - Not yet detailed enough to fully differentiate specific action types (work in progress)
+
+- Metrics Summary:
+  - `loss_lpips`: 0.24-0.25 stable
+  - `unique_codes`: 85-95 
+  - `spatial_gradient`: 0.34-0.36 (well above >0.2 target for sharp edges)
+  - `action_sensitivity`: 0.5-0.6 (exceeds >0.3 target)
+  - `confidence`: 0.60-0.65 (healthy 0.5-0.8 range)
+  - `loss_texture`: 0.05-0.065 
+  - `grad_norm`: <2.5 (stable training)
+  - `ar_loss_gap`: 0.25-0.3 (exposure bias controlled)
