@@ -447,3 +447,9 @@ Results, step 59k:
   - `loss_texture`: 0.05-0.065 
   - `grad_norm`: <2.5 (stable training)
   - `ar_loss_gap`: 0.25-0.3 (exposure bias controlled)
+
+**v4.6.3**
+train.py
+- Increased `LPIPS_WEIGHT` to 1.0
+
+Results, step 80k

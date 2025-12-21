@@ -52,7 +52,7 @@ NEIGHBOR_KERNEL = 3
 NEIGHBOR_EXACT_MIX = 0.1 # v4.6.0: Back to v4.4.1 baseline (was 0.3 in v4.5)
 
 # --- NEW LOSS (v4.6.0) ---
-LPIPS_WEIGHT = 0.3       # Perceptual loss (learn from VQ-VAE success)
+LPIPS_WEIGHT = 1.0       # v4.6.3: Increased from 0.3 -> 1.0
 LPIPS_FREQ = 5           # Compute LPIPS every N timesteps for efficiency
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
 
@@ -69,8 +69,8 @@ AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 me
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.2-step38k"
-MODEL_OUT_PREFIX = "ochre-v4.6.2"
+RUN_NAME = "v4.6.3-step59k"
+MODEL_OUT_PREFIX = "ochre-v4.6.3"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
