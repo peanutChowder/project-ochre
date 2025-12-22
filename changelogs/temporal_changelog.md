@@ -450,6 +450,36 @@ Results, step 59k:
 
 **v4.6.3**
 train.py
-- Increased `LPIPS_WEIGHT` to 1.0
+- Increased `LPIPS_WEIGHT` from 0.3 to 1.0
 
-Results, step 80k
+Results, step 80k:
+- Visual Quality:
+  - Marginal improvement over v4.6.2: slightly more individual blocks visible in terrain
+  - Sky-ground separation marginally sharper, less color bleeding
+  - Still predominantly Gaussian blur with no 3D block texture detail
+  - Individual blocks "vibrate" between frames (temporal flickering reduced but still significant)
+  - Long rollouts (>5-10s) still fail biome conditioning - looking away and back changes biome
+
+- Metrics Summary (vs v4.6.2 @ 59k):
+  - `loss_lpips`: 0.225-0.235 (improved from 0.24-0.25, -6%)
+  - `unique_codes`: 90-100 (healthier diversity, up from 85-95)
+  - `ar_loss`: 0.65-0.7 (improved from 0.75-0.8, -10%)
+  - `spatial_gradient`: 0.34-0.36 (unchanged)
+  - `action_sensitivity`: 0.55-0.6 (stable)
+  - `loss_texture`: 0.048-0.06 (unchanged, still very low)
+  - `grad_norm`: <2.5 (stable training)
+
+- Key Observations:
+  - LPIPS weight increase (0.3→1.0) had limited impact - only 5-10% visual improvement
+  - LPIPS loss decreased marginally (0.24→0.23) suggesting local optimum reached
+  - Metrics remain healthy but visual quality plateau evident
+  - Gap to VQ-VAE ground truth decreased, but remains large
+  - Model confident (`loss_texture` very low) but still produces blur (confidence != sharpness)
+
+- Limitations:
+  - No 3D block texture (grass blocks lack top/side distinction)
+  - Gaussian blur dominates most terrain
+  - Temporal flickering - block details appear/disappear sporadically
+  - Long rollout conditioning failure - biome changes during extended inference
+
+
