@@ -483,3 +483,7 @@ Results, step 80k:
   - Long rollout conditioning failure - biome changes during extended inference
 
 
+**v4.6.4**
+train.py
+- Removed neighborhood loss: `NEIGHBOR_WEIGHT` from 1.0 to 0.0
+- Increased AR from 18 -> 25

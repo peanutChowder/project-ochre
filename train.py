@@ -43,13 +43,13 @@ MIN_LR = 1e-6
 USE_CHECKPOINTING = False 
 
 # --- DUAL LOSS WEIGHTS ---
-# v4.6.0: Revert to v4.4.1 baseline + add LPIPS
+# v4.6.4: Remove neighborhood loss to test sharpness improvement
 # SEMANTIC: Punishes "wrong color/texture" (Embedding MSE)
-SEMANTIC_WEIGHT = 10.0   # v4.6.0: Back to v4.4.1 baseline (was 3.0 in v4.5)
+SEMANTIC_WEIGHT = 10.0   # Keep v4.6.0 baseline
 # NEIGHBOR: Tolerates "1-pixel spatial shift" (Spatial Cross Entropy)
-NEIGHBOR_WEIGHT = 1.0    # v4.6.0: Back to v4.4.1 baseline (was 2.0 in v4.5)
+NEIGHBOR_WEIGHT = 0.0    # v4.6.4: 1.0 -> 0.0 - conflicts with sharpness
 NEIGHBOR_KERNEL = 3
-NEIGHBOR_EXACT_MIX = 0.1 # v4.6.0: Back to v4.4.1 baseline (was 0.3 in v4.5)
+NEIGHBOR_EXACT_MIX = 0.1
 
 # --- NEW LOSS (v4.6.0) ---
 LPIPS_WEIGHT = 1.0       # v4.6.3: Increased from 0.3 -> 1.0
@@ -65,12 +65,12 @@ SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 CURRICULUM_AR = True
 AR_START_STEP = 0
 AR_RAMP_STEPS = 10000           # v4.5.1: Faster ramp (was 20000)
-AR_ROLLOUT_MAX = 18             # v4.5.1 OOM fix: Reduced from 32 to fit P100 memory (seq_len - 2)       
+AR_ROLLOUT_MAX = 25             # v4.6.4 Increased from 18 -> 25   
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.3-step59k"
-MODEL_OUT_PREFIX = "ochre-v4.6.3"
+RUN_NAME = "v4.6.4-step80k"
+MODEL_OUT_PREFIX = "ochre-v4.6.4"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
