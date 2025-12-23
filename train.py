@@ -42,18 +42,13 @@ WARMUP_STEPS = 500
 MIN_LR = 1e-6         
 USE_CHECKPOINTING = False 
 
-# --- DUAL LOSS WEIGHTS ---
-# v4.6.4: Remove neighborhood loss to test sharpness improvement
-# SEMANTIC: Punishes "wrong color/texture" (Embedding MSE)
-SEMANTIC_WEIGHT = 10.0   # Keep v4.6.0 baseline
-# NEIGHBOR: Tolerates "1-pixel spatial shift" (Spatial Cross Entropy)
-NEIGHBOR_WEIGHT = 0.0    # v4.6.4: 1.0 -> 0.0 - conflicts with sharpness
-NEIGHBOR_KERNEL = 3
-NEIGHBOR_EXACT_MIX = 0.1
-
-# --- NEW LOSS (v4.6.0) ---
-LPIPS_WEIGHT = 1.0       # v4.6.3: Increased from 0.3 -> 1.0
-LPIPS_FREQ = 5           # Compute LPIPS every N timesteps for efficiency
+# --- LOSS WEIGHTS ---
+# v4.6.5: Focus on perceptual sharpness via LPIPS
+# Only 2 loss components: Semantic + LPIPS (neighbor removed)
+SEMANTIC_WEIGHT = 10.0   # Embedding MSE (token prediction accuracy)
+LPIPS_WEIGHT = 2.0       # Perceptual loss (sharpness, visual quality) - v4.6.5: 1.0 -> 2.0
+                         # Combined with LPIPS_FREQ=1, this makes LPIPS the dominant signal
+LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flashing artifact
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
 
 # --- CURRICULUM ---
@@ -62,15 +57,18 @@ BASE_SEQ_LEN = 20               # v4.5.1 OOM fix: Increased from 16 to accommoda
 MAX_SEQ_LEN = 50                # Keep same
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
-CURRICULUM_AR = True
+# v4.6.5: AR rollout disabled during training, only used in validation
+CURRICULUM_AR = False            # Disabled: teacher-forced training only
 AR_START_STEP = 0
-AR_RAMP_STEPS = 10000           # v4.5.1: Faster ramp (was 20000)
-AR_ROLLOUT_MAX = 25             # v4.6.4 Increased from 18 -> 25   
+AR_RAMP_STEPS = 10000
+AR_ROLLOUT_MAX = 0              # v4.6.5: Disabled during training (was 25)
+AR_VALIDATION_FREQ = 500        # v4.6.5: Validate AR every N steps
+AR_VALIDATION_STEPS = 5         # v4.6.5: Number of AR rollouts per validation   
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.4-step80k"
-MODEL_OUT_PREFIX = "ochre-v4.6.4"
+RUN_NAME = "v4.6.5-step101k"
+MODEL_OUT_PREFIX = "ochre-v4.6.5"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -79,17 +77,6 @@ REPORT_SPIKES = True
 SPIKE_LOSS = 15.0
 SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
-
-# --- SCHEDULED SAMPLING ---
-ENABLE_SCHEDULED_SAMPLING = True
-SS_K_STEEPNESS = 4000.0              # v4.5: Faster decay (was 6000)
-SS_MIDPOINT_STEP = 10000             # v4.5: Earlier transition (was 15000)
-SS_MIN_TEACHER_PROB = 0.15           # v4.5: Keep more teacher signal (was 0.05)
-
-def get_sampling_probability(step, k=SS_K_STEEPNESS, s=SS_MIDPOINT_STEP):
-    """Returns probability of using teacher forcing (inverse sigmoid)"""
-    prob = 1.0 / (1.0 + np.exp((step - s) / k))
-    return max(SS_MIN_TEACHER_PROB, min(0.95, prob))
 
 # ==========================================
 # LOSS & HELPER FUNCTIONS
@@ -122,49 +109,10 @@ class SemanticCodebookLoss(nn.Module):
         # 3. MSE
         return F.mse_loss(pred_vectors, target_vectors)
 
-def neighborhood_token_loss(logits, target, kernel_size=3, mix_exact=0.1):
-    """
-    Spatially tolerant Cross Entropy.
-    Prevents penalty for 1-pixel jitter.
-    """
-    B, C, H, W = logits.shape
-    log_probs = F.log_softmax(logits, dim=1)          
-    log_probs_flat = log_probs.view(B, C, H * W)      
-
-    k = kernel_size
-    pad = k // 2
-    # Create windows of neighbors for every pixel
-    target_patches = F.unfold(
-        target.float().unsqueeze(1), kernel_size=k, padding=pad
-    ).long() # (B, K*K, HW)
-
-    neighbors = target_patches.permute(0, 2, 1) # (B, HW, K*K)
-    lp = log_probs_flat.permute(0, 2, 1)        # (B, HW, C)
-    
-    # Gather log-probs of all valid neighbors
-    lp_neighbors = lp.gather(dim=2, index=neighbors)
-    
-    # "Did we predict ANY of the neighbors?" (LogSumExp)
-    log_p_any = torch.logsumexp(lp_neighbors, dim=2)
-    loss_neigh = -log_p_any.mean()
-
-    if mix_exact <= 0.0: return loss_neigh
-
-    # Mix with strict loss
-    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)
-    target_flat = target.reshape(-1)
-    loss_exact = F.cross_entropy(logits_flat, target_flat)
-
-    return mix_exact * loss_exact + (1.0 - mix_exact) * loss_neigh
-
-# --- v4.5 LOSS FUNCTIONS REMOVED IN v4.6.0 ---
-# Removed: entropy_regularization_loss, sharpness_loss, temporal_consistency_loss
-# These created conflicting gradients causing mode collapse in v4.5.2
-
-def sample_with_temperature(logits, temperature=1.0):
-    if temperature < 1e-5: return logits.argmax(dim=-1)
-    probs = F.softmax(logits / temperature, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+# --- REMOVED LOSS FUNCTIONS ---
+# v4.5 → v4.6.0: Removed entropy_regularization_loss, sharpness_loss, temporal_consistency_loss
+#                (caused conflicting gradients and mode collapse in v4.5.2)
+# v4.6.5: Removed neighborhood_token_loss (NEIGHBOR_WEIGHT=0 since v4.6.4, unused computation)
 
 def log_images_to_wandb(vqvae, Z_target, logits, global_step):
     """
@@ -424,41 +372,22 @@ for epoch in range(start_epoch, EPOCHS + 1):
         Gammas_seq, Betas_seq = model.compute_film(A_seq)
         h_state = model.init_state(B, device=DEVICE)
 
-        # Scheduled sampling setup
-        if ENABLE_SCHEDULED_SAMPLING:
-            teacher_force_prob = get_sampling_probability(global_step)
-        else:
-            teacher_force_prob = 1.0  # Fallback to original behavior
+        # v4.6.5: Teacher-forced training only (AR disabled during training)
+        # AR rollout moved to validation-only (see AR validation section below)
+        teacher_force_prob = 1.0  # Always use ground truth
 
         teacher_loss_steps = []
-        ar_loss_steps = []
         lpips_loss_steps = []  # v4.6.2: Track LPIPS losses across sequence
         logits_last = None
-        logits_prev = None  # v4.5: Track previous logits for temporal consistency
 
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
-            ar_cutoff = K - ar_len
+            # v4.6.5: ar_len always 0 (teacher-forced only)
+            ar_cutoff = K  # All steps are teacher-forced
 
             for t in range(K):
-                # Determine if this step uses teacher forcing
-                if t < ar_cutoff:
-                    # Always use GT for context portion
-                    use_teacher = True
-                    x_in = X_seq[:, t]
-                else:
-                    # Scheduled sampling for AR portion
-                    use_teacher = (torch.rand(1).item() < teacher_force_prob) if ENABLE_SCHEDULED_SAMPLING else False
-
-                    if use_teacher:
-                        x_in = X_seq[:, t]
-                    else:
-                        # Use previous prediction
-                        if logits_last is not None:
-                            z_pred = logits_last.argmax(dim=1)
-                            x_in = model._embed_tokens(z_pred)
-                        else:
-                            # Fallback to GT for first AR step
-                            x_in = X_seq[:, t]
+                # v4.6.5: Always use ground truth during training
+                use_teacher = True
+                x_in = X_seq[:, t]
 
                 # Step
                 g_t = Gammas_seq[:, :, t]
@@ -470,15 +399,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
 
                 logits_last = logits_t
-                
-                # --- LOSS CALCULATION (v4.6.0) ---
-                # 1. Spatial Loss (Handle Jitter)
-                loss_space = neighborhood_token_loss(
-                    logits_t, Z_target[:, t],
-                    kernel_size=NEIGHBOR_KERNEL, mix_exact=NEIGHBOR_EXACT_MIX
-                )
 
-                # 2. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
+                # --- LOSS CALCULATION (v4.6.5: Optimized) ---
+                # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
                 logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
                 target_flat = Z_target[:, t].reshape(-1)
                 loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
@@ -518,17 +441,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     # Track LPIPS for averaging
                     lpips_loss_steps.append(loss_lpips)
 
-                # Weighted Sum (v4.6.0: Simplified - only 3 components)
-                loss_step = (NEIGHBOR_WEIGHT * loss_space) + \
-                            (SEMANTIC_WEIGHT * loss_texture) + \
+                # Weighted Sum (v4.6.5: Only 2 components - neighbor removed)
+                loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
                             (LPIPS_WEIGHT * loss_lpips)
                 step_losses.append(loss_step)
 
-                # Track teacher vs AR loss separately
-                if use_teacher:
-                    teacher_loss_steps.append(loss_step)
-                else:
-                    ar_loss_steps.append(loss_step)
+                # v4.6.5: All steps are teacher-forced
+                teacher_loss_steps.append(loss_step)
 
             loss = torch.stack(step_losses).mean()
 
@@ -541,21 +460,23 @@ for epoch in range(start_epoch, EPOCHS + 1):
         # --- DIAGNOSTICS & LOGGING ---
         if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
             print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
-            print(f"   (Space: {loss_space.item():.4f}, Tex: {loss_texture.item():.4f})")
+            print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
 
         total_loss += loss.item()
         
         # Periodic Logs
         if global_step % LOG_STEPS == 0:
-            # Calculate AR loss gap
-            if len(teacher_loss_steps) > 0 and len(ar_loss_steps) > 0:
+            # v4.6.5: No AR during training, so ar_loss_steps is always empty
+            # AR metrics come from validation (every AR_VALIDATION_FREQ steps)
+            if len(teacher_loss_steps) > 0:
                 teacher_loss_avg = torch.stack(teacher_loss_steps).mean().item()
-                ar_loss_avg = torch.stack(ar_loss_steps).mean().item()
-                ar_loss_gap = ar_loss_avg - teacher_loss_avg
             else:
                 teacher_loss_avg = 0.0
-                ar_loss_avg = 0.0
-                ar_loss_gap = 0.0
+
+            # ar_loss_avg and ar_loss_gap will be 0 during training
+            # Real values logged in validation section
+            ar_loss_avg = 0.0
+            ar_loss_gap = 0.0
 
             # Calculate LPIPS average (v4.6.2)
             if len(lpips_loss_steps) > 0:
@@ -590,31 +511,15 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     confidence_min = torch.tensor(0.0)
 
                 # Action responsiveness diagnostics
+                # v4.6.5: Use FiLM magnitude as proxy (removed expensive perturbation test)
                 gamma_magnitude = Gammas_seq.abs().mean().item()
                 beta_magnitude = Betas_seq.abs().mean().item()
-
-                # Action perturbation test (v4.5.2: reduced from every 100 to every 500 steps)
-                if global_step % 500 == 0:
-                    # Compare prediction with vs without actions
-                    A_seq_zero = torch.zeros_like(A_seq)
-                    Gammas_zero, Betas_zero = model.compute_film(A_seq_zero)
-
-                    # Re-run last timestep with zero actions
-                    logits_zero, _ = model.step(None, None, h_state, x_t=x_in,
-                                               gammas_t=Gammas_zero[:, :, -1],
-                                               betas_t=Betas_zero[:, :, -1])
-
-                    # Measure sensitivity
-                    action_sensitivity = (logits_last - logits_zero).abs().mean().item()
-                else:
-                    # Use FiLM magnitude as instant proxy
-                    action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
+                action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
             if wandb:
                 wandb.log({
                     # Existing metrics
                     "train/loss": loss.item(),
-                    "train/loss_space": loss_space.item(),
                     "train/loss_texture": loss_texture.item(),
 
                     # v4.6.2: LPIPS perceptual loss (averaged across sequence)
@@ -645,19 +550,96 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     "diagnostics/confidence_min": confidence_min.item(),
 
                     "train/grad_norm": float(grad_norm),
-                    "seq_len": seq_len,
-                    "ar_len": ar_len,
+                    # v4.6.5: seq_len and ar_len removed (constants: 20 and 0)
                 }, step=global_step)
 
         # Image Logs (Visual Confirmation)
         if global_step % IMAGE_LOG_STEPS == 0:
             log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
 
+        # v4.6.5: AR Validation 
+        if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
+            model.eval()
+            with torch.no_grad(), autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
+                # Perform AR_VALIDATION_STEPS rollouts
+                validation_ar_losses = []
+                validation_teacher_losses = []
+
+                for _ in range(AR_VALIDATION_STEPS):
+                    # Use current batch for validation
+                    val_X_seq = X_seq
+                    val_h_state = model.init_state(B, device=DEVICE)
+
+                    # Teacher-forced pass (ground truth)
+                    teacher_val_losses = []
+                    for t in range(K):
+                        x_in = val_X_seq[:, t]
+                        g_t = Gammas_seq[:, :, t]
+                        b_t = Betas_seq[:, :, t]
+
+                        logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+
+                        # Compute loss
+                        logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                        target_flat = Z_target[:, t].reshape(-1)
+                        loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+                        teacher_val_losses.append(loss_t)
+
+                    teacher_val_loss = torch.stack(teacher_val_losses).mean()
+                    validation_teacher_losses.append(teacher_val_loss)
+
+                    # AR rollout pass (autoregressive)
+                    val_h_state = model.init_state(B, device=DEVICE)
+                    ar_val_losses = []
+                    x_prev = val_X_seq[:, 0]  # Start with first GT frame
+
+                    for t in range(K):
+                        g_t = Gammas_seq[:, :, t]
+                        b_t = Betas_seq[:, :, t]
+
+                        # First frame uses GT, rest use predictions
+                        if t == 0:
+                            x_in = val_X_seq[:, t]
+                        else:
+                            x_in = x_prev
+
+                        logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+
+                        # Compute loss
+                        logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                        target_flat = Z_target[:, t].reshape(-1)
+                        loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+                        ar_val_losses.append(loss_t)
+
+                        # Use prediction for next step
+                        z_pred = logits_t.argmax(dim=1)
+                        x_prev = model._embed_tokens(z_pred)
+
+                    ar_val_loss = torch.stack(ar_val_losses).mean()
+                    validation_ar_losses.append(ar_val_loss)
+
+                # Average across validation rollouts
+                avg_teacher_val_loss = torch.stack(validation_teacher_losses).mean().item()
+                avg_ar_val_loss = torch.stack(validation_ar_losses).mean().item()
+                validation_ar_gap = avg_ar_val_loss - avg_teacher_val_loss
+
+                # Log validation metrics
+                if wandb:
+                    wandb.log({
+                        "validation/teacher_loss": avg_teacher_val_loss,
+                        "validation/ar_loss": avg_ar_val_loss,
+                        "validation/ar_loss_gap": validation_ar_gap,
+                    }, step=global_step)
+
+                print(f"[Step {global_step}] Validation AR gap: {validation_ar_gap:.4f} (teacher: {avg_teacher_val_loss:.4f}, ar: {avg_ar_val_loss:.4f})")
+
+            model.train()  # Return to training mode
+
         # Emergency Save
         if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
             save_checkpoint(epoch, global_step, is_emergency=True)
             last_emergency_save_time = time.time()
-            
+
         global_step += 1
 
     print(f"Epoch {epoch}: mean loss {total_loss / len(loader):.4f}")

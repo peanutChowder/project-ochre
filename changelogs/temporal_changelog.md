@@ -508,3 +508,22 @@ Results, step 101k:
   - `loss_space`: 4.5-5.0 (increased from ~2.0 but weight is 0.0)
   - `ar_loss_gap`: ~0.0 (no exposure bias)
   - `grad_norm`: <2.0 (stable)
+
+
+**v4.6.5**
+train.py
+- Core Changes:
+  - `LPIPS_FREQ`: 5 -> 1 (every step) - eliminates 5-frame periodic flashing artifact
+  - `LPIPS_WEIGHT`: 1.0 -> 2.0 - LPIPS becomes dominant gradient signal (53% vs 47% semantic)
+  - `CURRICULUM_AR`: Disabled during training - AR moved to validation-only, per 500 steps - since AR loss gap was negative-ish to zero
+
+- Optimizations:
+  - Removed 0-weighted neighborhood loss computation 
+  - Removed scheduled sampling logic (always teacher-forced)
+  - Removed action perturbation test (redundant diagnostic)
+  - Removed unused variables and constant logging
+
+- Expected Behavior:
+  - No periodic flashing (LPIPS every step provides consistent signal)
+  - Strong perceptual gradient (~10x stronger than v4.6.4)
+  - Potential mode collapse risk - keep watch on `unique_codes`
