@@ -485,5 +485,26 @@ Results, step 80k:
 
 **v4.6.4**
 train.py
-- Removed neighborhood loss: `NEIGHBOR_WEIGHT` from 1.0 to 0.0
+- Removed neighborhood loss: `NEIGHBOR_WEIGHT` from 1.0 to 0.0 due to potentially allowing 3x3 neighborhood jitter
 - Increased AR from 18 -> 25
+
+Results, step 101k:
+- Visual Quality:
+  - 2x sharpness improvement - spatial_gradient: 0.34-0.36 -> 0.6-0.7 (biggest gain across all versions)
+  - LPIPS improved 20%: 0.24-0.25 -> 0.18-0.20 
+  - Critical artifact discovered: Global flashing every 5 frames during inference
+    - Frames 0-4: Gaussian blur, low detail
+    - Frame 5: Flash of sharp features (sand hills, texture visible)
+    - Pattern repeats indefinitely (confirmed >1min rollout)
+    - Different from v4.6.3's localized jittering - now synchronized global flash
+    - Highly likely due to LPIPS only computed at every 5th timestep
+
+- Metrics Summary:
+  - `spatial_gradient`: 0.6-0.7 (doubled from 0.34-0.36)
+  - `loss_lpips`: 0.18-0.20 (improved 20% from 0.24-0.25)
+  - `unique_codes`: 65-78 (dropped 25% from 90-100) - WARNING
+  - `entropy`: 0.3-0.4 (halved from 0.6-1.0) - WARNING
+  - `confidence`: 0.88-0.92 (increased from 0.8)
+  - `loss_space`: 4.5-5.0 (increased from ~2.0 but weight is 0.0)
+  - `ar_loss_gap`: ~0.0 (no exposure bias)
+  - `grad_norm`: <2.0 (stable)
