@@ -408,7 +408,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 if use_ar_step:
                     # Use previous prediction (detached to prevent gradient backprop through time)
                     with torch.no_grad():
-                        x_in = vqvae_model.decode_code(prev_pred_tokens)
+                        x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
                     ar_mix_count += 1
                 else:
                     # Normal teacher forcing (ground truth)
