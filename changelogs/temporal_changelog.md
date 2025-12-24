@@ -511,6 +511,7 @@ Results, step 101k:
 
 
 **v4.6.5**
+
 train.py
 - Core Changes:
   - `LPIPS_FREQ`: 5 -> 1 (every step) - eliminates 5-frame periodic flashing artifact
@@ -527,3 +528,20 @@ train.py
   - No periodic flashing (LPIPS every step provides consistent signal)
   - Strong perceptual gradient (~10x stronger than v4.6.4)
   - Potential mode collapse risk - keep watch on `unique_codes`
+
+Results - skipped due to GPU budget exhausted
+
+**v4.6.6**
+
+train.py
+
+- Single-step AR mix: 5% of training steps use AR vs 20 frame rollout in v4.6.4
+- Removed unused WandB metrics and unused variables, added `ar_mix/actual_frequency` tracking
+- Checkpoint saving: step-based naming (e.g., `ochre-v4.6.6-step80k.pt`), auto-save every 10k steps
+
+- Expected Behavior:
+  - `validation/ar_loss_gap` stays <0.5 (AR capability preserved)
+  - Training stability maintained (no grad_norm spikes)
+  - 40-60x more efficient than v4.6.4 full AR rollout
+  - If AR gap >0.5: increase AR_MIX_PROB to 0.10
+  - If unstable: reduce to 0.02 or disable

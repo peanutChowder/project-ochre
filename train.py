@@ -57,18 +57,22 @@ BASE_SEQ_LEN = 20               # v4.5.1 OOM fix: Increased from 16 to accommoda
 MAX_SEQ_LEN = 50                # Keep same
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
-# v4.6.5: AR rollout disabled during training, only used in validation
+# v4.6.6: Single-step AR mix for noise robustness (cost-efficient alternative to full AR)
 CURRICULUM_AR = False            # Disabled: teacher-forced training only
 AR_START_STEP = 0
 AR_RAMP_STEPS = 10000
-AR_ROLLOUT_MAX = 0              # v4.6.5: Disabled during training (was 25)
-AR_VALIDATION_FREQ = 500        # v4.6.5: Validate AR every N steps
-AR_VALIDATION_STEPS = 5         # v4.6.5: Number of AR rollouts per validation   
+AR_ROLLOUT_MAX = 0              # v4.6.6: Disabled during training (was 25)
+AR_VALIDATION_FREQ = 500        # v4.6.6: Validate AR every N steps
+AR_VALIDATION_STEPS = 5         # v4.6.6: Number of AR rollouts per validation
+
+# v4.6.6: Single-step AR mix for noise robustness (Option 2 from efficient-ar-robustness.md)
+AR_MIX_ENABLED = True           # Enable occasional AR step during training
+AR_MIX_PROB = 0.05              # 5% of steps use previous prediction (~0.5% overhead)   
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.5-step101k"
-MODEL_OUT_PREFIX = "ochre-v4.6.5"
+RUN_NAME = "v4.6.6-step0"
+MODEL_OUT_PREFIX = "ochre-v4.6.6"
 RESUME_PATH = ""  
 
 LOG_STEPS = 10
@@ -77,6 +81,7 @@ REPORT_SPIKES = True
 SPIKE_LOSS = 15.0
 SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
+MILESTONE_SAVE_STEPS = 10000  # v4.6.6: Save checkpoint every N steps
 
 # ==========================================
 # LOSS & HELPER FUNCTIONS
@@ -282,10 +287,18 @@ if RESUME_PATH and os.path.exists(RESUME_PATH):
     start_epoch = ckpt["epoch"] + 1
     global_step = ckpt.get("global_step", 0)
 
-def save_checkpoint(epoch, global_step, is_emergency=False):
-    base_name = f"{MODEL_OUT_PREFIX}_epoch_{epoch}"
-    suffix = "_emergency" if is_emergency else ""
-    save_path = f"/kaggle/working/{base_name}{suffix}.pt"
+def save_checkpoint(epoch, global_step, is_emergency=False, is_milestone=False):
+    # v4.6.6: Step-based naming instead of epoch-based
+    if is_emergency:
+        save_name = f"{MODEL_OUT_PREFIX}-step{global_step}-emergency.pt"
+    elif is_milestone:
+        # Milestone saves every 10k steps
+        save_name = f"{MODEL_OUT_PREFIX}-step{global_step}.pt"
+    else:
+        # End of epoch saves (legacy, less important)
+        save_name = f"{MODEL_OUT_PREFIX}-epoch{epoch}.pt"
+
+    save_path = f"/kaggle/working/{save_name}"
     print(f"⏰ Saving checkpoint to {save_path}")
     torch.save({
         "epoch": epoch,
@@ -372,22 +385,34 @@ for epoch in range(start_epoch, EPOCHS + 1):
         Gammas_seq, Betas_seq = model.compute_film(A_seq)
         h_state = model.init_state(B, device=DEVICE)
 
-        # v4.6.5: Teacher-forced training only (AR disabled during training)
+        # v4.6.6: Primarily teacher-forced with occasional single-step AR mix
         # AR rollout moved to validation-only (see AR validation section below)
-        teacher_force_prob = 1.0  # Always use ground truth
 
-        teacher_loss_steps = []
-        lpips_loss_steps = []  # v4.6.2: Track LPIPS losses across sequence
+        step_losses = []         # Loss per timestep
+        lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
         logits_last = None
+        prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
+        ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
-            # v4.6.5: ar_len always 0 (teacher-forced only)
+            # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
             ar_cutoff = K  # All steps are teacher-forced
 
             for t in range(K):
-                # v4.6.5: Always use ground truth during training
-                use_teacher = True
-                x_in = X_seq[:, t]
+                # v4.6.6: Single-step AR mix for noise robustness
+                use_ar_step = (AR_MIX_ENABLED and
+                               t > 0 and
+                               prev_pred_tokens is not None and
+                               random.random() < AR_MIX_PROB)
+
+                if use_ar_step:
+                    # Use previous prediction (detached to prevent gradient backprop through time)
+                    with torch.no_grad():
+                        x_in = vqvae_model.decode_code(prev_pred_tokens)
+                    ar_mix_count += 1
+                else:
+                    # Normal teacher forcing (ground truth)
+                    x_in = X_seq[:, t]
 
                 # Step
                 g_t = Gammas_seq[:, :, t]
@@ -399,6 +424,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
 
                 logits_last = logits_t
+
+                # v4.6.6: Store prediction for potential next AR step
+                with torch.no_grad():
+                    prev_pred_tokens = logits_t.argmax(dim=1).detach()
 
                 # --- LOSS CALCULATION (v4.6.5: Optimized) ---
                 # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
@@ -441,13 +470,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     # Track LPIPS for averaging
                     lpips_loss_steps.append(loss_lpips)
 
-                # Weighted Sum (v4.6.5: Only 2 components - neighbor removed)
+                # Weighted Sum (v4.6.6: Only 2 components - neighbor removed)
                 loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
                             (LPIPS_WEIGHT * loss_lpips)
                 step_losses.append(loss_step)
-
-                # v4.6.5: All steps are teacher-forced
-                teacher_loss_steps.append(loss_step)
 
             loss = torch.stack(step_losses).mean()
 
@@ -466,19 +492,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         
         # Periodic Logs
         if global_step % LOG_STEPS == 0:
-            # v4.6.5: No AR during training, so ar_loss_steps is always empty
-            # AR metrics come from validation (every AR_VALIDATION_FREQ steps)
-            if len(teacher_loss_steps) > 0:
-                teacher_loss_avg = torch.stack(teacher_loss_steps).mean().item()
-            else:
-                teacher_loss_avg = 0.0
-
-            # ar_loss_avg and ar_loss_gap will be 0 during training
-            # Real values logged in validation section
-            ar_loss_avg = 0.0
-            ar_loss_gap = 0.0
-
-            # Calculate LPIPS average (v4.6.2)
+            # v4.6.6: Calculate LPIPS average
             if len(lpips_loss_steps) > 0:
                 lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
             else:
@@ -518,7 +532,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             if wandb:
                 wandb.log({
-                    # Existing metrics
+                    # Core metrics
                     "train/loss": loss.item(),
                     "train/loss_texture": loss_texture.item(),
 
@@ -528,11 +542,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     # v4.6.0: Gumbel-Softmax tau annealing
                     "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
-                    # New scheduled sampling metrics
-                    "curriculum/teacher_force_prob": teacher_force_prob,
-                    "curriculum/ar_loss_gap": ar_loss_gap,
-                    "curriculum/teacher_loss": teacher_loss_avg,
-                    "curriculum/ar_loss": ar_loss_avg,
+                    # v4.6.6: AR mix diagnostics
+                    "ar_mix/enabled": 1.0 if AR_MIX_ENABLED else 0.0,
+                    "ar_mix/probability": AR_MIX_PROB if AR_MIX_ENABLED else 0.0,
+                    "ar_mix/actual_frequency": ar_mix_count / K if K > 0 else 0.0,
 
                     # Action diagnostics
                     "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
@@ -635,7 +648,11 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             model.train()  # Return to training mode
 
-        # Emergency Save
+        # v4.6.6: Milestone Save (every 10k steps)
+        if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:
+            save_checkpoint(epoch, global_step, is_milestone=True)
+
+        # Emergency Save (time-based)
         if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
             save_checkpoint(epoch, global_step, is_emergency=True)
             last_emergency_save_time = time.time()
