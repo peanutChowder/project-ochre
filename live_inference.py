@@ -94,6 +94,7 @@ def main():
     p.add_argument("--greedy", action="store_true", help="Use argmax decoding (no sampling)")
     p.add_argument("--temperature", type=float, default=1.05, help="Sampling temperature (>0); 1.0 ≈ unbiased")
     p.add_argument("--topk", type=int, default=32, help="Top‑k sampling cutoff (0 = disable)")
+    p.add_argument("--use_context_actions", action="store_true", help="Use GT actions from context file instead of keyboard input")
     args = p.parse_args()
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -114,14 +115,17 @@ def main():
 
     # --- Initialize state ---
     h_state = model.init_state(1, device=device)
-    
+
+    # Store context actions for --use_context_actions flag
+    actions_ctx = None
+
     # Warmup if context provided
     if args.context_npz and os.path.exists(args.context_npz):
         print(f"Seeding from {args.context_npz}...")
         data = np.load(args.context_npz)
         # Load context tokens and actions
         # We need to run the model through these to build up h_state
-        
+
         # Take up to last 60 frames or so to build state, don't need infinite history for warmup
         # But actually, we just need to run through them.
         tokens_ctx = torch.tensor(data["tokens"], dtype=torch.long, device=device)
@@ -170,11 +174,21 @@ def main():
         current_z = torch.randint(0, 2048, (1, LATENT_H, LATENT_W), device=device)
         # h_state is already zeros
 
+    # Validate --use_context_actions flag
+    if args.use_context_actions:
+        if actions_ctx is None:
+            print("❌ ERROR: --use_context_actions requires --context_npz")
+            return
+        print(f"✅ Using GT actions from context ({actions_ctx.shape[0]} frames available)")
+
     # --- Pygame setup ---
     pygame.init()
     width, height = FRAME_W * args.scale, FRAME_H * args.scale
     screen = pygame.display.set_mode((width, height))
-    pygame.display.set_caption("Project Ochre — Live Inference (Stateful)")
+    title = "Project Ochre — Live Inference (Stateful)"
+    if args.use_context_actions:
+        title += " [Context Actions]"
+    pygame.display.set_caption(title)
     clock = pygame.time.Clock()
     pygame.font.init()
     hud_font = pygame.font.SysFont("Arial", max(10, int(10 * args.scale / 5)))
@@ -196,7 +210,13 @@ def main():
         # Action vector: [yaw, pitch, move_x, move_z, jump]
         return [yaw, pitch, move_x, move_z, jump]
 
-    print("🎮 W/A/S/D move • Space jump • Arrows look • ESC/Q quit")
+    if args.use_context_actions:
+        print("🎬 Replaying GT actions from context (no user input)")
+    else:
+        print("🎮 W/A/S/D move • Space jump • Arrows look • ESC/Q quit")
+
+    # Frame counter for context action indexing
+    frame_idx = 0
 
     def draw_key_button(screen, x, y, w, h, label, is_pressed):
         """Draw a button-like visualization for a key."""
@@ -244,8 +264,19 @@ def main():
                 running = False
 
         # 1. Get Action
-        act = get_action_vec()
-        current_a = torch.tensor([act], dtype=torch.float32, device=device) # (1, 5)
+        if args.use_context_actions:
+            # Use GT actions from context file
+            if frame_idx < actions_ctx.shape[0]:
+                current_a = actions_ctx[frame_idx:frame_idx+1]  # (1, ACTION_DIM)
+                act = current_a[0].cpu().tolist()  # For HUD display
+            else:
+                # Ran out of context actions, use zeros
+                act = [0.0, 0.0, 0.0, 0.0, 0.0]
+                current_a = torch.tensor([act], dtype=torch.float32, device=device)
+        else:
+            # Use keyboard input
+            act = get_action_vec()
+            current_a = torch.tensor([act], dtype=torch.float32, device=device) # (1, 5)
 
         # 2. Step Model
         with torch.no_grad():
@@ -269,6 +300,9 @@ def main():
         # Update state for next loop
         current_z = pred_tokens
 
+        # Increment frame counter for context action indexing
+        frame_idx += 1
+
         # draw
         surf = pygame.image.frombuffer(img.tobytes(), (FRAME_W, FRAME_H), "RGB")
         if args.scale != 1:
@@ -280,7 +314,23 @@ def main():
         screen.blit(hud_font.render(hud, True, (255, 255, 255)), (10, 10))
 
         # --- Draw WASD+Jump key visualizations ---
-        keys = pygame.key.get_pressed()
+        # When using context actions, visualize the context actions instead of keyboard
+        if args.use_context_actions:
+            # Extract action components: [yaw, pitch, move_x, move_z, jump]
+            move_x, move_z, jump = act[2], act[3], act[4]
+            w_pressed = move_z > 0.5
+            s_pressed = move_z < -0.5
+            a_pressed = move_x < -0.5
+            d_pressed = move_x > 0.5
+            space_pressed = jump > 0.5
+        else:
+            keys = pygame.key.get_pressed()
+            w_pressed = keys[pygame.K_w]
+            s_pressed = keys[pygame.K_s]
+            a_pressed = keys[pygame.K_a]
+            d_pressed = keys[pygame.K_d]
+            space_pressed = keys[pygame.K_SPACE]
+
         button_size = max(30, int(30 * args.scale / 5))
         button_spacing = max(5, int(5 * args.scale / 5))
 
@@ -290,24 +340,24 @@ def main():
 
         # W key (top middle)
         draw_key_button(screen, base_x + button_size + button_spacing, base_y,
-                       button_size, button_size, "W", keys[pygame.K_w])
+                       button_size, button_size, "W", w_pressed)
 
         # A key (middle left)
         draw_key_button(screen, base_x, base_y + button_size + button_spacing,
-                       button_size, button_size, "A", keys[pygame.K_a])
+                       button_size, button_size, "A", a_pressed)
 
         # S key (middle middle)
         draw_key_button(screen, base_x + button_size + button_spacing, base_y + button_size + button_spacing,
-                       button_size, button_size, "S", keys[pygame.K_s])
+                       button_size, button_size, "S", s_pressed)
 
         # D key (middle right)
         draw_key_button(screen, base_x + (button_size + button_spacing) * 2, base_y + button_size + button_spacing,
-                       button_size, button_size, "D", keys[pygame.K_d])
+                       button_size, button_size, "D", d_pressed)
 
         # Space key (bottom, wide)
         space_width = button_size * 3 + button_spacing * 2
         draw_key_button(screen, base_x, base_y + (button_size + button_spacing) * 2,
-                       space_width, button_size, "JUMP", keys[pygame.K_SPACE])
+                       space_width, button_size, "JUMP", space_pressed)
 
         # --- Draw camera direction arrows ---
         # Yaw (horizontal camera movement) -> left/right arrows
