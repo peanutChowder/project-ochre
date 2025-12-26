@@ -545,3 +545,16 @@ train.py
   - 40-60x more efficient than v4.6.4 full AR rollout
   - If AR gap >0.5: increase AR_MIX_PROB to 0.10
   - If unstable: reduce to 0.02 or disable
+
+**v4.6.7**
+
+train.py
+
+- Timing instrumentation: Added comprehensive timing tracking with EMA smoothing (α=0.1, ~10 step window) for throughput analysis and bottleneck identification
+- WandB metrics: New `timing/*` namespace tracking step_total, data_load, forward, lpips, backward, optimizer, ar_validation (all in ms) + throughput_steps_per_sec
+- Console output: Prints timing breakdown every 10 steps with steps/sec and section-level breakdown (e.g., "1.24 steps/s | Total: 806ms (Data: 50ms, Fwd: 620ms, Bwd: 85ms, Opt: 45ms, LPIPS: 480ms)")
+
+- Expected Behavior:
+  - Minimal overhead (<0.1% from time.time() calls)
+  - Stable metrics via EMA smoothing
+  - Identifies performance bottlenecks (e.g., LPIPS-bound vs forward-bound)

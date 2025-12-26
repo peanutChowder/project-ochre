@@ -71,9 +71,9 @@ AR_MIX_PROB = 0.05              # 5% of steps use previous prediction (~0.5% ove
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.6-step0"
-MODEL_OUT_PREFIX = "ochre-v4.6.6"
-RESUME_PATH = ""  
+RUN_NAME = "v4.6.7-step0"
+MODEL_OUT_PREFIX = "ochre-v4.6.7"
+RESUME_PATH = ""
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 500 # Log visual reconstruction every N steps
@@ -82,6 +82,9 @@ SPIKE_LOSS = 15.0
 SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 MILESTONE_SAVE_STEPS = 10000  # v4.6.6: Save checkpoint every N steps
+
+# v4.6.6: Timing & throughput tracking
+TIMING_EMA_ALPHA = 0.1  # Smoothing factor for exponential moving average (0.1 = ~10 step window)
 
 # ==========================================
 # LOSS & HELPER FUNCTIONS
@@ -311,6 +314,17 @@ def save_checkpoint(epoch, global_step, is_emergency=False, is_milestone=False):
 # --- TRAINING ---
 last_emergency_save_time = time.time()
 
+# v4.6.6: Timing tracking with exponential moving average
+timing_stats = {
+    'step_total': None,      # Total time per step (EMA)
+    'data_load': None,       # Time to load batch
+    'forward': None,         # Forward pass time
+    'lpips': None,           # LPIPS computation time
+    'backward': None,        # Backward pass time
+    'optimizer': None,       # Optimizer step time
+    'ar_validation': None,   # AR validation time
+}
+
 # Helper function to compute curriculum params
 def compute_curriculum_params(step):
     ar_len = 0
@@ -361,13 +375,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
             loader_iter = iter(loader)
 
         # Get next batch
+        t_step_start = time.time()
         try:
             batch = next(loader_iter)
         except StopIteration:
             # Epoch complete
             break
 
-        t0_batch = time.time()
+        t_data_end = time.time()
         Z_seq, A_seq, Z_target, _, _, _ = batch
         Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
         B, K, H, W = Z_seq.shape
@@ -394,6 +409,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
         ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
+        t_forward_start = time.time()
         with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
             # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
             ar_cutoff = K  # All steps are teacher-forced
@@ -437,6 +453,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
                 # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
                 loss_lpips = torch.tensor(0.0, device=DEVICE)
+                t_lpips_start = time.time()
                 if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
                     # v4.6.2 FIX: Use Gumbel-Softmax for differentiable token selection
                     # Reuse same tau as semantic loss for consistency
@@ -470,6 +487,15 @@ for epoch in range(start_epoch, EPOCHS + 1):
                     # Track LPIPS for averaging
                     lpips_loss_steps.append(loss_lpips)
 
+                t_lpips_end = time.time()
+                # Update LPIPS timing (only when LPIPS was computed)
+                if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
+                    lpips_time = t_lpips_end - t_lpips_start
+                    if timing_stats['lpips'] is None:
+                        timing_stats['lpips'] = lpips_time
+                    else:
+                        timing_stats['lpips'] = (1 - TIMING_EMA_ALPHA) * timing_stats['lpips'] + TIMING_EMA_ALPHA * lpips_time
+
                 # Weighted Sum (v4.6.6: Only 2 components - neighbor removed)
                 loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
                             (LPIPS_WEIGHT * loss_lpips)
@@ -477,11 +503,40 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
             loss = torch.stack(step_losses).mean()
 
+        t_forward_end = time.time()
+
+        t_backward_start = time.time()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
+        t_backward_end = time.time()
+
+        t_optimizer_start = time.time()
         scaler.step(optimizer)
         scaler.update()
+        t_optimizer_end = time.time()
+
+        # v4.6.6: Update timing statistics with EMA
+        data_time = t_data_end - t_step_start
+        forward_time = t_forward_end - t_forward_start
+        backward_time = t_backward_end - t_backward_start
+        optimizer_time = t_optimizer_end - t_optimizer_start
+        step_time = t_optimizer_end - t_step_start
+
+        if timing_stats['data_load'] is None:
+            # First step - initialize
+            timing_stats['data_load'] = data_time
+            timing_stats['forward'] = forward_time
+            timing_stats['backward'] = backward_time
+            timing_stats['optimizer'] = optimizer_time
+            timing_stats['step_total'] = step_time
+        else:
+            # EMA update
+            timing_stats['data_load'] = (1 - TIMING_EMA_ALPHA) * timing_stats['data_load'] + TIMING_EMA_ALPHA * data_time
+            timing_stats['forward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['forward'] + TIMING_EMA_ALPHA * forward_time
+            timing_stats['backward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward'] + TIMING_EMA_ALPHA * backward_time
+            timing_stats['optimizer'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer'] + TIMING_EMA_ALPHA * optimizer_time
+            timing_stats['step_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['step_total'] + TIMING_EMA_ALPHA * step_time
 
         # --- DIAGNOSTICS & LOGGING ---
         if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
@@ -497,6 +552,20 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
             else:
                 lpips_loss_avg = 0.0
+
+            # v4.6.6: Print timing summary
+            if timing_stats['step_total'] is not None:
+                throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
+                print(f"[Step {global_step}] Loss: {loss.item():.4f} | "
+                      f"{throughput:.2f} steps/s | "
+                      f"Total: {timing_stats['step_total']*1000:.1f}ms "
+                      f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
+                      f"Fwd: {timing_stats['forward']*1000:.0f}ms, "
+                      f"Bwd: {timing_stats['backward']*1000:.0f}ms, "
+                      f"Opt: {timing_stats['optimizer']*1000:.0f}ms"
+                      f"{f', LPIPS: {timing_stats[\"lpips\"]*1000:.0f}ms' if timing_stats['lpips'] is not None else ''})")
+            else:
+                print(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
             # Calculate Entropy (Uncertainty)
             with torch.no_grad():
@@ -531,7 +600,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
             if wandb:
-                wandb.log({
+                log_dict = {
                     # Core metrics
                     "train/loss": loss.item(),
                     "train/loss_texture": loss_texture.item(),
@@ -564,14 +633,33 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
                     "train/grad_norm": float(grad_norm),
                     # v4.6.5: seq_len and ar_len removed (constants: 20 and 0)
-                }, step=global_step)
+
+                    # v4.6.6: Timing & throughput metrics
+                    "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
+                    "timing/data_load_ms": timing_stats['data_load'] * 1000 if timing_stats['data_load'] else 0,
+                    "timing/forward_ms": timing_stats['forward'] * 1000 if timing_stats['forward'] else 0,
+                    "timing/backward_ms": timing_stats['backward'] * 1000 if timing_stats['backward'] else 0,
+                    "timing/optimizer_ms": timing_stats['optimizer'] * 1000 if timing_stats['optimizer'] else 0,
+                    "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0,
+                }
+
+                # Add LPIPS timing if available
+                if timing_stats['lpips'] is not None:
+                    log_dict["timing/lpips_ms"] = timing_stats['lpips'] * 1000
+
+                # Add AR validation timing if available
+                if timing_stats['ar_validation'] is not None:
+                    log_dict["timing/ar_validation_ms"] = timing_stats['ar_validation'] * 1000
+
+                wandb.log(log_dict, step=global_step)
 
         # Image Logs (Visual Confirmation)
         if global_step % IMAGE_LOG_STEPS == 0:
             log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
 
-        # v4.6.5: AR Validation 
+        # v4.6.5: AR Validation
         if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
+            t_ar_val_start = time.time()
             model.eval()
             with torch.no_grad(), autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
                 # Perform AR_VALIDATION_STEPS rollouts
@@ -647,6 +735,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
                 print(f"[Step {global_step}] Validation AR gap: {validation_ar_gap:.4f} (teacher: {avg_teacher_val_loss:.4f}, ar: {avg_ar_val_loss:.4f})")
 
             model.train()  # Return to training mode
+
+            t_ar_val_end = time.time()
+            ar_val_time = t_ar_val_end - t_ar_val_start
+            if timing_stats['ar_validation'] is None:
+                timing_stats['ar_validation'] = ar_val_time
+            else:
+                timing_stats['ar_validation'] = (1 - TIMING_EMA_ALPHA) * timing_stats['ar_validation'] + TIMING_EMA_ALPHA * ar_val_time
 
         # v4.6.6: Milestone Save (every 10k steps)
         if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:
