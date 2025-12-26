@@ -89,6 +89,7 @@ def main():
     p.add_argument("--context_npz", help="Optional preprocessed .npz providing initial tokens/actions")
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--scale", type=int, default=8)
+    p.add_argument("--warmup", type=int, default=20, help="Number of context frames to use for hidden state warmup (0 = no warmup)")
     p.add_argument("--key_look_gain", type=float, default=0.5, help="Arrow key look gain added to yaw/pitch")
     p.add_argument("--greedy", action="store_true", help="Use argmax decoding (no sampling)")
     p.add_argument("--temperature", type=float, default=1.05, help="Sampling temperature (>0); 1.0 ≈ unbiased")
@@ -135,29 +136,34 @@ def main():
         # We can use the efficient forward unroll since we just want the final state
         # Z_seq needs to be (1, K, H, W), A_seq (1, K, A)
         
-        # Limit to reasonable warmup length (e.g. 30 frames) to avoid wait
-        warmup_len = min(60, tokens_ctx.shape[0], actions_ctx.shape[0])
-        start_idx = 0 # or -warmup_len
+        # Use warmup from args (default 20 to match training seq_len)
+        warmup = min(args.warmup, tokens_ctx.shape[0], actions_ctx.shape[0]) if args.warmup > 0 else 0
+        start_idx = 0 # or -warmup
         
-        z_warmup = tokens_ctx[start_idx : start_idx+warmup_len].unsqueeze(0)
-        a_warmup = actions_ctx[start_idx : start_idx+warmup_len].unsqueeze(0)
+        z_warmup = tokens_ctx[start_idx : start_idx+warmup].unsqueeze(0)
+        a_warmup = actions_ctx[start_idx : start_idx+warmup].unsqueeze(0)
         
-        with torch.no_grad():
-            # model.forward returns logits, but we need the hidden state.
-            # model.forward unrolls but discards intermediate states unless we change it.
-            # Actually, model.forward calls model.init_state internally.
-            # We need to modify how we get the state out, or just loop step() manually.
-            # Looping step manually is safer to ensure we have the final h_state.
-            
-            print(f"Priming hidden state with {warmup_len} frames...")
-            for i in range(warmup_len):
-                z_t = z_warmup[:, i] # (1, H, W)
-                a_t = a_warmup[:, i] # (1, A)
-                _, h_state = model.step(z_t, a_t, h_state)
-        
-        # Set current token to the last one from context
-        current_z = z_warmup[:, -1]
-        print("State primed.")
+        if warmup > 0:
+            with torch.no_grad():
+                # model.forward returns logits, but we need the hidden state.
+                # model.forward unrolls but discards intermediate states unless we change it.
+                # Actually, model.forward calls model.init_state internally.
+                # We need to modify how we get the state out, or just loop step() manually.
+                # Looping step manually is safer to ensure we have the final h_state.
+
+                print(f"Priming hidden state with {warmup} frames...")
+                for i in range(warmup):
+                    z_t = z_warmup[:, i] # (1, H, W)
+                    a_t = a_warmup[:, i] # (1, A)
+                    _, h_state = model.step(z_t, a_t, h_state)
+
+            # Set current token to the last one from context
+            current_z = z_warmup[:, -1]
+            print("State primed.")
+        else:
+            # No warmup - use first frame from context
+            current_z = tokens_ctx[0:1]
+            print("⚠️ Warmup disabled (--warmup=0)")
 
     else:
         print("⚠️ No context provided — starting from random state")
