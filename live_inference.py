@@ -90,8 +90,6 @@ def main():
     p.add_argument("--context_npz", help="Optional preprocessed .npz providing initial tokens/actions")
     p.add_argument("--fps", type=int, default=8)
     p.add_argument("--scale", type=int, default=8)
-    p.add_argument("--no_mouse", action="store_true", help="Disable mouse look; use arrow keys instead")
-    p.add_argument("--mouse_sens", type=float, default=60.0, help="Divisor for mouse dx/dy → [-1,1]")
     p.add_argument("--key_look_gain", type=float, default=0.5, help="Arrow key look gain added to yaw/pitch")
     p.add_argument("--greedy", action="store_true", help="Use argmax decoding (no sampling)")
     p.add_argument("--temperature", type=float, default=1.05, help="Sampling temperature (>0); 1.0 ≈ unbiased")
@@ -175,6 +173,7 @@ def main():
     clock = pygame.time.Clock()
     pygame.font.init()
     hud_font = pygame.font.SysFont("Arial", max(10, int(10 * args.scale / 5)))
+    button_font = pygame.font.SysFont("Arial", max(14, int(14 * args.scale / 5)), bold=True)
 
     if not args.no_mouse:
         pygame.event.set_grab(True)
@@ -189,7 +188,7 @@ def main():
         
         # Arrow keys contribute to look regardless of mouse mode
         key_yaw = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
-        key_pitch = float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN])
+        key_pitch = float(keys[pygame.K_DOWN]) - float(keys[pygame.K_UP])
 
         if args.no_mouse:
             # Arrow-only look
@@ -205,6 +204,43 @@ def main():
         return [yaw, pitch, move_x, move_z, jump]
 
     print("🎮 W/A/S/D move • Space jump • Mouse/Arrows look • ESC/Q quit")
+
+    def draw_key_button(screen, x, y, w, h, label, is_pressed):
+        """Draw a button-like visualization for a key."""
+        # Colors
+        bg_color = (100, 200, 100) if is_pressed else (60, 60, 60)
+        border_color = (150, 255, 150) if is_pressed else (100, 100, 100)
+        text_color = (255, 255, 255)
+
+        # Draw button background
+        pygame.draw.rect(screen, bg_color, (x, y, w, h))
+        # Draw border
+        pygame.draw.rect(screen, border_color, (x, y, w, h), 2)
+
+        # Draw label
+        text_surf = button_font.render(label, True, text_color)
+        text_rect = text_surf.get_rect(center=(x + w//2, y + h//2))
+        screen.blit(text_surf, text_rect)
+
+    def draw_arrow_indicator(screen, x, y, direction, is_active):
+        """Draw an arrow indicator on screen edge."""
+        # direction: 'up', 'down', 'left', 'right'
+        size = max(20, int(20 * args.scale / 5))
+        color = (255, 200, 50) if is_active else (80, 80, 80)
+
+        # Define arrow points based on direction
+        if direction == 'up':
+            points = [(x, y - size), (x - size//2, y), (x + size//2, y)]
+        elif direction == 'down':
+            points = [(x, y + size), (x - size//2, y), (x + size//2, y)]
+        elif direction == 'left':
+            points = [(x - size, y), (x, y - size//2), (x, y + size//2)]
+        elif direction == 'right':
+            points = [(x + size, y), (x, y - size//2), (x, y + size//2)]
+
+        pygame.draw.polygon(screen, color, points)
+        # Add outline
+        pygame.draw.polygon(screen, (200, 200, 200) if is_active else (120, 120, 120), points, 2)
 
     running = True
     while running:
@@ -245,9 +281,59 @@ def main():
         if args.scale != 1:
             surf = pygame.transform.smoothscale(surf, (width, height))
         screen.blit(surf, (0, 0))
-        
+
+        # Draw HUD
         hud = f"Y:{act[0]:+.2f} P:{act[1]:+.2f} X:{act[2]:.0f} Z:{act[3]:.0f} J:{act[4]:.0f}"
         screen.blit(hud_font.render(hud, True, (255, 255, 255)), (10, 10))
+
+        # --- Draw WASD+Jump key visualizations ---
+        keys = pygame.key.get_pressed()
+        button_size = max(30, int(30 * args.scale / 5))
+        button_spacing = max(5, int(5 * args.scale / 5))
+
+        # Position in bottom-left area
+        base_x = 20
+        base_y = height - button_size * 3 - button_spacing * 2 - 20
+
+        # W key (top middle)
+        draw_key_button(screen, base_x + button_size + button_spacing, base_y,
+                       button_size, button_size, "W", keys[pygame.K_w])
+
+        # A key (middle left)
+        draw_key_button(screen, base_x, base_y + button_size + button_spacing,
+                       button_size, button_size, "A", keys[pygame.K_a])
+
+        # S key (middle middle)
+        draw_key_button(screen, base_x + button_size + button_spacing, base_y + button_size + button_spacing,
+                       button_size, button_size, "S", keys[pygame.K_s])
+
+        # D key (middle right)
+        draw_key_button(screen, base_x + (button_size + button_spacing) * 2, base_y + button_size + button_spacing,
+                       button_size, button_size, "D", keys[pygame.K_d])
+
+        # Space key (bottom, wide)
+        space_width = button_size * 3 + button_spacing * 2
+        draw_key_button(screen, base_x, base_y + (button_size + button_spacing) * 2,
+                       space_width, button_size, "JUMP", keys[pygame.K_SPACE])
+
+        # --- Draw camera direction arrows ---
+        # Yaw (horizontal camera movement) -> left/right arrows
+        # Pitch (vertical camera movement) -> up/down arrows
+        yaw, pitch = act[0], act[1]
+        threshold = 0.05  # Small threshold to avoid flickering on tiny movements
+
+        # Left arrow (left edge, middle)
+        draw_arrow_indicator(screen, 30, height // 2, 'left', yaw < -threshold)
+
+        # Right arrow (right edge, middle)
+        draw_arrow_indicator(screen, width - 30, height // 2, 'right', yaw > threshold)
+
+        # Up arrow (top edge, middle) - negative pitch = look up
+        draw_arrow_indicator(screen, width // 2, 30, 'up', pitch < -threshold)
+
+        # Down arrow (bottom edge, middle) - positive pitch = look down
+        draw_arrow_indicator(screen, width // 2, height - 30, 'down', pitch > threshold)
+
         pygame.display.flip()
         clock.tick(args.fps)
 
