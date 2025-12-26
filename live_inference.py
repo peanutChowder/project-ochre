@@ -5,8 +5,7 @@ Live interactive inference for the Ochre world model (VQ‑VAE + WorldModelConvF
 Controls:
   - W/A/S/D: movement (binary)
   - Space: jump (binary)
-  - Mouse move: yaw (dx) and pitch (dy) → normalized to [-1, 1]
-  - Arrow keys: look yaw/pitch 
+  - Arrow keys: look yaw/pitch → normalized to [-1, 1]
   - Esc or Q: quit
 """
 
@@ -175,35 +174,23 @@ def main():
     hud_font = pygame.font.SysFont("Arial", max(10, int(10 * args.scale / 5)))
     button_font = pygame.font.SysFont("Arial", max(14, int(14 * args.scale / 5)), bold=True)
 
-    if not args.no_mouse:
-        pygame.event.set_grab(True)
-        pygame.mouse.set_visible(False)
-        pygame.mouse.get_rel()  # reset relative motion accumulator
-
     def get_action_vec():
         keys = pygame.key.get_pressed()
         move_x = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
         move_z = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
         jump   = float(keys[pygame.K_SPACE])
-        
-        # Arrow keys contribute to look regardless of mouse mode
+
+        # Arrow keys for camera look
         key_yaw = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
         key_pitch = float(keys[pygame.K_DOWN]) - float(keys[pygame.K_UP])
 
-        if args.no_mouse:
-            # Arrow-only look
-            yaw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
-            pitch = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
-        else:
-            # Combine mouse and arrow key look
-            dx, dy = pygame.mouse.get_rel()
-            yaw = clamp((dx / args.mouse_sens) + (key_yaw * args.key_look_gain), -1.0, 1.0)
-            pitch = clamp((-dy / args.mouse_sens) + (key_pitch * args.key_look_gain), -1.0, 1.0)
-            
+        yaw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
+        pitch = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
+
         # Action vector: [yaw, pitch, move_x, move_z, jump]
         return [yaw, pitch, move_x, move_z, jump]
 
-    print("🎮 W/A/S/D move • Space jump • Mouse/Arrows look • ESC/Q quit")
+    print("🎮 W/A/S/D move • Space jump • Arrows look • ESC/Q quit")
 
     def draw_key_button(screen, x, y, w, h, label, is_pressed):
         """Draw a button-like visualization for a key."""
