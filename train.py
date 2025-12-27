@@ -815,18 +815,11 @@ while global_step < MAX_STEPS:
         if wandb:
             log_dict = {
                 # Core metrics
-
-                                    "train/loss": loss.item(),
-
-                                    "train/loss_teacher": loss_teacher.item(),  # v4.7.0
-
-                                    "train/loss_ar": loss_ar.item(),            # v4.7.0
-
-                                    "train/loss_texture": loss_texture.item(),
-
-                    
-
-                                    # v4.6.2: LPIPS perceptual loss (averaged across sequence)                "train/loss_lpips": lpips_loss_avg,
+                "train/loss": loss.item(),
+                "train/loss_teacher": loss_teacher.item(),  # v4.7.0
+                "train/loss_ar": loss_ar.item(),            # v4.7.0
+                "train/loss_texture": loss_texture.item(), 
+                "train/loss_lpips": lpips_loss_avg, # v4.6.2: LPIPS perceptual loss (averaged across sequence)
 
                 # v4.6.0: Gumbel-Softmax tau annealing
                 "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
