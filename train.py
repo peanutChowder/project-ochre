@@ -378,12 +378,16 @@ class GTTokenDataset(Dataset):
         Z_seq = tokens[start:start + self.seq_len]
         A_seq = actions[start:start + self.seq_len]
         Z_target_seq = tokens[start + 1:start + self.seq_len + 1]
-        
+
+        # Convert uint16 to int32 (PyTorch doesn't support uint16)
+        Z_seq_int = np.array(Z_seq, dtype=np.int32)
+        Z_target_int = np.array(Z_target_seq, dtype=np.int32)
+
         return (
-            torch.tensor(np.array(Z_seq), dtype=torch.long),        
-            torch.tensor(np.array(A_seq), dtype=torch.float32),     
-            torch.tensor(np.array(Z_target_seq), dtype=torch.long), 
-            idx, vid_idx, start                
+            torch.tensor(Z_seq_int, dtype=torch.long),
+            torch.tensor(np.array(A_seq), dtype=torch.float32),
+            torch.tensor(Z_target_int, dtype=torch.long),
+            idx, vid_idx, start
         )
 
 if wandb:
