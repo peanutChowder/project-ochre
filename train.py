@@ -448,7 +448,7 @@ model = WorldModelConvFiLM(
     zero_init_head=False  # Disable zero-init to prevent mode collapse at cold start
 ).to(DEVICE)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-scaler = GradScaler("cuda", enabled=(DEVICE == "cuda"))
+scaler = GradScaler(enabled=(DEVICE == "cuda"))
 
 # D. Setup Semantic Loss with loaded codebook
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)

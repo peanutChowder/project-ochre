@@ -385,7 +385,7 @@ def main():
         })
         wandb.watch(model, log="all") #type: ignore
 
-    scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
+    scaler = GradScaler(enabled=(device.type == 'cuda'))
     start_time = time.time()
     emergency_saved = False
 
