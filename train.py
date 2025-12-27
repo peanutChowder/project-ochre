@@ -487,6 +487,9 @@ def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
         # Periodic saves (every 10k steps if called manually)
         save_name = f"{MODEL_OUT_PREFIX}-step{global_step}.pt"
 
+    # Ensure checkpoint directory exists
+    os.makedirs("./checkpoints", exist_ok=True)
+
     save_path = f"./checkpoints/{save_name}"
     print(f"💾 Saving checkpoint to {save_path}")
     torch.save({
@@ -728,8 +731,6 @@ while global_step < MAX_STEPS:
         print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
         print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
 
-    total_loss += loss.item()
-        
     # Periodic Logs
     if global_step % LOG_STEPS == 0:
         # v4.6.6: Calculate LPIPS average
