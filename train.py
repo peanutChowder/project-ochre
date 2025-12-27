@@ -17,6 +17,10 @@ from torch.amp.grad_scaler import GradScaler
 from torch.utils.checkpoint import checkpoint
 from torchvision.utils import make_grid
 
+# World Model and VQ-VAE imports (required for standalone execution)
+from vq_vae.vq_vae import VQVAE
+from model_convGru import WorldModelConvFiLM
+
 try:
     import wandb
 except ImportError:
@@ -30,8 +34,8 @@ except ImportError:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- PATHS (UPDATE THESE) ---
-DATA_DIR = "/kaggle/input/gamefactorylatents/preprocessedv4"
-VQVAE_PATH = "/kaggle/input/vq-vae-64x64/pytorch/v1.0.1-epoch10/7/vqvae_v2.1.6__epoch100.pt" 
+DATA_DIR = "../preprocessedv4"
+VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt" 
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
