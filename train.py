@@ -12,8 +12,7 @@ import os, time, json, math, numpy as np, torch, random
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import autocast
-from torch.amp.grad_scaler import GradScaler
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.checkpoint import checkpoint
 from torchvision.utils import make_grid
 
