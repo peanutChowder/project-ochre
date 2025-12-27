@@ -4,7 +4,7 @@
 
 set -e  # Exit on error
 
-echo "🚀 Installing dependencies..."
+echo "🚀 Installing dependencies"
 
 # Detect CUDA version
 if command -v nvcc &> /dev/null; then
@@ -16,15 +16,16 @@ else
 fi
 
 # Install PyTorch based on CUDA version
+# CUDA 12.x requires PyTorch 2.2.0+
 if [[ "$CUDA_VERSION" == "11.8"* ]]; then
-    echo "📦 Installing PyTorch for CUDA 11.8..."
+    echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
     pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
-elif [[ "$CUDA_VERSION" == "12.1"* ]] || [[ "$CUDA_VERSION" == "12.2"* ]]; then
-    echo "📦 Installing PyTorch for CUDA 12.1..."
-    pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+elif [[ "$CUDA_VERSION" == "12."* ]]; then
+    echo "📦 Installing PyTorch 2.2.0 for CUDA 12.x (compatible with $CUDA_VERSION)..."
+    pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 else
-    echo "📦 Installing PyTorch (auto-detect CUDA)..."
-    pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0
+    echo "📦 Installing PyTorch 2.2.0 (auto-detect CUDA)..."
+    pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0
 fi
 
 # Install other dependencies (matching Kaggle setup)
