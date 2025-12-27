@@ -21,11 +21,11 @@ from torchvision.utils import make_grid
 from vq_vae.vq_vae import VQVAE
 from model_convGru import WorldModelConvFiLM
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-    print("WARNING: wandb not found, logging disabled.")
+import wandb
+if 'WANDB_API_KEY' in os.environ:
+    wandb.login(key=os.environ['WANDB_API_KEY'])
+else:
+    raise Exception("No wandb key found")
 
 
 # ==========================================
@@ -451,15 +451,13 @@ semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
 print(f"Semantic Loss Initialized with codebook shape {codebook.shape}")
 
 # E. Setup LPIPS Perceptual Loss (v4.6.0)
-try:
-    import lpips
-    lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE)
-    lpips_criterion.eval()  # Frozen, only for loss computation
-    lpips_criterion.requires_grad_(False)
-    print(f"✅ LPIPS Loss Initialized (AlexNet backend)")
-except ImportError:
-    print("⚠️  LPIPS not installed, will skip perceptual loss")
-    lpips_criterion = None
+
+import lpips
+lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE)
+lpips_criterion.eval()  # Frozen, only for loss computation
+lpips_criterion.requires_grad_(False)
+print(f"✅ LPIPS Loss Initialized (AlexNet backend)")
+
 
 # F. Resume Logic
 global_step = 0
