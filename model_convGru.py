@@ -38,17 +38,22 @@ class ConvGRUCell(nn.Module):
 class ActionFiLM(nn.Module):
     """
     Produces FiLM (gamma, beta) per ConvGRU layer from a low-dim action vector.
+
+    v4.7.0: Increased internal MLP hidden dimension to 512 (was same as hidden_dim=256)
+    to strengthen action conditioning. Camera rotations require complex geometric mappings.
     """
     def __init__(self, action_dim: int, hidden_dim: int, n_layers: int):
         super().__init__()
         self.n_layers = n_layers
         self.mlps = nn.ModuleList()
+        # v4.7.0: Use larger internal MLP hidden dim for stronger action encoding
+        film_internal_dim = 512  # Increased from hidden_dim (256) for better action capacity
         for _ in range(n_layers):
             self.mlps.append(
                 nn.Sequential(
-                    nn.Linear(action_dim, hidden_dim),
+                    nn.Linear(action_dim, film_internal_dim),
                     nn.SiLU(),
-                    nn.Linear(hidden_dim, 2 * hidden_dim),
+                    nn.Linear(film_internal_dim, 2 * hidden_dim),
                 )
             )
 

@@ -57,22 +57,22 @@ BASE_SEQ_LEN = 20               # v4.5.1 OOM fix: Increased from 16 to accommoda
 MAX_SEQ_LEN = 50                # Keep same
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
 
-# v4.6.6: Single-step AR mix for noise robustness (cost-efficient alternative to full AR)
-CURRICULUM_AR = False            # Disabled: teacher-forced training only
-AR_START_STEP = 0
-AR_RAMP_STEPS = 10000
-AR_ROLLOUT_MAX = 0              # v4.6.6: Disabled during training (was 25)
+# v4.7.0: Restore v4.6.4 AR curriculum (fixes action conditioning via exposure to AR rollout)
+CURRICULUM_AR = True             # Re-enabled: AR rollout during training
+AR_START_STEP = 5000            # v4.6.4: Start AR after model stabilizes
+AR_RAMP_STEPS = 10000           # v4.6.4: Ramp AR length gradually
+AR_ROLLOUT_MAX = 25             # v4.6.4: Maximum AR rollout length (restored from v4.6.6's 0)
 AR_VALIDATION_FREQ = 500        # v4.6.6: Validate AR every N steps
 AR_VALIDATION_STEPS = 5         # v4.6.6: Number of AR rollouts per validation
 
 # v4.6.6: Single-step AR mix for noise robustness (Option 2 from efficient-ar-robustness.md)
 AR_MIX_ENABLED = True           # Enable occasional AR step during training
-AR_MIX_PROB = 0.05              # 5% of steps use previous prediction (~0.5% overhead)   
+AR_MIX_PROB = 0.05              # 5% of steps use previous prediction (~0.5% overhead)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.6.7-step0"
-MODEL_OUT_PREFIX = "ochre-v4.6.7"
+RUN_NAME = "v4.7.0-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -163,6 +163,184 @@ def log_images_to_wandb(vqvae, Z_target, logits, global_step):
         wandb.log({
             "visuals/reconstruction": wandb.Image(grid_np, caption=f"Left: GT | Right: Pred (Step {global_step})")
         }, step=global_step)
+
+
+def log_ar_rollout_to_wandb(model, vqvae, Z_seq, A_seq, Z_target, global_step, ar_len):
+    """
+    v4.7.0: Enhanced AR rollout visualization.
+    Displays GT vs AR predictions at current AR rollout length to catch action conditioning issues early.
+
+    Args:
+        model: World model
+        vqvae: VQ-VAE decoder
+        Z_seq: (B, K, H, W) input token sequence
+        A_seq: (B, K, A) action sequence (ground truth from context)
+        Z_target: (B, K, H, W) target token sequence
+        global_step: Current training step
+        ar_len: Current AR rollout length
+    """
+    if wandb is None or ar_len == 0: return
+
+    with torch.no_grad():
+        B, K, H, W = Z_seq.shape
+        device = Z_seq.device
+
+        # Use first sample from batch for visualization
+        z_seq = Z_seq[0:1]  # (1, K, H, W)
+        a_seq = A_seq[0:1]  # (1, K, A)
+        z_target = Z_target[0:1]  # (1, K, H, W)
+
+        # Pre-compute embeddings and FiLM for efficiency
+        X_seq = model.compute_embeddings(z_seq)
+        Gammas_seq, Betas_seq = model.compute_film(a_seq)
+
+        # Determine where AR rollout starts (last ar_len frames)
+        ar_start = K - ar_len
+
+        # Teacher-forced warmup (frames 0 to ar_start-1)
+        h_state = model.init_state(1, device=device)
+        for t in range(ar_start):
+            x_t = X_seq[:, t]
+            g_t = Gammas_seq[:, :, t]
+            b_t = Betas_seq[:, :, t]
+            _, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=g_t, betas_t=b_t)
+
+        # AR rollout (frames ar_start to K-1)
+        ar_pred_frames = []
+        gt_frames = []
+        x_prev = X_seq[:, ar_start-1] if ar_start > 0 else X_seq[:, 0]
+
+        for t in range(ar_start, K):
+            g_t = Gammas_seq[:, :, t]
+            b_t = Betas_seq[:, :, t]
+
+            # AR prediction
+            logits_t, h_state = model.step(None, None, h_state, x_t=x_prev, gammas_t=g_t, betas_t=b_t)
+            pred_tokens = logits_t.argmax(dim=1)  # (1, H, W)
+
+            # Decode predictions and GT
+            pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
+            gt_rgb = vqvae.decode_code(z_target[:, t])[0]  # (3, IMG_H, IMG_W)
+
+            ar_pred_frames.append(pred_rgb.cpu())
+            gt_frames.append(gt_rgb.cpu())
+
+            # Update for next step
+            x_prev = model._embed_tokens(pred_tokens)
+
+        # Create visualization: show every 5th frame or all if < 5
+        num_ar_frames = len(ar_pred_frames)
+        if num_ar_frames <= 5:
+            # Show all frames
+            indices = list(range(num_ar_frames))
+        else:
+            # Show evenly spaced frames (first, middle points, last)
+            indices = [0, num_ar_frames//4, num_ar_frames//2, 3*num_ar_frames//4, num_ar_frames-1]
+
+        # Build interleaved GT/Pred grid
+        vis_frames = []
+        for idx in indices:
+            gt_frame = torch.clamp(gt_frames[idx], 0.0, 1.0)
+            pred_frame = torch.clamp(ar_pred_frames[idx], 0.0, 1.0)
+            vis_frames.append(gt_frame)
+            vis_frames.append(pred_frame)
+
+        vis_tensor = torch.stack(vis_frames, dim=0)
+        grid = make_grid(vis_tensor, nrow=2, normalize=False, value_range=(0, 1), padding=2)
+        grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        wandb.log({
+            "visuals/ar_rollout": wandb.Image(
+                grid_np,
+                caption=f"AR Rollout (len={ar_len}) | Left: GT | Right: AR Pred | Step {global_step}"
+            )
+        }, step=global_step)
+
+
+def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_step):
+    """
+    v4.7.0: Action-specific validation to catch action conditioning failures.
+    Tests model response to different action types: static, camera movements, player movement.
+
+    Args:
+        model: World model
+        vqvae: VQ-VAE decoder
+        Z_seq: (B, K, H, W) input token sequence
+        A_seq: (B, K, A) action sequence
+        Z_target: (B, K, H, W) target token sequence
+        global_step: Current training step
+
+    Returns:
+        dict: Metrics for different action conditions
+    """
+    if wandb is None: return {}
+
+    with torch.no_grad():
+        device = Z_seq.device
+        # Use first sample
+        z_start = Z_seq[0:1, 0]  # (1, H, W) - starting frame
+        x_start = model._embed_tokens(z_start)
+        h_start = model.init_state(1, device=device)
+
+        # Action format: [yaw, pitch, move_x, move_z, action_5] (5-dim)
+        # Test different action conditions
+        test_actions = {
+            'static': torch.zeros(1, 5, device=device),  # No movement
+            'camera_left': torch.tensor([[0.5, 0.0, 0.0, 0.0, 0.0]], device=device),  # Yaw left
+            'camera_right': torch.tensor([[-0.5, 0.0, 0.0, 0.0, 0.0]], device=device),  # Yaw right
+            'move_forward': torch.tensor([[0.0, 0.0, 0.0, 0.5, 0.0]], device=device),  # Forward
+        }
+
+        # Predict from same starting state with different actions
+        predictions = {}
+        for action_name, action_vec in test_actions.items():
+            # Get FiLM parameters for this action
+            gammas, betas = model.film(action_vec)  # (L, 1, C, 1, 1)
+
+            # Single-step prediction
+            logits, _ = model.step(None, None, h_start, x_t=x_start, gammas_t=gammas, betas_t=betas)
+            pred_tokens = logits.argmax(dim=1)  # (1, H, W)
+            pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
+
+            predictions[action_name] = pred_rgb.cpu()
+
+        # Visualize: show all action-conditioned predictions side-by-side
+        vis_frames = []
+        for action_name in ['static', 'camera_left', 'camera_right', 'move_forward']:
+            pred_frame = torch.clamp(predictions[action_name], 0.0, 1.0)
+            vis_frames.append(pred_frame)
+
+        vis_tensor = torch.stack(vis_frames, dim=0)
+        grid = make_grid(vis_tensor, nrow=4, normalize=False, value_range=(0, 1), padding=2)
+        grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        wandb.log({
+            "visuals/action_conditioning": wandb.Image(
+                grid_np,
+                caption=f"Action Test | Static | Camera L | Camera R | Move Fwd | Step {global_step}"
+            )
+        }, step=global_step)
+
+        # Compute diversity metrics: how different are action-conditioned predictions?
+        static_pred = predictions['static'].flatten()
+        camera_l_pred = predictions['camera_left'].flatten()
+        camera_r_pred = predictions['camera_right'].flatten()
+        move_fwd_pred = predictions['move_forward'].flatten()
+
+        # L2 distance between predictions (higher = better action response)
+        diff_camera_l = (static_pred - camera_l_pred).pow(2).mean().sqrt().item()
+        diff_camera_r = (static_pred - camera_r_pred).pow(2).mean().sqrt().item()
+        diff_move_fwd = (static_pred - move_fwd_pred).pow(2).mean().sqrt().item()
+
+        # Average action response magnitude
+        action_response = (diff_camera_l + diff_camera_r + diff_move_fwd) / 3
+
+        return {
+            'action_response/camera_left_diff': diff_camera_l,
+            'action_response/camera_right_diff': diff_camera_r,
+            'action_response/move_forward_diff': diff_move_fwd,
+            'action_response/average': action_response,
+        }
 
 
 class GTTokenDataset(Dataset):
@@ -656,6 +834,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
         # Image Logs (Visual Confirmation)
         if global_step % IMAGE_LOG_STEPS == 0:
             log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
+            # v4.7.0: Also log AR rollout visualization when AR is active
+            if ar_len > 0:
+                log_ar_rollout_to_wandb(model, vqvae_model, Z_seq, A_seq, Z_target, global_step, ar_len)
+            # v4.7.0: Action conditioning validation
+            action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, A_seq, Z_target, global_step)
+            if wandb and action_metrics:
+                wandb.log(action_metrics, step=global_step)
 
         # v4.6.5: AR Validation
         if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
