@@ -30,7 +30,7 @@ fi
 
 # Install other dependencies (matching Kaggle setup)
 echo "📦 Installing core dependencies..."
-pip install webdataset tqdm numpy pillow lpips
+pip install "numpy<2.0" webdataset tqdm pillow lpips
 
 echo "📦 Installing wandb..."
 pip install wandb==0.22.3

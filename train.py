@@ -33,6 +33,8 @@ else:
 # ==========================================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+print("Device:", DEVICE)
+
 # --- PATHS ---
 DATA_DIR = "../preprocessedv4/preprocessedv4"
 VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt" 
@@ -40,9 +42,9 @@ MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
 BATCH_SIZE = 28
-EPOCHS = 50
-LR = 3e-5             
-WARMUP_STEPS = 500   
+MAX_STEPS = 200000  # v4.7.0: Step-based training (replaces EPOCHS)
+LR = 3e-5
+WARMUP_STEPS = 500
 MIN_LR = 1e-6         
 USE_CHECKPOINTING = False 
 
@@ -393,7 +395,7 @@ class GTTokenDataset(Dataset):
 
 if wandb:
     wandb.init(project=PROJECT, name=RUN_NAME, resume="allow",
-                config=dict(batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS))
+                config=dict(batch_size=BATCH_SIZE, lr=LR, max_steps=MAX_STEPS))
 
 # A. Load VQ-VAE (Frozen) for Loss & Vis
 print(f"📥 Loading VQ-VAE from {VQVAE_PATH}...")
@@ -465,30 +467,29 @@ print(f"✅ LPIPS Loss Initialized (AlexNet backend)")
 
 # F. Resume Logic
 global_step = 0
-start_epoch = 1
 if RESUME_PATH and os.path.exists(RESUME_PATH):
-    print(f" Resuming training from {RESUME_PATH}")
+    print(f"📥 Resuming training from {RESUME_PATH}")
     ckpt = torch.load(RESUME_PATH, map_location=DEVICE)
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    start_epoch = ckpt["epoch"] + 1
     global_step = ckpt.get("global_step", 0)
+    print(f"✅ Resumed from step {global_step}")
+else:
+    print("✨ ---- Starting fresh training run ---- ")
 
-def save_checkpoint(epoch, global_step, is_emergency=False, is_milestone=False):
-    # v4.6.6: Step-based naming instead of epoch-based
+def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
+    # v4.7.0: Step-based checkpointing (epoch removed)
     if is_emergency:
         save_name = f"{MODEL_OUT_PREFIX}-step{global_step}-emergency.pt"
     elif is_milestone:
-        # Milestone saves every 10k steps
         save_name = f"{MODEL_OUT_PREFIX}-step{global_step}.pt"
     else:
-        # End of epoch saves (legacy, less important)
-        save_name = f"{MODEL_OUT_PREFIX}-epoch{epoch}.pt"
+        # Periodic saves (every 10k steps if called manually)
+        save_name = f"{MODEL_OUT_PREFIX}-step{global_step}.pt"
 
     save_path = f"/kaggle/working/{save_name}"
-    print(f"⏰ Saving checkpoint to {save_path}")
+    print(f"💾 Saving checkpoint to {save_path}")
     torch.save({
-        "epoch": epoch,
         "global_step": global_step,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -533,420 +534,419 @@ def compute_curriculum_params(step):
 prev_seq_len, prev_ar_len = compute_curriculum_params(global_step)
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                    num_workers=4, pin_memory=True, persistent_workers=True)  # v4.5.2: Keep workers alive
+                    num_workers=4, pin_memory=True, persistent_workers=True)
 loader_iter = iter(loader)
 print(f"Initial Curriculum: seq_len={prev_seq_len}, ar_len={prev_ar_len}")
+print(f"Training target: {MAX_STEPS:,} steps")
 
-for epoch in range(start_epoch, EPOCHS + 1):
-    model.train()
-    total_loss = 0.0
+model.train()
 
-    # Infinite batch loop (dataloader reloads when curriculum changes)
-    while True:
-        # Check if curriculum needs update
-        seq_len, ar_len = compute_curriculum_params(global_step)
+# v4.7.0: Step-based training loop (no epochs)
+while global_step < MAX_STEPS:
+    # Check if curriculum needs update
+    seq_len, ar_len = compute_curriculum_params(global_step)
 
-        if seq_len != prev_seq_len:
-            print(f"Curriculum changed: seq_len {prev_seq_len}->{seq_len}, ar_len {prev_ar_len}->{ar_len}")
-            prev_seq_len, prev_ar_len = seq_len, ar_len
-            # Reload dataset and dataloader
-            dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
-            if len(dataset) == 0:
-                print("WARNING: Empty dataset, breaking epoch")
-                break
-            loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=4, pin_memory=True, persistent_workers=True)  # v4.5.2: Keep workers alive
-            loader_iter = iter(loader)
-
-        # Get next batch
-        t_step_start = time.time()
-        try:
-            batch = next(loader_iter)
-        except StopIteration:
-            # Epoch complete
+    if seq_len != prev_seq_len:
+        print(f"📚 Curriculum changed: seq_len {prev_seq_len}->{seq_len}, ar_len {prev_ar_len}->{ar_len}")
+        prev_seq_len, prev_ar_len = seq_len, ar_len
+        # Reload dataset and dataloader
+        dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
+        if len(dataset) == 0:
+            print("⚠️ WARNING: Empty dataset, stopping training")
             break
+        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=4, pin_memory=True, persistent_workers=True)
+        loader_iter = iter(loader)
 
-        t_data_end = time.time()
-        Z_seq, A_seq, Z_target, _, _, _ = batch
-        Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
-        B, K, H, W = Z_seq.shape
-        step_losses = []
+    # Get next batch
+    t_step_start = time.time()
+    try:
+        batch = next(loader_iter)
+    except StopIteration:
+        # Dataloader exhausted, restart it (infinite training)
+        loader_iter = iter(loader)
+        batch = next(loader_iter)
 
-        # LR Warmup
-        if global_step <= WARMUP_STEPS:
-            new_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
-            for pg in optimizer.param_groups: pg['lr'] = new_lr
+    t_data_end = time.time()
+    Z_seq, A_seq, Z_target, _, _, _ = batch
+    Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
+    B, K, H, W = Z_seq.shape
+    step_losses = []
 
-        optimizer.zero_grad()
+    # LR Warmup
+    if global_step <= WARMUP_STEPS:
+        new_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
+        for pg in optimizer.param_groups: pg['lr'] = new_lr
 
-        # Embeddings & FiLM
-        X_seq = model.compute_embeddings(Z_seq)
-        Gammas_seq, Betas_seq = model.compute_film(A_seq)
-        h_state = model.init_state(B, device=DEVICE)
+    optimizer.zero_grad()
 
-        # v4.6.6: Primarily teacher-forced with occasional single-step AR mix
-        # AR rollout moved to validation-only (see AR validation section below)
+    # Embeddings & FiLM
+    X_seq = model.compute_embeddings(Z_seq)
+    Gammas_seq, Betas_seq = model.compute_film(A_seq)
+    h_state = model.init_state(B, device=DEVICE)
 
-        step_losses = []         # Loss per timestep
-        lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
-        logits_last = None
-        prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
-        ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
+    # v4.6.6: Primarily teacher-forced with occasional single-step AR mix
+    # AR rollout moved to validation-only (see AR validation section below)
 
-        t_forward_start = time.time()
-        with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
-            # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
-            ar_cutoff = K  # All steps are teacher-forced
+    step_losses = []         # Loss per timestep
+    lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
+    logits_last = None
+    prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
+    ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
-            for t in range(K):
-                # v4.6.6: Single-step AR mix for noise robustness
-                use_ar_step = (AR_MIX_ENABLED and
-                               t > 0 and
-                               prev_pred_tokens is not None and
-                               random.random() < AR_MIX_PROB)
+    t_forward_start = time.time()
+    with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
+        # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
+        ar_cutoff = K  # All steps are teacher-forced
 
-                if use_ar_step:
-                    # Use previous prediction (detached to prevent gradient backprop through time)
-                    with torch.no_grad():
-                        x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
-                    ar_mix_count += 1
-                else:
-                    # Normal teacher forcing (ground truth)
-                    x_in = X_seq[:, t]
+        for t in range(K):
+            # v4.6.6: Single-step AR mix for noise robustness
+            use_ar_step = (AR_MIX_ENABLED and
+                           t > 0 and
+                           prev_pred_tokens is not None and
+                           random.random() < AR_MIX_PROB)
 
-                # Step
-                g_t = Gammas_seq[:, :, t]
-                b_t = Betas_seq[:, :, t]
-
-                if USE_CHECKPOINTING:
-                    logits_t, h_state = checkpoint(model.step, torch.tensor(0, device=DEVICE), torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
-                else:
-                    logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-
-                logits_last = logits_t
-
-                # v4.6.6: Store prediction for potential next AR step
+            if use_ar_step:
+                # Use previous prediction (detached to prevent gradient backprop through time)
                 with torch.no_grad():
-                    prev_pred_tokens = logits_t.argmax(dim=1).detach()
-
-                # --- LOSS CALCULATION (v4.6.5: Optimized) ---
-                # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
-                logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                target_flat = Z_target[:, t].reshape(-1)
-                loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
-
-                # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
-                loss_lpips = torch.tensor(0.0, device=DEVICE)
-                t_lpips_start = time.time()
-                if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
-                    # v4.6.2 FIX: Use Gumbel-Softmax for differentiable token selection
-                    # Reuse same tau as semantic loss for consistency
-                    tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
-
-                    # Get soft token probabilities (differentiable)
-                    logits_flat_lpips = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))  # (B*H*W, C)
-                    probs = F.gumbel_softmax(logits_flat_lpips, tau=tau, hard=False, dim=-1)  # (B*H*W, C)
-                    probs = probs.reshape(logits_t.size(0), logits_t.size(2), logits_t.size(3), -1)  # (B, H, W, C)
-
-                    # Soft embedding lookup: weighted sum over VQ-VAE codebook
-                    # codebook is already transposed (K, D) from line 295
-                    soft_embeddings = torch.matmul(probs, codebook)  # (B, H, W, D)
-                    soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, D, H, W)
-
-                    # Decode soft embeddings directly (gradients flow!)
-                    pred_rgb = vqvae_model.decoder(soft_embeddings)  # (B, 3, 128, 72)
-
-                    # Target (no gradients needed)
-                    with torch.no_grad():
-                        target_tokens = Z_target[:, t]  # (B, H, W)
-                        target_rgb = vqvae_model.decode_code(target_tokens)  # (B, 3, 128, 72)
-
-                    # LPIPS expects inputs in [-1, 1] range
-                    pred_rgb_norm = pred_rgb * 2.0 - 1.0
-                    target_rgb_norm = target_rgb * 2.0 - 1.0
-
-                    # Compute perceptual loss (gradients now flow through entire chain!)
-                    loss_lpips = lpips_criterion(pred_rgb_norm, target_rgb_norm).mean()
-
-                    # Track LPIPS for averaging
-                    lpips_loss_steps.append(loss_lpips)
-
-                t_lpips_end = time.time()
-                # Update LPIPS timing (only when LPIPS was computed)
-                if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
-                    lpips_time = t_lpips_end - t_lpips_start
-                    if timing_stats['lpips'] is None:
-                        timing_stats['lpips'] = lpips_time
-                    else:
-                        timing_stats['lpips'] = (1 - TIMING_EMA_ALPHA) * timing_stats['lpips'] + TIMING_EMA_ALPHA * lpips_time
-
-                # Weighted Sum (v4.6.6: Only 2 components - neighbor removed)
-                loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
-                            (LPIPS_WEIGHT * loss_lpips)
-                step_losses.append(loss_step)
-
-            loss = torch.stack(step_losses).mean()
-
-        t_forward_end = time.time()
-
-        t_backward_start = time.time()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
-        t_backward_end = time.time()
-
-        t_optimizer_start = time.time()
-        scaler.step(optimizer)
-        scaler.update()
-        t_optimizer_end = time.time()
-
-        # v4.6.6: Update timing statistics with EMA
-        data_time = t_data_end - t_step_start
-        forward_time = t_forward_end - t_forward_start
-        backward_time = t_backward_end - t_backward_start
-        optimizer_time = t_optimizer_end - t_optimizer_start
-        step_time = t_optimizer_end - t_step_start
-
-        if timing_stats['data_load'] is None:
-            # First step - initialize
-            timing_stats['data_load'] = data_time
-            timing_stats['forward'] = forward_time
-            timing_stats['backward'] = backward_time
-            timing_stats['optimizer'] = optimizer_time
-            timing_stats['step_total'] = step_time
-        else:
-            # EMA update
-            timing_stats['data_load'] = (1 - TIMING_EMA_ALPHA) * timing_stats['data_load'] + TIMING_EMA_ALPHA * data_time
-            timing_stats['forward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['forward'] + TIMING_EMA_ALPHA * forward_time
-            timing_stats['backward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward'] + TIMING_EMA_ALPHA * backward_time
-            timing_stats['optimizer'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer'] + TIMING_EMA_ALPHA * optimizer_time
-            timing_stats['step_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['step_total'] + TIMING_EMA_ALPHA * step_time
-
-        # --- DIAGNOSTICS & LOGGING ---
-        if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
-            print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
-            print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
-
-        total_loss += loss.item()
-        
-        # Periodic Logs
-        if global_step % LOG_STEPS == 0:
-            # v4.6.6: Calculate LPIPS average
-            if len(lpips_loss_steps) > 0:
-                lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
+                    x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
+                ar_mix_count += 1
             else:
-                lpips_loss_avg = 0.0
+                # Normal teacher forcing (ground truth)
+                x_in = X_seq[:, t]
 
-            # v4.6.6: Print timing summary
-            if timing_stats['step_total'] is not None:
-                throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
-                print(f"[Step {global_step}] Loss: {loss.item():.4f} | "
-                      f"{throughput:.2f} steps/s | "
-                      f"Total: {timing_stats['step_total']*1000:.1f}ms "
-                      f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
-                      f"Fwd: {timing_stats['forward']*1000:.0f}ms, "
-                      f"Bwd: {timing_stats['backward']*1000:.0f}ms, "
-                      f"Opt: {timing_stats['optimizer']*1000:.0f}ms"
-                      f"{', LPIPS: ' + str(int(timing_stats['lpips']*1000)) + 'ms' if timing_stats['lpips'] is not None else ''})")
+            # Step
+            g_t = Gammas_seq[:, :, t]
+            b_t = Betas_seq[:, :, t]
+
+            if USE_CHECKPOINTING:
+                logits_t, h_state = checkpoint(model.step, torch.tensor(0, device=DEVICE), torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
             else:
-                print(f"[Step {global_step}] Loss: {loss.item():.4f}")
+                logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
 
-            # Calculate Entropy (Uncertainty)
+            logits_last = logits_t
+
+            # v4.6.6: Store prediction for potential next AR step
             with torch.no_grad():
-                if logits_last is not None:
-                    probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
-                    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
-                    confidence = probs.max(dim=1)[0].mean()
-                    unique_codes = logits_last.argmax(dim=1).unique().numel()
+                prev_pred_tokens = logits_t.argmax(dim=1).detach()
 
-                    # v4.5: NEW Spatial Gradient Magnitude (sharpness proxy)
-                    spatial_grad_x = (logits_last[:, :, :, 1:] - logits_last[:, :, :, :-1]).abs().mean()
-                    spatial_grad_y = (logits_last[:, :, 1:, :] - logits_last[:, :, :-1, :]).abs().mean()
-                    spatial_gradient = (spatial_grad_x + spatial_grad_y) / 2
+            # --- LOSS CALCULATION (v4.6.5: Optimized) ---
+            # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
+            logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+            target_flat = Z_target[:, t].reshape(-1)
+            loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
 
-                    # v4.5: NEW Confidence distribution stats
-                    top1_conf = probs.max(dim=1)[0]
-                    confidence_std = top1_conf.std()
-                    confidence_min = top1_conf.min()
+            # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
+            loss_lpips = torch.tensor(0.0, device=DEVICE)
+            t_lpips_start = time.time()
+            if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
+                # v4.6.2 FIX: Use Gumbel-Softmax for differentiable token selection
+                # Reuse same tau as semantic loss for consistency
+                tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
+
+                # Get soft token probabilities (differentiable)
+                logits_flat_lpips = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))  # (B*H*W, C)
+                probs = F.gumbel_softmax(logits_flat_lpips, tau=tau, hard=False, dim=-1)  # (B*H*W, C)
+                probs = probs.reshape(logits_t.size(0), logits_t.size(2), logits_t.size(3), -1)  # (B, H, W, C)
+
+                # Soft embedding lookup: weighted sum over VQ-VAE codebook
+                # codebook is already transposed (K, D) from line 295
+                soft_embeddings = torch.matmul(probs, codebook)  # (B, H, W, D)
+                soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, D, H, W)
+
+                # Decode soft embeddings directly (gradients flow!)
+                pred_rgb = vqvae_model.decoder(soft_embeddings)  # (B, 3, 128, 72)
+
+                # Target (no gradients needed)
+                with torch.no_grad():
+                    target_tokens = Z_target[:, t]  # (B, H, W)
+                    target_rgb = vqvae_model.decode_code(target_tokens)  # (B, 3, 128, 72)
+
+                # LPIPS expects inputs in [-1, 1] range
+                pred_rgb_norm = pred_rgb * 2.0 - 1.0
+                target_rgb_norm = target_rgb * 2.0 - 1.0
+
+                # Compute perceptual loss (gradients now flow through entire chain!)
+                loss_lpips = lpips_criterion(pred_rgb_norm, target_rgb_norm).mean()
+
+                # Track LPIPS for averaging
+                lpips_loss_steps.append(loss_lpips)
+
+            t_lpips_end = time.time()
+            # Update LPIPS timing (only when LPIPS was computed)
+            if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
+                lpips_time = t_lpips_end - t_lpips_start
+                if timing_stats['lpips'] is None:
+                    timing_stats['lpips'] = lpips_time
                 else:
-                    # Fallback values for first step
-                    entropy = torch.tensor(0.0)
-                    confidence = torch.tensor(0.0)
-                    unique_codes = 0
-                    spatial_gradient = torch.tensor(0.0)
-                    confidence_std = torch.tensor(0.0)
-                    confidence_min = torch.tensor(0.0)
+                    timing_stats['lpips'] = (1 - TIMING_EMA_ALPHA) * timing_stats['lpips'] + TIMING_EMA_ALPHA * lpips_time
 
-                # Action responsiveness diagnostics
-                # v4.6.5: Use FiLM magnitude as proxy (removed expensive perturbation test)
-                gamma_magnitude = Gammas_seq.abs().mean().item()
-                beta_magnitude = Betas_seq.abs().mean().item()
-                action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
+            # Weighted Sum (v4.6.6: Only 2 components - neighbor removed)
+            loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
+                        (LPIPS_WEIGHT * loss_lpips)
+            step_losses.append(loss_step)
 
-            if wandb:
-                log_dict = {
-                    # Core metrics
-                    "train/loss": loss.item(),
-                    "train/loss_texture": loss_texture.item(),
+        loss = torch.stack(step_losses).mean()
 
-                    # v4.6.2: LPIPS perceptual loss (averaged across sequence)
-                    "train/loss_lpips": lpips_loss_avg,
+    t_forward_end = time.time()
 
-                    # v4.6.0: Gumbel-Softmax tau annealing
-                    "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
+    t_backward_start = time.time()
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
+    t_backward_end = time.time()
 
-                    # v4.6.6: AR mix diagnostics
-                    "ar_mix/enabled": 1.0 if AR_MIX_ENABLED else 0.0,
-                    "ar_mix/probability": AR_MIX_PROB if AR_MIX_ENABLED else 0.0,
-                    "ar_mix/actual_frequency": ar_mix_count / K if K > 0 else 0.0,
+    t_optimizer_start = time.time()
+    scaler.step(optimizer)
+    scaler.update()
+    t_optimizer_end = time.time()
 
-                    # Action diagnostics
-                    "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
-                    "action_diagnostics/film_beta_magnitude": beta_magnitude,
-                    "action_diagnostics/sensitivity": action_sensitivity,
+    # v4.6.6: Update timing statistics with EMA
+    data_time = t_data_end - t_step_start
+    forward_time = t_forward_end - t_forward_start
+    backward_time = t_backward_end - t_backward_start
+    optimizer_time = t_optimizer_end - t_optimizer_start
+    step_time = t_optimizer_end - t_step_start
 
-                    # Existing diagnostics
-                    "diagnostics/entropy": entropy.item(),
-                    "diagnostics/confidence": confidence.item(),
-                    "diagnostics/unique_codes": unique_codes,
+    if timing_stats['data_load'] is None:
+        # First step - initialize
+        timing_stats['data_load'] = data_time
+        timing_stats['forward'] = forward_time
+        timing_stats['backward'] = backward_time
+        timing_stats['optimizer'] = optimizer_time
+        timing_stats['step_total'] = step_time
+    else:
+        # EMA update
+        timing_stats['data_load'] = (1 - TIMING_EMA_ALPHA) * timing_stats['data_load'] + TIMING_EMA_ALPHA * data_time
+        timing_stats['forward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['forward'] + TIMING_EMA_ALPHA * forward_time
+        timing_stats['backward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward'] + TIMING_EMA_ALPHA * backward_time
+        timing_stats['optimizer'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer'] + TIMING_EMA_ALPHA * optimizer_time
+        timing_stats['step_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['step_total'] + TIMING_EMA_ALPHA * step_time
 
-                    # v4.5: NEW diagnostics
-                    "diagnostics/spatial_gradient": spatial_gradient.item(),
-                    "diagnostics/confidence_std": confidence_std.item(),
-                    "diagnostics/confidence_min": confidence_min.item(),
+    # --- DIAGNOSTICS & LOGGING ---
+    if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
+        print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
+        print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
 
-                    "train/grad_norm": float(grad_norm),
-                    # v4.6.5: seq_len and ar_len removed (constants: 20 and 0)
+    total_loss += loss.item()
+        
+    # Periodic Logs
+    if global_step % LOG_STEPS == 0:
+        # v4.6.6: Calculate LPIPS average
+        if len(lpips_loss_steps) > 0:
+            lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
+        else:
+            lpips_loss_avg = 0.0
 
-                    # v4.6.6: Timing & throughput metrics
-                    "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
-                    "timing/data_load_ms": timing_stats['data_load'] * 1000 if timing_stats['data_load'] else 0,
-                    "timing/forward_ms": timing_stats['forward'] * 1000 if timing_stats['forward'] else 0,
-                    "timing/backward_ms": timing_stats['backward'] * 1000 if timing_stats['backward'] else 0,
-                    "timing/optimizer_ms": timing_stats['optimizer'] * 1000 if timing_stats['optimizer'] else 0,
-                    "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0,
-                }
+        # v4.6.6: Print timing summary
+        if timing_stats['step_total'] is not None:
+            throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
+            print(f"[Step {global_step}] Loss: {loss.item():.4f} | "
+                  f"{throughput:.2f} steps/s | "
+                  f"Total: {timing_stats['step_total']*1000:.1f}ms "
+                  f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
+                  f"Fwd: {timing_stats['forward']*1000:.0f}ms, "
+                  f"Bwd: {timing_stats['backward']*1000:.0f}ms, "
+                  f"Opt: {timing_stats['optimizer']*1000:.0f}ms"
+                  f"{', LPIPS: ' + str(int(timing_stats['lpips']*1000)) + 'ms' if timing_stats['lpips'] is not None else ''})")
+        else:
+            print(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
-                # Add LPIPS timing if available
-                if timing_stats['lpips'] is not None:
-                    log_dict["timing/lpips_ms"] = timing_stats['lpips'] * 1000
+        # Calculate Entropy (Uncertainty)
+        with torch.no_grad():
+            if logits_last is not None:
+                probs = F.softmax(logits_last.float(), dim=1) # (B, C, H, W)
+                entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=1).mean()
+                confidence = probs.max(dim=1)[0].mean()
+                unique_codes = logits_last.argmax(dim=1).unique().numel()
 
-                # Add AR validation timing if available
-                if timing_stats['ar_validation'] is not None:
-                    log_dict["timing/ar_validation_ms"] = timing_stats['ar_validation'] * 1000
+                # v4.5: NEW Spatial Gradient Magnitude (sharpness proxy)
+                spatial_grad_x = (logits_last[:, :, :, 1:] - logits_last[:, :, :, :-1]).abs().mean()
+                spatial_grad_y = (logits_last[:, :, 1:, :] - logits_last[:, :, :-1, :]).abs().mean()
+                spatial_gradient = (spatial_grad_x + spatial_grad_y) / 2
 
-                wandb.log(log_dict, step=global_step)
-
-        # Image Logs (Visual Confirmation)
-        if global_step % IMAGE_LOG_STEPS == 0:
-            log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
-            # v4.7.0: Also log AR rollout visualization when AR is active
-            if ar_len > 0:
-                log_ar_rollout_to_wandb(model, vqvae_model, Z_seq, A_seq, Z_target, global_step, ar_len)
-            # v4.7.0: Action conditioning validation
-            action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, A_seq, Z_target, global_step)
-            if wandb and action_metrics:
-                wandb.log(action_metrics, step=global_step)
-
-        # v4.6.5: AR Validation
-        if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
-            t_ar_val_start = time.time()
-            model.eval()
-            with torch.no_grad(), autocast('cuda' if DEVICE == "cuda" else 'cpu'):
-                # Perform AR_VALIDATION_STEPS rollouts
-                validation_ar_losses = []
-                validation_teacher_losses = []
-
-                for _ in range(AR_VALIDATION_STEPS):
-                    # Use current batch for validation
-                    val_X_seq = X_seq
-                    val_h_state = model.init_state(B, device=DEVICE)
-
-                    # Teacher-forced pass (ground truth)
-                    teacher_val_losses = []
-                    for t in range(K):
-                        x_in = val_X_seq[:, t]
-                        g_t = Gammas_seq[:, :, t]
-                        b_t = Betas_seq[:, :, t]
-
-                        logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-
-                        # Compute loss
-                        logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                        target_flat = Z_target[:, t].reshape(-1)
-                        loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
-                        teacher_val_losses.append(loss_t)
-
-                    teacher_val_loss = torch.stack(teacher_val_losses).mean()
-                    validation_teacher_losses.append(teacher_val_loss)
-
-                    # AR rollout pass (autoregressive)
-                    val_h_state = model.init_state(B, device=DEVICE)
-                    ar_val_losses = []
-                    x_prev = val_X_seq[:, 0]  # Start with first GT frame
-
-                    for t in range(K):
-                        g_t = Gammas_seq[:, :, t]
-                        b_t = Betas_seq[:, :, t]
-
-                        # First frame uses GT, rest use predictions
-                        if t == 0:
-                            x_in = val_X_seq[:, t]
-                        else:
-                            x_in = x_prev
-
-                        logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-
-                        # Compute loss
-                        logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                        target_flat = Z_target[:, t].reshape(-1)
-                        loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
-                        ar_val_losses.append(loss_t)
-
-                        # Use prediction for next step
-                        z_pred = logits_t.argmax(dim=1)
-                        x_prev = model._embed_tokens(z_pred)
-
-                    ar_val_loss = torch.stack(ar_val_losses).mean()
-                    validation_ar_losses.append(ar_val_loss)
-
-                # Average across validation rollouts
-                avg_teacher_val_loss = torch.stack(validation_teacher_losses).mean().item()
-                avg_ar_val_loss = torch.stack(validation_ar_losses).mean().item()
-                validation_ar_gap = avg_ar_val_loss - avg_teacher_val_loss
-
-                # Log validation metrics
-                if wandb:
-                    wandb.log({
-                        "validation/teacher_loss": avg_teacher_val_loss,
-                        "validation/ar_loss": avg_ar_val_loss,
-                        "validation/ar_loss_gap": validation_ar_gap,
-                    }, step=global_step)
-
-                print(f"[Step {global_step}] Validation AR gap: {validation_ar_gap:.4f} (teacher: {avg_teacher_val_loss:.4f}, ar: {avg_ar_val_loss:.4f})")
-
-            model.train()  # Return to training mode
-
-            t_ar_val_end = time.time()
-            ar_val_time = t_ar_val_end - t_ar_val_start
-            if timing_stats['ar_validation'] is None:
-                timing_stats['ar_validation'] = ar_val_time
+                # v4.5: NEW Confidence distribution stats
+                top1_conf = probs.max(dim=1)[0]
+                confidence_std = top1_conf.std()
+                confidence_min = top1_conf.min()
             else:
-                timing_stats['ar_validation'] = (1 - TIMING_EMA_ALPHA) * timing_stats['ar_validation'] + TIMING_EMA_ALPHA * ar_val_time
+                # Fallback values for first step
+                entropy = torch.tensor(0.0)
+                confidence = torch.tensor(0.0)
+                unique_codes = 0
+                spatial_gradient = torch.tensor(0.0)
+                confidence_std = torch.tensor(0.0)
+                confidence_min = torch.tensor(0.0)
 
-        # v4.6.6: Milestone Save (every 10k steps)
-        if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:
-            save_checkpoint(epoch, global_step, is_milestone=True)
+            # Action responsiveness diagnostics
+            # v4.6.5: Use FiLM magnitude as proxy (removed expensive perturbation test)
+            gamma_magnitude = Gammas_seq.abs().mean().item()
+            beta_magnitude = Betas_seq.abs().mean().item()
+            action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
-        # Emergency Save (time-based)
-        if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
-            save_checkpoint(epoch, global_step, is_emergency=True)
-            last_emergency_save_time = time.time()
+        if wandb:
+            log_dict = {
+                # Core metrics
+                "train/loss": loss.item(),
+                "train/loss_texture": loss_texture.item(),
 
-        global_step += 1
+                # v4.6.2: LPIPS perceptual loss (averaged across sequence)
+                "train/loss_lpips": lpips_loss_avg,
 
-    print(f"Epoch {epoch}: mean loss {total_loss / len(loader):.4f}")
-    save_checkpoint(epoch, global_step)
+                # v4.6.0: Gumbel-Softmax tau annealing
+                "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
+                # v4.6.6: AR mix diagnostics
+                "ar_mix/enabled": 1.0 if AR_MIX_ENABLED else 0.0,
+                "ar_mix/probability": AR_MIX_PROB if AR_MIX_ENABLED else 0.0,
+                "ar_mix/actual_frequency": ar_mix_count / K if K > 0 else 0.0,
+
+                # Action diagnostics
+                "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
+                "action_diagnostics/film_beta_magnitude": beta_magnitude,
+                "action_diagnostics/sensitivity": action_sensitivity,
+
+                # Existing diagnostics
+                "diagnostics/entropy": entropy.item(),
+                "diagnostics/confidence": confidence.item(),
+                "diagnostics/unique_codes": unique_codes,
+
+                # v4.5: NEW diagnostics
+                "diagnostics/spatial_gradient": spatial_gradient.item(),
+                "diagnostics/confidence_std": confidence_std.item(),
+                "diagnostics/confidence_min": confidence_min.item(),
+
+                "train/grad_norm": float(grad_norm),
+                # v4.6.5: seq_len and ar_len removed (constants: 20 and 0)
+
+                # v4.6.6: Timing & throughput metrics
+                "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
+                "timing/data_load_ms": timing_stats['data_load'] * 1000 if timing_stats['data_load'] else 0,
+                "timing/forward_ms": timing_stats['forward'] * 1000 if timing_stats['forward'] else 0,
+                "timing/backward_ms": timing_stats['backward'] * 1000 if timing_stats['backward'] else 0,
+                "timing/optimizer_ms": timing_stats['optimizer'] * 1000 if timing_stats['optimizer'] else 0,
+                "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0,
+            }
+
+            # Add LPIPS timing if available
+            if timing_stats['lpips'] is not None:
+                log_dict["timing/lpips_ms"] = timing_stats['lpips'] * 1000
+
+            # Add AR validation timing if available
+            if timing_stats['ar_validation'] is not None:
+                log_dict["timing/ar_validation_ms"] = timing_stats['ar_validation'] * 1000
+
+            wandb.log(log_dict, step=global_step)
+
+    # Image Logs (Visual Confirmation)
+    if global_step % IMAGE_LOG_STEPS == 0:
+        log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
+        # v4.7.0: Also log AR rollout visualization when AR is active
+        if ar_len > 0:
+            log_ar_rollout_to_wandb(model, vqvae_model, Z_seq, A_seq, Z_target, global_step, ar_len)
+        # v4.7.0: Action conditioning validation
+        action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, A_seq, Z_target, global_step)
+        if wandb and action_metrics:
+            wandb.log(action_metrics, step=global_step)
+
+    # v4.6.5: AR Validation
+    if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
+        t_ar_val_start = time.time()
+        model.eval()
+        with torch.no_grad(), autocast('cuda' if DEVICE == "cuda" else 'cpu'):
+            # Perform AR_VALIDATION_STEPS rollouts
+            validation_ar_losses = []
+            validation_teacher_losses = []
+
+            for _ in range(AR_VALIDATION_STEPS):
+                # Use current batch for validation
+                val_X_seq = X_seq
+                val_h_state = model.init_state(B, device=DEVICE)
+
+                # Teacher-forced pass (ground truth)
+                teacher_val_losses = []
+                for t in range(K):
+                    x_in = val_X_seq[:, t]
+                    g_t = Gammas_seq[:, :, t]
+                    b_t = Betas_seq[:, :, t]
+
+                    logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+
+                    # Compute loss
+                    logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                    target_flat = Z_target[:, t].reshape(-1)
+                    loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+                    teacher_val_losses.append(loss_t)
+
+                teacher_val_loss = torch.stack(teacher_val_losses).mean()
+                validation_teacher_losses.append(teacher_val_loss)
+
+                # AR rollout pass (autoregressive)
+                val_h_state = model.init_state(B, device=DEVICE)
+                ar_val_losses = []
+                x_prev = val_X_seq[:, 0]  # Start with first GT frame
+
+                for t in range(K):
+                    g_t = Gammas_seq[:, :, t]
+                    b_t = Betas_seq[:, :, t]
+
+                    # First frame uses GT, rest use predictions
+                    if t == 0:
+                        x_in = val_X_seq[:, t]
+                    else:
+                        x_in = x_prev
+
+                    logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+
+                    # Compute loss
+                    logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                    target_flat = Z_target[:, t].reshape(-1)
+                    loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+                    ar_val_losses.append(loss_t)
+
+                    # Use prediction for next step
+                    z_pred = logits_t.argmax(dim=1)
+                    x_prev = model._embed_tokens(z_pred)
+
+                ar_val_loss = torch.stack(ar_val_losses).mean()
+                validation_ar_losses.append(ar_val_loss)
+
+            # Average across validation rollouts
+            avg_teacher_val_loss = torch.stack(validation_teacher_losses).mean().item()
+            avg_ar_val_loss = torch.stack(validation_ar_losses).mean().item()
+            validation_ar_gap = avg_ar_val_loss - avg_teacher_val_loss
+
+            # Log validation metrics
+            if wandb:
+                wandb.log({
+                    "validation/teacher_loss": avg_teacher_val_loss,
+                    "validation/ar_loss": avg_ar_val_loss,
+                    "validation/ar_loss_gap": validation_ar_gap,
+                }, step=global_step)
+
+            print(f"[Step {global_step}] Validation AR gap: {validation_ar_gap:.4f} (teacher: {avg_teacher_val_loss:.4f}, ar: {avg_ar_val_loss:.4f})")
+
+        model.train()  # Return to training mode
+
+        t_ar_val_end = time.time()
+        ar_val_time = t_ar_val_end - t_ar_val_start
+        if timing_stats['ar_validation'] is None:
+            timing_stats['ar_validation'] = ar_val_time
+        else:
+            timing_stats['ar_validation'] = (1 - TIMING_EMA_ALPHA) * timing_stats['ar_validation'] + TIMING_EMA_ALPHA * ar_val_time
+
+    # v4.6.6: Milestone Save (every 10k steps)
+    if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:
+        save_checkpoint(global_step, is_milestone=True)
+
+    # Emergency Save (time-based)
+    if (time.time() - last_emergency_save_time) > EMERGENCY_SAVE_INTERVAL_HRS * 3600:
+        save_checkpoint(global_step, is_emergency=True)
+        last_emergency_save_time = time.time()
+
+    global_step += 1
+
+# Training complete
+print(f"🎉 Training complete! Reached {global_step} steps (target: {MAX_STEPS})")
+save_checkpoint(global_step, is_milestone=True)
 if wandb: wandb.finish()
-print("Training complete.")

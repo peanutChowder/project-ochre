@@ -565,6 +565,7 @@ train.py
 - Restored v4.6.4 AR curriculum: `CURRICULUM_AR=True`, `AR_ROLLOUT_MAX=25`, gradual ramp 5k-15k steps
 - Enhanced logging: `log_ar_rollout_to_wandb()` shows GT vs predictions after AR
 - Action validation metrics: `action_response/camera_left_diff`, `action_response/camera_right_diff`, `action_response/move_forward_diff`
+- Step-based training: Removed epoch loop, replaced `EPOCHS=50` with `MAX_STEPS=200000`, infinite dataloader restart
 
 model_convGru.py
 - FiLM capacity: Internal MLP hidden dim 256 -> 512 for stronger action encoding
