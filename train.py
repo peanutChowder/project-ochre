@@ -487,7 +487,7 @@ def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
         # Periodic saves (every 10k steps if called manually)
         save_name = f"{MODEL_OUT_PREFIX}-step{global_step}.pt"
 
-    save_path = f"/kaggle/working/{save_name}"
+    save_path = f"./checkpoints/{save_name}"
     print(f"💾 Saving checkpoint to {save_path}")
     torch.save({
         "global_step": global_step,
