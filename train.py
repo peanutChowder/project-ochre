@@ -42,7 +42,7 @@ MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
 BATCH_SIZE = 32
-MAX_STEPS = 100000  # v4.7.0: Step-based training (replaces EPOCHS)
+MAX_STEPS = 50_000  # v4.7.0: Step-based training (replaces EPOCHS)
 LR = 3e-5
 WARMUP_STEPS = 500
 MIN_LR = 1e-6         
@@ -58,16 +58,18 @@ LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flas
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
 
 # --- CURRICULUM ---
-CURRICULUM_SEQ_LEN = False      # Keep disabled (GPU memory risk)
-BASE_SEQ_LEN = 20               # v4.5.1 OOM fix: Increased from 16 to accommodate AR rollout
-MAX_SEQ_LEN = 50                # Keep same
-SEQ_LEN_INCREASE_STEPS = 5000   # Not used (SEQ_LEN disabled)
+# v4.7.0: seq_len curriculum removed - seq_len dynamically grows with ar_len
+# Live inference uses CTX_LEN=6, so training seq_len doesn't need to match
+BASE_SEQ_LEN = 20               # Minimum sequence length (will grow to ar_len + 1)
+CURRICULUM_SEQ_LEN = False      # Disabled (seq_len now auto-adjusts to AR curriculum)
+MAX_SEQ_LEN = 50                # Not used
+SEQ_LEN_INCREASE_STEPS = 5000   # Not used
 
-# v4.7.0: Restore v4.6.4 AR curriculum (fixes action conditioning via exposure to AR rollout)
+# v4.7.0: AR curriculum (fixes action conditioning via exposure to AR rollout)
 CURRICULUM_AR = True             # Re-enabled: AR rollout during training
-AR_START_STEP = 5000            # v4.6.4: Start AR after model stabilizes
-AR_RAMP_STEPS = 10000           # v4.6.4: Ramp AR length gradually
-AR_ROLLOUT_MAX = 25             # v4.6.4: Maximum AR rollout length (restored from v4.6.6's 0)
+AR_START_STEP = 5000            # Start AR after model stabilizes
+AR_RAMP_STEPS = 10000           # Ramp AR length gradually
+AR_ROLLOUT_MAX = 25             # Maximum AR rollout length (seq_len will grow to accommodate this)
 
 # v4.6.6: Single-step AR mix for noise robustness (Option 2 from efficient-ar-robustness.md)
 AR_MIX_ENABLED = True           # Enable occasional AR step during training
@@ -518,14 +520,11 @@ def compute_curriculum_params(step):
         progress = max(0.0, min(1.0, progress))
         ar_len = int(progress * AR_ROLLOUT_MAX)
 
-    # v4.5 OOM fix: Lock seq_len to BASE_SEQ_LEN to prevent memory growth
-    # Previous logic allowed seq_len to grow with ar_len, causing OOM
-    current_base = BASE_SEQ_LEN
-    if CURRICULUM_SEQ_LEN:
-        current_base = min(BASE_SEQ_LEN + (step // SEQ_LEN_INCREASE_STEPS), MAX_SEQ_LEN)
+    # v4.7.0: seq_len dynamically grows to accommodate AR rollout
+    # Need at least 1 teacher-forced step + ar_len AR steps
+    # Live inference uses CTX_LEN=6 (independent of training seq_len)
+    seq_len = max(BASE_SEQ_LEN, ar_len + 1)  # Always allow full AR rollout
 
-    seq_len = current_base  # Fixed at BASE_SEQ_LEN (16)
-    ar_len = min(ar_len, seq_len - 1)  # Cap ar_len to seq_len - 1
     if ar_len < 0: ar_len = 0
 
     return seq_len, ar_len

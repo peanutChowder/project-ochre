@@ -566,7 +566,8 @@ train.py
 - Real-time Monitoring: Added `train/loss_teacher` vs `train/loss_ar` and component-specific `grad/film_norm` vs `grad/dynamics_norm`
 - Validation Update: Removed offline AR validation loop (speedup); added explicit `ar_len` logging
 - Action Metrics: `action_response/camera_left_diff` etc. to verify FiLM efficacy
-- Step-based training: Removed epoch loop, replaced `EPOCHS=50` with `MAX_STEPS=100000`
+- Step-based training: Removed epoch loop in favour of step-based
+- seq_len deprecation: Made AR len override seq_len which previously capped max AR to 19.
 
 model_convGru.py
 - FiLM capacity: Internal MLP hidden dim 256 -> 512 for stronger action encoding
