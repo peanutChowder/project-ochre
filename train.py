@@ -15,6 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.checkpoint import checkpoint
 from torchvision.utils import make_grid
+from torch import autocast
 
 # World Model and VQ-VAE imports (required for standalone execution)
 from vq_vae.vq_vae import VQVAE
@@ -593,7 +594,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
         t_forward_start = time.time()
-        with autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
+        with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
             # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
             ar_cutoff = K  # All steps are teacher-forced
 
@@ -851,7 +852,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
             t_ar_val_start = time.time()
             model.eval()
-            with torch.no_grad(), autocast(device_type="cuda", enabled=(DEVICE == "cuda")):
+            with torch.no_grad(), autocast('cuda' if DEVICE == "cuda" else 'cpu'):
                 # Perform AR_VALIDATION_STEPS rollouts
                 validation_ar_losses = []
                 validation_teacher_losses = []
