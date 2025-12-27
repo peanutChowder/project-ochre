@@ -41,8 +41,8 @@ VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
-BATCH_SIZE = 28
-MAX_STEPS = 200000  # v4.7.0: Step-based training (replaces EPOCHS)
+BATCH_SIZE = 32
+MAX_STEPS = 100000  # v4.7.0: Step-based training (replaces EPOCHS)
 LR = 3e-5
 WARMUP_STEPS = 500
 MIN_LR = 1e-6         
@@ -68,8 +68,6 @@ CURRICULUM_AR = True             # Re-enabled: AR rollout during training
 AR_START_STEP = 5000            # v4.6.4: Start AR after model stabilizes
 AR_RAMP_STEPS = 10000           # v4.6.4: Ramp AR length gradually
 AR_ROLLOUT_MAX = 25             # v4.6.4: Maximum AR rollout length (restored from v4.6.6's 0)
-AR_VALIDATION_FREQ = 500        # v4.6.6: Validate AR every N steps
-AR_VALIDATION_STEPS = 5         # v4.6.6: Number of AR rollouts per validation
 
 # v4.6.6: Single-step AR mix for noise robustness (Option 2 from efficient-ar-robustness.md)
 AR_MIX_ENABLED = True           # Enable occasional AR step during training
@@ -510,7 +508,6 @@ timing_stats = {
     'lpips': None,           # LPIPS computation time
     'backward': None,        # Backward pass time
     'optimizer': None,       # Optimizer step time
-    'ar_validation': None,   # AR validation time
 }
 
 # Helper function to compute curriculum params
@@ -592,6 +589,8 @@ while global_step < MAX_STEPS:
     # AR rollout moved to validation-only (see AR validation section below)
 
     step_losses = []         # Loss per timestep
+    teacher_losses = []      # v4.7.0: Track teacher-forcing losses
+    ar_losses = []           # v4.7.0: Track autoregressive losses
     lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
     logits_last = None
     prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
@@ -599,21 +598,28 @@ while global_step < MAX_STEPS:
 
     t_forward_start = time.time()
     with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
-        # v4.6.6: ar_len always 0 (teacher-forced only, except AR mix)
-        ar_cutoff = K  # All steps are teacher-forced
+        # v4.7.0: Restore AR curriculum - use ar_len to determine AR rollout
+        ar_cutoff = K - ar_len  # Steps [0, ar_cutoff) are teacher-forced, [ar_cutoff, K) are AR
 
         for t in range(K):
-            # v4.6.6: Single-step AR mix for noise robustness
-            use_ar_step = (AR_MIX_ENABLED and
-                           t > 0 and
-                           prev_pred_tokens is not None and
-                           random.random() < AR_MIX_PROB)
+            # Determine input source based on AR curriculum and AR mix
+            use_ar_rollout = (t >= ar_cutoff and t > 0 and prev_pred_tokens is not None)
 
-            if use_ar_step:
+            # v4.6.6: Single-step AR mix for noise robustness (independent of curriculum)
+            use_ar_mix = (AR_MIX_ENABLED and
+                          t > 0 and
+                          t < ar_cutoff and  # Only apply AR mix in teacher-forced region
+                          prev_pred_tokens is not None and
+                          random.random() < AR_MIX_PROB)
+            
+            is_ar_step = use_ar_rollout or use_ar_mix
+
+            if is_ar_step:
                 # Use previous prediction (detached to prevent gradient backprop through time)
                 with torch.no_grad():
                     x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
-                ar_mix_count += 1
+                if use_ar_mix:
+                    ar_mix_count += 1
             else:
                 # Normal teacher forcing (ground truth)
                 x_in = X_seq[:, t]
@@ -688,14 +694,35 @@ while global_step < MAX_STEPS:
             loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
                         (LPIPS_WEIGHT * loss_lpips)
             step_losses.append(loss_step)
+            if is_ar_step:
+                ar_losses.append(loss_step)
+            else:
+                teacher_losses.append(loss_step)
 
         loss = torch.stack(step_losses).mean()
+        
+        # v4.7.0: Compute split losses for logging
+        loss_teacher = torch.stack(teacher_losses).mean() if teacher_losses else torch.tensor(0.0, device=DEVICE)
+        loss_ar = torch.stack(ar_losses).mean() if ar_losses else torch.tensor(0.0, device=DEVICE)
 
     t_forward_end = time.time()
 
     t_backward_start = time.time()
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
+    
+    # v4.7.0: Track specific gradient norms (FiLM vs Dynamics)
+    grad_film = 0.0
+    grad_dynamics = 0.0
+    if global_step % LOG_STEPS == 0:
+        film_params = [p for n, p in model.named_parameters() if ("film" in n or "action" in n) and p.grad is not None]
+        dynamics_params = [p for n, p in model.named_parameters() if ("film" not in n and "action" not in n) and p.grad is not None]
+        
+        if film_params:
+            grad_film = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in film_params]), 2).item()
+        if dynamics_params:
+            grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params]), 2).item()
+
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
     t_backward_end = time.time()
 
@@ -785,19 +812,26 @@ while global_step < MAX_STEPS:
             beta_magnitude = Betas_seq.abs().mean().item()
             action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
-        if wandb:
-            log_dict = {
-                # Core metrics
-                "train/loss": loss.item(),
-                "train/loss_texture": loss_texture.item(),
-
-                # v4.6.2: LPIPS perceptual loss (averaged across sequence)
-                "train/loss_lpips": lpips_loss_avg,
+                    if wandb:
+                    log_dict = {
+                        # Core metrics
+                        "train/loss": loss.item(),
+                        "train/loss_teacher": loss_teacher.item(),  # v4.7.0
+                        "train/loss_ar": loss_ar.item(),            # v4.7.0
+                        "train/loss_texture": loss_texture.item(),
+        
+                        # v4.6.2: LPIPS perceptual loss (averaged across sequence)                "train/loss_lpips": lpips_loss_avg,
 
                 # v4.6.0: Gumbel-Softmax tau annealing
                 "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
-                # v4.6.6: AR mix diagnostics
+                # v4.7.0: AR curriculum diagnostics (restored from v4.6.4)
+                "curriculum/seq_len": seq_len,
+                "curriculum/ar_len": ar_len,
+                "ar_len": ar_len,  # Explicit root-level logging (requested)
+                "curriculum/ar_cutoff": ar_cutoff,
+
+                # v4.6.6: AR mix diagnostics (independent of curriculum)
                 "ar_mix/enabled": 1.0 if AR_MIX_ENABLED else 0.0,
                 "ar_mix/probability": AR_MIX_PROB if AR_MIX_ENABLED else 0.0,
                 "ar_mix/actual_frequency": ar_mix_count / K if K > 0 else 0.0,
@@ -818,7 +852,8 @@ while global_step < MAX_STEPS:
                 "diagnostics/confidence_min": confidence_min.item(),
 
                 "train/grad_norm": float(grad_norm),
-                # v4.6.5: seq_len and ar_len removed (constants: 20 and 0)
+                "grad/film_norm": grad_film,           # v4.7.0
+                "grad/dynamics_norm": grad_dynamics,   # v4.7.0
 
                 # v4.6.6: Timing & throughput metrics
                 "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
@@ -833,10 +868,6 @@ while global_step < MAX_STEPS:
             if timing_stats['lpips'] is not None:
                 log_dict["timing/lpips_ms"] = timing_stats['lpips'] * 1000
 
-            # Add AR validation timing if available
-            if timing_stats['ar_validation'] is not None:
-                log_dict["timing/ar_validation_ms"] = timing_stats['ar_validation'] * 1000
-
             wandb.log(log_dict, step=global_step)
 
     # Image Logs (Visual Confirmation)
@@ -849,92 +880,6 @@ while global_step < MAX_STEPS:
         action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, A_seq, Z_target, global_step)
         if wandb and action_metrics:
             wandb.log(action_metrics, step=global_step)
-
-    # v4.6.5: AR Validation
-    if global_step % AR_VALIDATION_FREQ == 0 and global_step > 0:
-        t_ar_val_start = time.time()
-        model.eval()
-        with torch.no_grad(), autocast('cuda' if DEVICE == "cuda" else 'cpu'):
-            # Perform AR_VALIDATION_STEPS rollouts
-            validation_ar_losses = []
-            validation_teacher_losses = []
-
-            for _ in range(AR_VALIDATION_STEPS):
-                # Use current batch for validation
-                val_X_seq = X_seq
-                val_h_state = model.init_state(B, device=DEVICE)
-
-                # Teacher-forced pass (ground truth)
-                teacher_val_losses = []
-                for t in range(K):
-                    x_in = val_X_seq[:, t]
-                    g_t = Gammas_seq[:, :, t]
-                    b_t = Betas_seq[:, :, t]
-
-                    logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-
-                    # Compute loss
-                    logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                    target_flat = Z_target[:, t].reshape(-1)
-                    loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
-                    teacher_val_losses.append(loss_t)
-
-                teacher_val_loss = torch.stack(teacher_val_losses).mean()
-                validation_teacher_losses.append(teacher_val_loss)
-
-                # AR rollout pass (autoregressive)
-                val_h_state = model.init_state(B, device=DEVICE)
-                ar_val_losses = []
-                x_prev = val_X_seq[:, 0]  # Start with first GT frame
-
-                for t in range(K):
-                    g_t = Gammas_seq[:, :, t]
-                    b_t = Betas_seq[:, :, t]
-
-                    # First frame uses GT, rest use predictions
-                    if t == 0:
-                        x_in = val_X_seq[:, t]
-                    else:
-                        x_in = x_prev
-
-                    logits_t, val_h_state = model.step(None, None, val_h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
-
-                    # Compute loss
-                    logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-                    target_flat = Z_target[:, t].reshape(-1)
-                    loss_t = semantic_criterion(logits_flat, target_flat, global_step=global_step)
-                    ar_val_losses.append(loss_t)
-
-                    # Use prediction for next step
-                    z_pred = logits_t.argmax(dim=1)
-                    x_prev = model._embed_tokens(z_pred)
-
-                ar_val_loss = torch.stack(ar_val_losses).mean()
-                validation_ar_losses.append(ar_val_loss)
-
-            # Average across validation rollouts
-            avg_teacher_val_loss = torch.stack(validation_teacher_losses).mean().item()
-            avg_ar_val_loss = torch.stack(validation_ar_losses).mean().item()
-            validation_ar_gap = avg_ar_val_loss - avg_teacher_val_loss
-
-            # Log validation metrics
-            if wandb:
-                wandb.log({
-                    "validation/teacher_loss": avg_teacher_val_loss,
-                    "validation/ar_loss": avg_ar_val_loss,
-                    "validation/ar_loss_gap": validation_ar_gap,
-                }, step=global_step)
-
-            print(f"[Step {global_step}] Validation AR gap: {validation_ar_gap:.4f} (teacher: {avg_teacher_val_loss:.4f}, ar: {avg_ar_val_loss:.4f})")
-
-        model.train()  # Return to training mode
-
-        t_ar_val_end = time.time()
-        ar_val_time = t_ar_val_end - t_ar_val_start
-        if timing_stats['ar_validation'] is None:
-            timing_stats['ar_validation'] = ar_val_time
-        else:
-            timing_stats['ar_validation'] = (1 - TIMING_EMA_ALPHA) * timing_stats['ar_validation'] + TIMING_EMA_ALPHA * ar_val_time
 
     # v4.6.6: Milestone Save (every 10k steps)
     if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:

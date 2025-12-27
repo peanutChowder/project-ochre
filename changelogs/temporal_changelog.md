@@ -563,11 +563,12 @@ train.py
 
 train.py
 - Restored v4.6.4 AR curriculum: `CURRICULUM_AR=True`, `AR_ROLLOUT_MAX=25`, gradual ramp 5k-15k steps
-- Enhanced logging: `log_ar_rollout_to_wandb()` shows GT vs predictions after AR
-- Action validation metrics: `action_response/camera_left_diff`, `action_response/camera_right_diff`, `action_response/move_forward_diff`
-- Step-based training: Removed epoch loop, replaced `EPOCHS=50` with `MAX_STEPS=200000`, infinite dataloader restart
+- Real-time Monitoring: Added `train/loss_teacher` vs `train/loss_ar` and component-specific `grad/film_norm` vs `grad/dynamics_norm`
+- Validation Update: Removed offline AR validation loop (speedup); added explicit `ar_len` logging
+- Action Metrics: `action_response/camera_left_diff` etc. to verify FiLM efficacy
+- Step-based training: Removed epoch loop, replaced `EPOCHS=50` with `MAX_STEPS=100000`
 
 model_convGru.py
 - FiLM capacity: Internal MLP hidden dim 256 -> 512 for stronger action encoding
 
-Target: Fix v4.6.6 action conditioning failure (duplicated tails during camera movement, no response to WASD+jump)
+Target: Fix v4.6.6 action conditioning failure (duplicated tails during camera movement) via stronger FiLM + AR exposure
