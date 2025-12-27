@@ -743,7 +743,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
                       f"Fwd: {timing_stats['forward']*1000:.0f}ms, "
                       f"Bwd: {timing_stats['backward']*1000:.0f}ms, "
                       f"Opt: {timing_stats['optimizer']*1000:.0f}ms"
-                      f"{f', LPIPS: {timing_stats[\"lpips\"]*1000:.0f}ms' if timing_stats['lpips'] is not None else ''})")
+                      f"{', LPIPS: ' + str(int(timing_stats['lpips']*1000)) + 'ms' if timing_stats['lpips'] is not None else ''})")
             else:
                 print(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
