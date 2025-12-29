@@ -58,27 +58,52 @@ LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flas
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
 
 # --- CURRICULUM ---
-# v4.7.0: seq_len curriculum removed - seq_len dynamically grows with ar_len
+# v4.7.1: seq_len curriculum removed - seq_len dynamically grows with ar_len
 # Live inference uses CTX_LEN=6, so training seq_len doesn't need to match
 BASE_SEQ_LEN = 20               # Minimum sequence length (will grow to ar_len + 1)
 CURRICULUM_SEQ_LEN = False      # Disabled (seq_len now auto-adjusts to AR curriculum)
 MAX_SEQ_LEN = 50                # Not used
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used
 
-# v4.7.0: AR curriculum (fixes action conditioning via exposure to AR rollout)
+# v4.7.1: AR curriculum with adaptive brake (TIER 2 - PRIMARY)
+# Warm up with teacher forcing, then guarantee some AR exposure with adaptive quality control
 CURRICULUM_AR = True             # Re-enabled: AR rollout during training
-AR_START_STEP = 5000            # Start AR after model stabilizes
-AR_RAMP_STEPS = 10000           # Ramp AR length gradually
-AR_ROLLOUT_MAX = 25             # Maximum AR rollout length (seq_len will grow to accommodate this)
+AR_WARMUP_STEPS = 5000          # Warm up before starting AR 
+AR_MIN_LEN = 3                  # Minimum AR length (after warmup)
+AR_MAX_LEN = 25                 # Maximum AR rollout length 
 
-# v4.6.6: Single-step AR mix for noise robustness (Option 2 from efficient-ar-robustness.md)
-AR_MIX_ENABLED = True           # Enable occasional AR step during training
-AR_MIX_PROB = 0.05              # 5% of steps use previous prediction (~0.5% overhead)
+# Adaptive AR brake: prevent LPIPS degradation by monitoring AR vs TF quality
+ADAPTIVE_AR_BRAKE = True
+AR_BRAKE_EMA_ALPHA = 0.98       # Smoothing for LPIPS tracking
+AR_BRAKE_HYSTERESIS = 0.05      # Prevent oscillation
+AR_BRAKE_RATIO_UPPER = 1.8      # If AR LPIPS >1.8x TF, reduce AR intensity
+AR_BRAKE_RATIO_LOWER = 1.3      # If AR LPIPS <1.3x TF, allow increases
+
+# Optional: AR frame weighting (keep disabled; can induce blur)
+AR_FRAME_WEIGHTING = False
+AR_WEIGHT_SCALE = 0.5
+
+# v4.6.6: Single-step AR mix DISABLED in v4.7.1 (replaced by guaranteed AR exposure)
+AR_MIX_ENABLED = False          # Disabled: v4.7.1 uses guaranteed AR exposure instead
+AR_MIX_PROB = 0.0               # Not used
+
+# --- ACTION CONDITIONING (TIER 1) ---
+# v4.7.1: Action-contrastive ranking loss (correctness supervision)
+ACTION_RANK_WEIGHT = 0.5        # Weight for action ranking loss
+ACTION_RANK_FREQ = 10           # Compute ranking loss every N steps
+ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
+
+# NOTE: ACTION_RANK_NUM_NEG removed - hardcoded to 1 for efficiency
+# NOTE: ACTION_NOISE_SCALE not implemented - reserved for future use
+
+# --- OPTIMIZATION ---
+# v4.7.1: Address gradient imbalance (dynamics >> FiLM)
+FILM_LR_MULT = 3.0              # FiLM learning rate multiplier (3× base LR)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.0-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.0"
+RUN_NAME = "v4.7.1-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.1"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -420,15 +445,15 @@ if "encoder" in vqvae_ckpt and "decoder" in vqvae_ckpt and "quantizer" in vqvae_
     for key, value in vqvae_ckpt["quantizer"].items():
         if hasattr(vqvae_model.vq_vae, key):
             getattr(vqvae_model.vq_vae, key).copy_(value)
-    print("✅ VQ-VAE loaded from component-wise checkpoint")
+    print("VQ-VAE loaded from component-wise checkpoint")
 elif "model_state" in vqvae_ckpt:
     # Unified state dict format
     vqvae_model.load_state_dict(vqvae_ckpt["model_state"], strict=False)
-    print("✅ VQ-VAE loaded from model_state")
+    print("VQ-VAE loaded from model_state")
 else:
     # Try loading directly (legacy fallback)
     vqvae_model.load_state_dict(vqvae_ckpt, strict=False)
-    print("⚠️  VQ-VAE loaded from root dict (legacy)")
+    print("WARNING: VQ-VAE loaded from root dict (legacy)")
 
 vqvae_model.eval()
 vqvae_model.requires_grad_(False)
@@ -449,7 +474,16 @@ model = WorldModelConvFiLM(
     use_checkpointing=USE_CHECKPOINTING,
     zero_init_head=False  # Disable zero-init to prevent mode collapse at cold start
 ).to(DEVICE)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+
+# v4.7.1: Optimizer with FiLM parameter group (higher LR for action pathway)
+film_params = [p for n, p in model.named_parameters() if ("film" in n or "action" in n)]
+dynamics_params = [p for n, p in model.named_parameters() if ("film" not in n and "action" not in n)]
+
+optimizer = torch.optim.AdamW([
+    {'params': dynamics_params, 'lr': LR},
+    {'params': film_params, 'lr': LR * FILM_LR_MULT}
+], lr=LR)
+print(f"Optimizer: Base LR={LR}, FiLM LR={LR * FILM_LR_MULT} ({FILM_LR_MULT}x multiplier)")
 scaler = GradScaler(enabled=(DEVICE == "cuda"))
 
 # D. Setup Semantic Loss with loaded codebook
@@ -462,7 +496,7 @@ import lpips
 lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE)
 lpips_criterion.eval()  # Frozen, only for loss computation
 lpips_criterion.requires_grad_(False)
-print(f"✅ LPIPS Loss Initialized (AlexNet backend)")
+print(f"LPIPS Loss Initialized (AlexNet backend)")
 
 
 # F. Resume Logic
@@ -473,9 +507,9 @@ if RESUME_PATH and os.path.exists(RESUME_PATH):
     model.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     global_step = ckpt.get("global_step", 0)
-    print(f"✅ Resumed from step {global_step}")
+    print(f"Resumed from step {global_step}")
 else:
-    print("✨ ---- Starting fresh training run ---- ")
+    print("Starting fresh training run")
 
 def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
     # v4.7.0: Step-based checkpointing (epoch removed)
@@ -491,7 +525,7 @@ def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
     os.makedirs("./checkpoints", exist_ok=True)
 
     save_path = f"./checkpoints/{save_name}"
-    print(f"💾 Saving checkpoint to {save_path}")
+    print(f"Saving checkpoint to {save_path}")
     torch.save({
         "global_step": global_step,
         "model_state": model.state_dict(),
@@ -512,20 +546,81 @@ timing_stats = {
     'optimizer': None,       # Optimizer step time
 }
 
-# Helper function to compute curriculum params
-def compute_curriculum_params(step):
-    ar_len = 0
-    if CURRICULUM_AR and step > AR_START_STEP:
-        progress = (step - AR_START_STEP) / AR_RAMP_STEPS
-        progress = max(0.0, min(1.0, progress))
-        ar_len = int(progress * AR_ROLLOUT_MAX)
+# v4.7.1: AR curriculum with adaptive brake
+# Global state for AR brake (initialized outside function)
+current_ar_len = 0
+lpips_tf_ema = None
+lpips_ar_ema = None
+brake_increase_count = 0
+brake_decrease_count = 0
+brake_stable_count = 0
 
-    # v4.7.0: seq_len dynamically grows to accommodate AR rollout
-    # Need at least 1 teacher-forced step + ar_len AR steps
-    # Live inference uses CTX_LEN=6 (independent of training seq_len)
-    seq_len = max(BASE_SEQ_LEN, ar_len + 1)  # Always allow full AR rollout
+def compute_ar_len_from_brake(step, lpips_tf_avg, lpips_ar_avg):
+    """
+    v4.7.1: Compute AR length with adaptive brake.
+    Guarantees minimum AR exposure after warmup, with quality-based adjustments.
+    """
+    global current_ar_len, lpips_tf_ema, lpips_ar_ema, brake_increase_count, brake_decrease_count, brake_stable_count
 
-    if ar_len < 0: ar_len = 0
+    # Check if AR curriculum is enabled
+    if not CURRICULUM_AR:
+        return 0
+
+    # Phase 1: Warmup (teacher-forcing only)
+    if step < AR_WARMUP_STEPS:
+        return 0
+
+    # Phase 2: Initialize AR at minimum length
+    if current_ar_len == 0:
+        current_ar_len = AR_MIN_LEN
+        print(f"AR curriculum started: ar_len={current_ar_len} (step {step})")
+        return current_ar_len
+
+    # Phase 3: Adaptive brake adjustments
+    if ADAPTIVE_AR_BRAKE and lpips_ar_avg > 0:
+        # Update EMA trackers
+        if lpips_tf_ema is None:
+            lpips_tf_ema = lpips_tf_avg
+            lpips_ar_ema = lpips_ar_avg
+        else:
+            lpips_tf_ema = AR_BRAKE_EMA_ALPHA * lpips_tf_ema + (1 - AR_BRAKE_EMA_ALPHA) * lpips_tf_avg
+            lpips_ar_ema = AR_BRAKE_EMA_ALPHA * lpips_ar_ema + (1 - AR_BRAKE_EMA_ALPHA) * lpips_ar_avg
+
+        # Compute quality ratio (AR LPIPS / TF LPIPS)
+        ratio = lpips_ar_ema / (lpips_tf_ema + 1e-6)
+
+        # Apply brake logic with hysteresis
+        prev_ar_len = current_ar_len
+        if ratio > (AR_BRAKE_RATIO_UPPER + AR_BRAKE_HYSTERESIS):
+            # AR quality degraded too much - reduce AR intensity
+            current_ar_len = max(AR_MIN_LEN, current_ar_len - 2)
+            if current_ar_len != prev_ar_len:
+                brake_decrease_count += 1
+                print(f"AR brake: REDUCE ar_len {prev_ar_len}->{current_ar_len} (ratio={ratio:.2f} > {AR_BRAKE_RATIO_UPPER}, step {step})")
+            else:
+                brake_stable_count += 1  # Pinned at AR_MIN_LEN
+        elif ratio < (AR_BRAKE_RATIO_LOWER - AR_BRAKE_HYSTERESIS):
+            # AR quality close to TF - allow increases
+            current_ar_len = min(AR_MAX_LEN, current_ar_len + 2)
+            if current_ar_len != prev_ar_len:
+                brake_increase_count += 1
+                print(f"AR brake: INCREASE ar_len {prev_ar_len}->{current_ar_len} (ratio={ratio:.2f} < {AR_BRAKE_RATIO_LOWER}, step {step})")
+            else:
+                brake_stable_count += 1  # Pinned at AR_MAX_LEN
+        else:
+            # Within acceptable range - no change
+            brake_stable_count += 1
+
+    return current_ar_len
+
+def compute_curriculum_params(step, lpips_tf_avg=0, lpips_ar_avg=0):
+    """
+    v4.7.1: Compute curriculum parameters with adaptive AR brake.
+    """
+    ar_len = compute_ar_len_from_brake(step, lpips_tf_avg, lpips_ar_avg)
+
+    # seq_len dynamically grows to accommodate AR rollout
+    seq_len = max(BASE_SEQ_LEN, ar_len + 1)
 
     return seq_len, ar_len
 
@@ -540,18 +635,22 @@ print(f"Training target: {MAX_STEPS:,} steps")
 
 model.train()
 
+# v4.7.1: Track prev step LPIPS for adaptive brake
+prev_lpips_tf_avg = 0.0
+prev_lpips_ar_avg = 0.0
+
 # v4.7.0: Step-based training loop (no epochs)
 while global_step < MAX_STEPS:
-    # Check if curriculum needs update
-    seq_len, ar_len = compute_curriculum_params(global_step)
+    # Check if curriculum needs update (uses LPIPS from previous step)
+    seq_len, ar_len = compute_curriculum_params(global_step, prev_lpips_tf_avg, prev_lpips_ar_avg)
 
     if seq_len != prev_seq_len:
-        print(f"📚 Curriculum changed: seq_len {prev_seq_len}->{seq_len}, ar_len {prev_ar_len}->{ar_len}")
+        print(f"Curriculum changed: seq_len {prev_seq_len}->{seq_len}, ar_len {prev_ar_len}->{ar_len}")
         prev_seq_len, prev_ar_len = seq_len, ar_len
         # Reload dataset and dataloader
         dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
         if len(dataset) == 0:
-            print("⚠️ WARNING: Empty dataset, stopping training")
+            print("WARNING: Empty dataset, stopping training")
             break
         loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                           num_workers=4, pin_memory=True, persistent_workers=True)
@@ -572,10 +671,13 @@ while global_step < MAX_STEPS:
     B, K, H, W = Z_seq.shape
     step_losses = []
 
-    # LR Warmup
+    # LR Warmup (v4.7.1: Preserve FiLM multiplier)
     if global_step <= WARMUP_STEPS:
-        new_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
-        for pg in optimizer.param_groups: pg['lr'] = new_lr
+        warmup_progress = global_step / WARMUP_STEPS
+        base_lr = MIN_LR + warmup_progress * (LR - MIN_LR)
+        # Set LR for each param group (dynamics: base, FiLM: base * multiplier)
+        optimizer.param_groups[0]['lr'] = base_lr  # dynamics
+        optimizer.param_groups[1]['lr'] = base_lr * FILM_LR_MULT  # FiLM
 
     optimizer.zero_grad()
 
@@ -584,13 +686,13 @@ while global_step < MAX_STEPS:
     Gammas_seq, Betas_seq = model.compute_film(A_seq)
     h_state = model.init_state(B, device=DEVICE)
 
-    # v4.6.6: Primarily teacher-forced with occasional single-step AR mix
-    # AR rollout moved to validation-only (see AR validation section below)
-
+    # v4.7.1: Training loop with adaptive AR curriculum (ar_len determined by brake)
     step_losses = []         # Loss per timestep
     teacher_losses = []      # v4.7.0: Track teacher-forcing losses
     ar_losses = []           # v4.7.0: Track autoregressive losses
     lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
+    lpips_tf_steps = []      # v4.7.1: Track TF LPIPS separately
+    lpips_ar_steps = []      # v4.7.1: Track AR LPIPS separately
     logits_last = None
     prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
     ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
@@ -680,6 +782,12 @@ while global_step < MAX_STEPS:
                 # Track LPIPS for averaging
                 lpips_loss_steps.append(loss_lpips)
 
+                # v4.7.1: Track TF vs AR LPIPS separately
+                if is_ar_step:
+                    lpips_ar_steps.append(loss_lpips)
+                else:
+                    lpips_tf_steps.append(loss_lpips)
+
             t_lpips_end = time.time()
             # Update LPIPS timing (only when LPIPS was computed)
             if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
@@ -699,10 +807,53 @@ while global_step < MAX_STEPS:
                 teacher_losses.append(loss_step)
 
         loss = torch.stack(step_losses).mean()
-        
+
         # v4.7.0: Compute split losses for logging
         loss_teacher = torch.stack(teacher_losses).mean() if teacher_losses else torch.tensor(0.0, device=DEVICE)
         loss_ar = torch.stack(ar_losses).mean() if ar_losses else torch.tensor(0.0, device=DEVICE)
+
+        # v4.7.1: Action-contrastive ranking loss (every ACTION_RANK_FREQ steps)
+        loss_action_rank = torch.tensor(0.0, device=DEVICE)
+        if global_step % ACTION_RANK_FREQ == 0 and K > 1:
+            # Select a random timestep to evaluate action conditioning
+            # Use teacher-forced context for stability (avoid AR compounding errors)
+            t_rank = random.randint(1, K - 1)
+
+            # Get starting state (teacher-forced up to t_rank-1 for realistic h_state)
+            # NOTE: For efficiency, we use fresh h_state here (minimal version)
+            # Better approach: replay TF forward to t_rank for realistic hidden state
+            h_rank = model.init_state(B, device=DEVICE)
+            x_rank = X_seq[:, t_rank]  # Ground truth at t_rank
+
+            # True action: should predict target better
+            g_true = Gammas_seq[:, :, t_rank]
+            b_true = Betas_seq[:, :, t_rank]
+            logits_true, _ = model.step(None, None, h_rank, x_t=x_rank, gammas_t=g_true, betas_t=b_true)
+
+            # Compute loss for true action
+            logits_true_flat = logits_true.permute(0, 2, 3, 1).reshape(-1, logits_true.size(1))
+            target_rank_flat = Z_target[:, t_rank].reshape(-1)
+            L_true = semantic_criterion(logits_true_flat, target_rank_flat, global_step=global_step)
+
+            # Negative action: shuffle actions across batch (wrong action)
+            perm = torch.randperm(B, device=DEVICE)
+            a_neg = A_seq[:, t_rank][perm]  # Shuffled actions
+            g_neg, b_neg = model.compute_film(a_neg.unsqueeze(1))  # (B, 1, A) -> (L, B, C, 1, 1)
+
+            # Compute prediction with wrong action (detach h_state to prevent interference)
+            logits_neg, _ = model.step(None, None, h_rank.detach(), x_t=x_rank,
+                                      gammas_t=g_neg[:, :, 0], betas_t=b_neg[:, :, 0])
+
+            # Compute loss for negative action
+            logits_neg_flat = logits_neg.permute(0, 2, 3, 1).reshape(-1, logits_neg.size(1))
+            L_neg = semantic_criterion(logits_neg_flat, target_rank_flat, global_step=global_step)
+
+            # Ranking loss: penalize if true action loss is not better than negative loss
+            # margin: L_true should be at least ACTION_RANK_MARGIN better than L_neg
+            loss_action_rank = F.relu(ACTION_RANK_MARGIN + L_true - L_neg)
+
+            # Add to total loss
+            loss = loss + ACTION_RANK_WEIGHT * loss_action_rank
 
     t_forward_end = time.time()
 
@@ -756,6 +907,17 @@ while global_step < MAX_STEPS:
     if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
         print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
         print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
+
+    # v4.7.1: Compute TF/AR LPIPS averages (for adaptive brake)
+    if len(lpips_tf_steps) > 0:
+        prev_lpips_tf_avg = torch.stack(lpips_tf_steps).mean().item()
+    else:
+        prev_lpips_tf_avg = 0.0
+
+    if len(lpips_ar_steps) > 0:
+        prev_lpips_ar_avg = torch.stack(lpips_ar_steps).mean().item()
+    else:
+        prev_lpips_ar_avg = 0.0
 
     # Periodic Logs
     if global_step % LOG_STEPS == 0:
@@ -817,22 +979,37 @@ while global_step < MAX_STEPS:
                 "train/loss": loss.item(),
                 "train/loss_teacher": loss_teacher.item(),  # v4.7.0
                 "train/loss_ar": loss_ar.item(),            # v4.7.0
-                "train/loss_texture": loss_texture.item(), 
+                "train/loss_texture": loss_texture.item(),
                 "train/loss_lpips": lpips_loss_avg, # v4.6.2: LPIPS perceptual loss (averaged across sequence)
+
+                # v4.7.1: TF vs AR LPIPS split (for adaptive brake)
+                "train/loss_lpips_tf": prev_lpips_tf_avg,
+                "train/loss_lpips_ar": prev_lpips_ar_avg,
+
+                # v4.7.1: Action ranking loss
+                "action_rank/loss": loss_action_rank.item(),
 
                 # v4.6.0: Gumbel-Softmax tau annealing
                 "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
-                # v4.7.0: AR curriculum diagnostics (restored from v4.6.4)
+                # v4.7.1: AR curriculum diagnostics with adaptive brake
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "ar_len": ar_len,  # Explicit root-level logging (requested)
                 "curriculum/ar_cutoff": ar_cutoff,
+                "curriculum/lpips_tf_ema": lpips_tf_ema if lpips_tf_ema is not None else 0.0,
+                "curriculum/lpips_ar_ema": lpips_ar_ema if lpips_ar_ema is not None else 0.0,
+                "curriculum/lpips_ratio": (lpips_ar_ema / (lpips_tf_ema + 1e-6)) if (lpips_ar_ema and lpips_tf_ema) else 0.0,
 
-                # v4.6.6: AR mix diagnostics (independent of curriculum)
-                "ar_mix/enabled": 1.0 if AR_MIX_ENABLED else 0.0,
-                "ar_mix/probability": AR_MIX_PROB if AR_MIX_ENABLED else 0.0,
-                "ar_mix/actual_frequency": ar_mix_count / K if K > 0 else 0.0,
+                # v4.7.1: Brake state tracking
+                "curriculum/brake_increase_count": brake_increase_count,
+                "curriculum/brake_decrease_count": brake_decrease_count,
+                "curriculum/brake_stable_count": brake_stable_count,
+
+                # v4.6.6: AR mix diagnostics (DISABLED in v4.7.1)
+                "ar_mix/enabled": 0.0,
+                "ar_mix/probability": 0.0,
+                "ar_mix/actual_frequency": 0.0,
 
                 # Action diagnostics
                 "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
@@ -891,6 +1068,6 @@ while global_step < MAX_STEPS:
     global_step += 1
 
 # Training complete
-print(f"🎉 Training complete! Reached {global_step} steps (target: {MAX_STEPS})")
+print(f"Training complete! Reached {global_step} steps (target: {MAX_STEPS})")
 save_checkpoint(global_step, is_milestone=True)
 if wandb: wandb.finish()

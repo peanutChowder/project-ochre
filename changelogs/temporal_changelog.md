@@ -590,3 +590,23 @@ Results, step 50k:
   - Visual quality degraded: LPIPS doubled coinciding with AR curriculum 10k-15k
   - Action conditioning still broken: FiLM capacity increase (256->512) ineffective
   - Trade-off: Solved AR stability, lost single-frame sharpness vs v4.6.6
+
+**v4.7.1**
+
+train.py
+- Adaptive AR Brake: Guaranteed minimum AR exposure (ar_len>=3 after warmup) with quality-based adjustments (TF vs AR LPIPS split)
+  - Brake logic: If AR LPIPS >1.8× TF → reduce ar_len; if <1.3× TF -> increase ar_len (with hysteresis to prevent oscillation)
+  - EMA smoothing (alpha=0.98) for stable feedback signal
+- Action-Contrastive Ranking Loss: Explicit correctness supervision every 10 steps
+  - Hinge loss: true action should predict target better than shuffled action by margin 0.05
+  - Weight: 0.5, uses fresh h_state for efficiency (~10-15% overhead vs ~30% for replay)
+- FiLM LR Multiplier: 3× base LR for FiLM/action parameters to address gradient imbalance (dynamics 5.6× stronger than FiLM in v4.7.0)
+- Enhanced Logging: TF vs AR LPIPS split, brake state counters (increase/decrease/stable), action ranking loss
+- Critical Bug Fixes (pre-training):
+  - Fixed LR warmup overwriting FiLM multiplier (would have broken action training)
+  - Added CURRICULUM_AR gate to brake function
+  - Enhanced brake observability with state counters
+
+Target: Fix v4.7.0's LPIPS degradation (0.12→0.24) and action conditioning failure via adaptive AR curriculum + explicit action supervision
+
+Expected: TF LPIPS 0.11-0.15, AR LPIPS <2× TF, action_response >0.05 (vs 0.015)
