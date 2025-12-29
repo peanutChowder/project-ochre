@@ -1,8 +1,26 @@
 #!/bin/bash
 # Installation script for Vast.ai / Linux CUDA environments
-# Run with: bash install_vast.sh
-
+# Run with: bash setup.sh
 set -e  # Exit on error
+
+echo "Setting up Project Ochre environment..."
+git clone https://github.com/peanutChowder/project-ochre
+cd project-ochre
+bash install_vast.sh
+cd ..
+
+echo "Installing vqvae checkpoint..."
+
+pip install gdown
+cd project-ochre
+mkdir checkpoints && cd checkpoints
+gdown 1hpBa3d-JX3vmHtH-e1FkSEdvyBtzcN6z # vqvae v2.1.6
+cd ../..
+
+echo "Installing dataset..."
+gdown 104I8PGlrUdshuI4LPT5TXDwjWvaxVu2i
+unzip preprocessedv4.zip
+ls preprocessedv4
 
 echo "🚀 Installing dependencies"
 
