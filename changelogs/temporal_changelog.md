@@ -573,3 +573,20 @@ model_convGru.py
 - FiLM capacity: Internal MLP hidden dim 256 -> 512 for stronger action encoding
 
 Target: Fix v4.6.6 action conditioning failure (duplicated tails during camera movement) via stronger FiLM + AR exposure
+
+Results, step 50k:
+- Visual Quality:
+  - Reconstruction: Significantly blurry (all samples), scene structure preserved but details lost (e.g. birch biome only has green, no white birch trunks)
+  - AR Rollout: Stable blur across 25 frames, no compounding/splitting/drift (major improvement over v4.6.6)
+  - Action Conditioning: Non-functional (outputs identical for different actions)
+- Metrics Summary:
+  - `loss_lpips`: 0.23-0.24 (doubled from v4.6.6's 0.11-0.13 during AR ramp-up 10k-15k)
+  - `spatial_gradient`: 0.65 (degraded from v4.6.6's 0.98-1.02)
+  - `unique_codes`: 85-90 (down from v4.6.6's 96-98)
+  - `action_response/average`: 0.015 (30% of target >0.05, broken like v4.6.6)
+  - `ar_loss_gap`: 0.3 (excellent AR stability)
+- Key Observations:
+  - AR stability achieved: 25-frame rollouts coherent, no v4.6.6 catastrophic failures
+  - Visual quality degraded: LPIPS doubled coinciding with AR curriculum 10k-15k
+  - Action conditioning still broken: FiLM capacity increase (256->512) ineffective
+  - Trade-off: Solved AR stability, lost single-frame sharpness vs v4.6.6
