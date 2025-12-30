@@ -41,11 +41,11 @@ VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
-BATCH_SIZE = 64         # v4.7.3 doubled batch size
+BATCH_SIZE = 48         # v4.7.3: 1.5× batch size (32 → 48)
 MAX_STEPS = 50_000  # v4.7.0: Step-based training (replaces EPOCHS)
-LR = 6e-5               # v4.7.3 doubled LR
-WARMUP_STEPS = 1000     # v4.7.3 doubled warmup
-MIN_LR = 2e-6           # v4.7.3 doubled minimum LR
+LR = 4.5e-5             # v4.7.3: 1.5× LR (3e-5 → 4.5e-5)
+WARMUP_STEPS = 750      # v4.7.3: 1.5× warmup (500 → 750)
+MIN_LR = 1.5e-6         # v4.7.3: 1.5× minimum LR
 USE_CHECKPOINTING = False 
 
 # --- LOSS WEIGHTS ---
