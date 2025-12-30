@@ -783,15 +783,14 @@ while global_step < MAX_STEPS:
 
             # --- LOSS CALCULATION (v4.6.5: Optimized) ---
             # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
-            t_semantic_start = time.perf_counter()
-            logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
-            target_flat = Z_target[:, t].reshape(-1)
             if (SEMANTIC_WEIGHT > 0):
+                t_semantic_start = time.perf_counter()
+                logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
+                target_flat = Z_target[:, t].reshape(-1)
                 loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+                loss_semantic_time_total += (time.perf_counter() - t_semantic_start)
             else:
                 loss_texture = torch.tensor(0.0, device=DEVICE)
-
-            loss_semantic_time_total += (time.perf_counter() - t_semantic_start)
 
             # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
             loss_lpips = torch.tensor(0.0, device=DEVICE)
@@ -999,6 +998,12 @@ while global_step < MAX_STEPS:
         timing_stats['scaler_update'] = (1 - TIMING_EMA_ALPHA) * timing_stats['scaler_update'] + TIMING_EMA_ALPHA * scaler_update_time
 
     # --- DIAGNOSTICS & LOGGING ---
+    # v4.6.6: Calculate LPIPS average (needed for spike detection and logging)
+    if len(lpips_loss_steps) > 0:
+        lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
+    else:
+        lpips_loss_avg = 0.0
+
     if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
         print(f"\nSPIKE: step={global_step} loss={loss.item():.2f} grad={float(grad_norm):.2f}")
         print(f"   (Semantic: {loss_texture.item():.4f}, LPIPS: {lpips_loss_avg:.4f})")
@@ -1016,12 +1021,6 @@ while global_step < MAX_STEPS:
 
     # Periodic Logs
     if global_step % LOG_STEPS == 0:
-        # v4.6.6: Calculate LPIPS average
-        if len(lpips_loss_steps) > 0:
-            lpips_loss_avg = torch.stack(lpips_loss_steps).mean().item()
-        else:
-            lpips_loss_avg = 0.0
-
         # v4.7.2: Print fine-grained timing summary
         if timing_stats['step_total'] is not None:
             throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
