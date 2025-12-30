@@ -51,7 +51,7 @@ USE_CHECKPOINTING = False
 # --- LOSS WEIGHTS ---
 # v4.6.5: Focus on perceptual sharpness via LPIPS
 # Only 2 loss components: Semantic + LPIPS (neighbor removed)
-SEMANTIC_WEIGHT = 10.0   # Embedding MSE (token prediction accuracy)
+SEMANTIC_WEIGHT = 0.0   # Embedding MSE (token prediction accuracy) - v4.6.3: Disabled to test whether is preventing LPIPS improvement
 LPIPS_WEIGHT = 2.0       # Perceptual loss (sharpness, visual quality) - v4.6.5: 1.0 -> 2.0
                          # Combined with LPIPS_FREQ=1, this makes LPIPS the dominant signal
 LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flashing artifact
@@ -786,7 +786,11 @@ while global_step < MAX_STEPS:
             t_semantic_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
-            loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+            if (SEMANTIC_WEIGHT > 0):
+                loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+            else:
+                loss_texture = torch.tensor(0.0, device=DEVICE)
+                
             loss_semantic_time_total += (time.perf_counter() - t_semantic_start)
 
             # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)

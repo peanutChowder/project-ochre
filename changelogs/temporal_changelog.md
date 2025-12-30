@@ -615,3 +615,8 @@ Expected: TF LPIPS 0.11-0.15, AR LPIPS <2× TF, action_response >0.05 (vs 0.015)
 
 train.py
 - Replaced coarse forward/backward timings with per-step EMA breakdown (embed+FiLM, model_step, semantic, LPIPS total + ms/call, action_rank, backward sub-steps, optimizer sub-steps)
+
+**v4.7.3**
+
+train.py
+- Turned `SEMANTIC_WEIGHT = 0` and added conditional skip computation when 0
