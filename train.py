@@ -102,8 +102,8 @@ FILM_LR_MULT = 3.0              # FiLM learning rate multiplier (3× base LR)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.1-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.1"
+RUN_NAME = "v4.7.2-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.2"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -114,7 +114,7 @@ SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 MILESTONE_SAVE_STEPS = 10000  # v4.6.6: Save checkpoint every N steps
 
-# v4.6.6: Timing & throughput tracking
+# v4.7.2: Fine-grained timing & throughput tracking
 TIMING_EMA_ALPHA = 0.1  # Smoothing factor for exponential moving average (0.1 = ~10 step window)
 
 # ==========================================
@@ -536,14 +536,33 @@ def save_checkpoint(global_step, is_emergency=False, is_milestone=False):
 # --- TRAINING ---
 last_emergency_save_time = time.time()
 
-# v4.6.6: Timing tracking with exponential moving average
+# v4.7.2: Fine-grained timing tracking (EMA)
+# Notes:
+# - Times are per training step (one batch), averaged with EMA.
+# - LPIPS is timed as both total LPIPS time across all timesteps in the sequence and per-LPIPS-call time.
 timing_stats = {
-    'step_total': None,      # Total time per step (EMA)
-    'data_load': None,       # Time to load batch
-    'forward': None,         # Forward pass time
-    'lpips': None,           # LPIPS computation time
-    'backward': None,        # Backward pass time
-    'optimizer': None,       # Optimizer step time
+    'step_total': None,          # Total time per step (EMA)
+    'data_load': None,           # Time to load batch
+
+    # Forward breakdown
+    'forward_total': None,       # Total forward section time
+    'embed_film': None,          # X_seq + Gammas/Betas + init_state
+    'model_step': None,          # Sum of model.step calls across sequence
+    'loss_semantic': None,       # Sum of semantic loss compute across sequence
+    'loss_lpips_total': None,    # Sum of LPIPS blocks across sequence (total)
+    'loss_lpips_call': None,     # Mean time per LPIPS call (EMA)
+    'action_rank': None,         # Action ranking loss block
+
+    # Backward breakdown
+    'backward_total': None,      # Total backward section time
+    'backward': None,            # scaler.scale(loss).backward()
+    'unscale': None,             # scaler.unscale_
+    'grad_clip': None,           # clip_grad_norm_
+
+    # Optimizer breakdown
+    'optimizer_total': None,     # Total optimizer section time
+    'optimizer_step': None,      # scaler.step(optimizer)
+    'scaler_update': None,       # scaler.update()
 }
 
 # v4.7.1: AR curriculum with adaptive brake
@@ -665,7 +684,7 @@ while global_step < MAX_STEPS:
         loader_iter = iter(loader)
         batch = next(loader_iter)
 
-    t_data_end = time.time()
+    t_data_end = time.perf_counter()
     Z_seq, A_seq, Z_target, _, _, _ = batch
     Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
     B, K, H, W = Z_seq.shape
@@ -681,10 +700,16 @@ while global_step < MAX_STEPS:
 
     optimizer.zero_grad()
 
+    # v4.7.2: Forward timing breakdown
+    t_forward_start = time.perf_counter()
+    t_embed_film_start = time.perf_counter()
+
     # Embeddings & FiLM
     X_seq = model.compute_embeddings(Z_seq)
     Gammas_seq, Betas_seq = model.compute_film(A_seq)
     h_state = model.init_state(B, device=DEVICE)
+
+    t_embed_film_end = time.perf_counter()
 
     # v4.7.1: Training loop with adaptive AR curriculum (ar_len determined by brake)
     step_losses = []         # Loss per timestep
@@ -697,7 +722,12 @@ while global_step < MAX_STEPS:
     prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
     ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
-    t_forward_start = time.time()
+    model_step_time_total = 0.0
+    loss_semantic_time_total = 0.0
+    lpips_time_total = 0.0
+    lpips_call_count = 0
+    action_rank_time = 0.0
+
     with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
         # v4.7.0: Restore AR curriculum - use ar_len to determine AR rollout
         ar_cutoff = K - ar_len  # Steps [0, ar_cutoff) are teacher-forced, [ar_cutoff, K) are AR
@@ -729,10 +759,21 @@ while global_step < MAX_STEPS:
             g_t = Gammas_seq[:, :, t]
             b_t = Betas_seq[:, :, t]
 
+            t_model_step_start = time.perf_counter()
             if USE_CHECKPOINTING:
-                logits_t, h_state = checkpoint(model.step, torch.tensor(0, device=DEVICE), torch.tensor(0, device=DEVICE), h_state, x_in, g_t, b_t, use_reentrant=False)
+                logits_t, h_state = checkpoint(
+                    model.step,
+                    torch.tensor(0, device=DEVICE),
+                    torch.tensor(0, device=DEVICE),
+                    h_state,
+                    x_in,
+                    g_t,
+                    b_t,
+                    use_reentrant=False,
+                )
             else:
                 logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
+            model_step_time_total += (time.perf_counter() - t_model_step_start)
 
             logits_last = logits_t
 
@@ -742,13 +783,15 @@ while global_step < MAX_STEPS:
 
             # --- LOSS CALCULATION (v4.6.5: Optimized) ---
             # 1. Semantic Loss with Gumbel-Softmax (Handle Blur + Force Discrete)
+            t_semantic_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
             loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
+            loss_semantic_time_total += (time.perf_counter() - t_semantic_start)
 
             # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
             loss_lpips = torch.tensor(0.0, device=DEVICE)
-            t_lpips_start = time.time()
+            t_lpips_start = time.perf_counter()
             if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
                 # v4.6.2 FIX: Use Gumbel-Softmax for differentiable token selection
                 # Reuse same tau as semantic loss for consistency
@@ -788,14 +831,12 @@ while global_step < MAX_STEPS:
                 else:
                     lpips_tf_steps.append(loss_lpips)
 
-            t_lpips_end = time.time()
+            t_lpips_end = time.perf_counter()
             # Update LPIPS timing (only when LPIPS was computed)
             if lpips_criterion is not None and (t % LPIPS_FREQ == 0):
                 lpips_time = t_lpips_end - t_lpips_start
-                if timing_stats['lpips'] is None:
-                    timing_stats['lpips'] = lpips_time
-                else:
-                    timing_stats['lpips'] = (1 - TIMING_EMA_ALPHA) * timing_stats['lpips'] + TIMING_EMA_ALPHA * lpips_time
+                lpips_time_total += lpips_time
+                lpips_call_count += 1
 
             # Weighted Sum (v4.6.6: Only 2 components - neighbor removed)
             loss_step = (SEMANTIC_WEIGHT * loss_texture) + \
@@ -812,7 +853,8 @@ while global_step < MAX_STEPS:
         loss_teacher = torch.stack(teacher_losses).mean() if teacher_losses else torch.tensor(0.0, device=DEVICE)
         loss_ar = torch.stack(ar_losses).mean() if ar_losses else torch.tensor(0.0, device=DEVICE)
 
-        # v4.7.1: Action-contrastive ranking loss (every ACTION_RANK_FREQ steps)
+        # v4.7.1+: Action-contrastive ranking loss (every ACTION_RANK_FREQ steps)
+        t_action_rank_start = time.perf_counter()
         loss_action_rank = torch.tensor(0.0, device=DEVICE)
         if global_step % ACTION_RANK_FREQ == 0 and K > 1:
             # Select a random timestep to evaluate action conditioning
@@ -854,12 +896,17 @@ while global_step < MAX_STEPS:
 
             # Add to total loss
             loss = loss + ACTION_RANK_WEIGHT * loss_action_rank
+        action_rank_time = time.perf_counter() - t_action_rank_start
 
-    t_forward_end = time.time()
-
-    t_backward_start = time.time()
+    t_forward_end = time.perf_counter()
+    t_backward_start = time.perf_counter()
+    t_backward_compute_start = time.perf_counter()
     scaler.scale(loss).backward()
+    t_backward_compute_end = time.perf_counter()
+
+    t_unscale_start = time.perf_counter()
     scaler.unscale_(optimizer)
+    t_unscale_end = time.perf_counter()
     
     # v4.7.0: Track specific gradient norms (FiLM vs Dynamics)
     grad_film = 0.0
@@ -873,13 +920,19 @@ while global_step < MAX_STEPS:
         if dynamics_params:
             grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params]), 2).item()
 
+    t_clip_start = time.perf_counter()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
-    t_backward_end = time.time()
+    t_clip_end = time.perf_counter()
+    t_backward_end = time.perf_counter()
 
-    t_optimizer_start = time.time()
+    t_optimizer_start = time.perf_counter()
+    t_opt_step_start = time.perf_counter()
     scaler.step(optimizer)
+    t_opt_step_end = time.perf_counter()
+    t_scaler_update_start = time.perf_counter()
     scaler.update()
-    t_optimizer_end = time.time()
+    t_scaler_update_end = time.perf_counter()
+    t_optimizer_end = time.perf_counter()
 
     # v4.6.6: Update timing statistics with EMA
     data_time = t_data_end - t_step_start
@@ -888,20 +941,58 @@ while global_step < MAX_STEPS:
     optimizer_time = t_optimizer_end - t_optimizer_start
     step_time = t_optimizer_end - t_step_start
 
+    embed_film_time = t_embed_film_end - t_embed_film_start
+    forward_total_time = forward_time
+    backward_compute_time = t_backward_compute_end - t_backward_compute_start
+    unscale_time = t_unscale_end - t_unscale_start
+    grad_clip_time = t_clip_end - t_clip_start
+    optimizer_step_time = t_opt_step_end - t_opt_step_start
+    scaler_update_time = t_scaler_update_end - t_scaler_update_start
+
+    lpips_call_time = (lpips_time_total / lpips_call_count) if lpips_call_count > 0 else 0.0
+
     if timing_stats['data_load'] is None:
         # First step - initialize
-        timing_stats['data_load'] = data_time
-        timing_stats['forward'] = forward_time
-        timing_stats['backward'] = backward_time
-        timing_stats['optimizer'] = optimizer_time
         timing_stats['step_total'] = step_time
+        timing_stats['data_load'] = data_time
+
+        timing_stats['forward_total'] = forward_total_time
+        timing_stats['embed_film'] = embed_film_time
+        timing_stats['model_step'] = model_step_time_total
+        timing_stats['loss_semantic'] = loss_semantic_time_total
+        timing_stats['loss_lpips_total'] = lpips_time_total
+        timing_stats['loss_lpips_call'] = lpips_call_time
+        timing_stats['action_rank'] = action_rank_time
+
+        timing_stats['backward_total'] = backward_time
+        timing_stats['backward'] = backward_compute_time
+        timing_stats['unscale'] = unscale_time
+        timing_stats['grad_clip'] = grad_clip_time
+
+        timing_stats['optimizer_total'] = optimizer_time
+        timing_stats['optimizer_step'] = optimizer_step_time
+        timing_stats['scaler_update'] = scaler_update_time
     else:
         # EMA update
-        timing_stats['data_load'] = (1 - TIMING_EMA_ALPHA) * timing_stats['data_load'] + TIMING_EMA_ALPHA * data_time
-        timing_stats['forward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['forward'] + TIMING_EMA_ALPHA * forward_time
-        timing_stats['backward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward'] + TIMING_EMA_ALPHA * backward_time
-        timing_stats['optimizer'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer'] + TIMING_EMA_ALPHA * optimizer_time
         timing_stats['step_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['step_total'] + TIMING_EMA_ALPHA * step_time
+        timing_stats['data_load'] = (1 - TIMING_EMA_ALPHA) * timing_stats['data_load'] + TIMING_EMA_ALPHA * data_time
+
+        timing_stats['forward_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['forward_total'] + TIMING_EMA_ALPHA * forward_total_time
+        timing_stats['embed_film'] = (1 - TIMING_EMA_ALPHA) * timing_stats['embed_film'] + TIMING_EMA_ALPHA * embed_film_time
+        timing_stats['model_step'] = (1 - TIMING_EMA_ALPHA) * timing_stats['model_step'] + TIMING_EMA_ALPHA * model_step_time_total
+        timing_stats['loss_semantic'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_semantic'] + TIMING_EMA_ALPHA * loss_semantic_time_total
+        timing_stats['loss_lpips_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_lpips_total'] + TIMING_EMA_ALPHA * lpips_time_total
+        timing_stats['loss_lpips_call'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_lpips_call'] + TIMING_EMA_ALPHA * lpips_call_time
+        timing_stats['action_rank'] = (1 - TIMING_EMA_ALPHA) * timing_stats['action_rank'] + TIMING_EMA_ALPHA * action_rank_time
+
+        timing_stats['backward_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward_total'] + TIMING_EMA_ALPHA * backward_time
+        timing_stats['backward'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward'] + TIMING_EMA_ALPHA * backward_compute_time
+        timing_stats['unscale'] = (1 - TIMING_EMA_ALPHA) * timing_stats['unscale'] + TIMING_EMA_ALPHA * unscale_time
+        timing_stats['grad_clip'] = (1 - TIMING_EMA_ALPHA) * timing_stats['grad_clip'] + TIMING_EMA_ALPHA * grad_clip_time
+
+        timing_stats['optimizer_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer_total'] + TIMING_EMA_ALPHA * optimizer_time
+        timing_stats['optimizer_step'] = (1 - TIMING_EMA_ALPHA) * timing_stats['optimizer_step'] + TIMING_EMA_ALPHA * optimizer_step_time
+        timing_stats['scaler_update'] = (1 - TIMING_EMA_ALPHA) * timing_stats['scaler_update'] + TIMING_EMA_ALPHA * scaler_update_time
 
     # --- DIAGNOSTICS & LOGGING ---
     if (loss.item() > SPIKE_LOSS or float(grad_norm) > SPIKE_GRAD) and REPORT_SPIKES:
@@ -927,17 +1018,23 @@ while global_step < MAX_STEPS:
         else:
             lpips_loss_avg = 0.0
 
-        # v4.6.6: Print timing summary
+        # v4.7.2: Print fine-grained timing summary
         if timing_stats['step_total'] is not None:
             throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
-            print(f"[Step {global_step}] Loss: {loss.item():.4f} | "
-                  f"{throughput:.2f} steps/s | "
-                  f"Total: {timing_stats['step_total']*1000:.1f}ms "
-                  f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
-                  f"Fwd: {timing_stats['forward']*1000:.0f}ms, "
-                  f"Bwd: {timing_stats['backward']*1000:.0f}ms, "
-                  f"Opt: {timing_stats['optimizer']*1000:.0f}ms"
-                  f"{', LPIPS: ' + str(int(timing_stats['lpips']*1000)) + 'ms' if timing_stats['lpips'] is not None else ''})")
+            lpips_call_ms = int(timing_stats['loss_lpips_call'] * 1000) if timing_stats['loss_lpips_call'] is not None else 0
+            print(
+                f"[Step {global_step}] Loss: {loss.item():.4f} | {throughput:.2f} steps/s | "
+                f"Total: {timing_stats['step_total']*1000:.1f}ms "
+                f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
+                f"Emb+FiLM: {timing_stats['embed_film']*1000:.0f}ms, "
+                f"Step: {timing_stats['model_step']*1000:.0f}ms, "
+                f"Sem: {timing_stats['loss_semantic']*1000:.0f}ms, "
+                f"LPIPS: {timing_stats['loss_lpips_total']*1000:.0f}ms"
+                f"{f' ({lpips_call_ms}ms/call)' if lpips_call_ms > 0 else ''}, "
+                f"Rank: {timing_stats['action_rank']*1000:.0f}ms, "
+                f"Bwd: {timing_stats['backward_total']*1000:.0f}ms, "
+                f"Opt: {timing_stats['optimizer_total']*1000:.0f}ms)"
+            )
         else:
             print(f"[Step {global_step}] Loss: {loss.item():.4f}")
 
@@ -974,6 +1071,15 @@ while global_step < MAX_STEPS:
             action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
 
         if wandb:
+            # v4.7.2: Timing percentages (relative to total step time)
+            step_total_s = timing_stats['step_total'] if timing_stats['step_total'] else 0.0
+            if step_total_s > 0:
+                def _pct(value_s: float | None) -> float:
+                    return (float(value_s) / step_total_s) * 100.0 if value_s else 0.0
+            else:
+                def _pct(value_s: float | None) -> float:
+                    return 0.0
+
             log_dict = {
                 # Core metrics
                 "train/loss": loss.item(),
@@ -1030,18 +1136,28 @@ while global_step < MAX_STEPS:
                 "grad/film_norm": grad_film,           # v4.7.0
                 "grad/dynamics_norm": grad_dynamics,   # v4.7.0
 
-                # v4.6.6: Timing & throughput metrics
+                # v4.7.2: Timing & throughput metrics
+                # Keep total step time in ms + LPIPS ms/call as absolute units; everything else is logged as percentages below.
                 "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
-                "timing/data_load_ms": timing_stats['data_load'] * 1000 if timing_stats['data_load'] else 0,
-                "timing/forward_ms": timing_stats['forward'] * 1000 if timing_stats['forward'] else 0,
-                "timing/backward_ms": timing_stats['backward'] * 1000 if timing_stats['backward'] else 0,
-                "timing/optimizer_ms": timing_stats['optimizer'] * 1000 if timing_stats['optimizer'] else 0,
+                "timing/loss_lpips_call_ms": timing_stats['loss_lpips_call'] * 1000 if timing_stats['loss_lpips_call'] else 0,
                 "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0,
-            }
 
-            # Add LPIPS timing if available
-            if timing_stats['lpips'] is not None:
-                log_dict["timing/lpips_ms"] = timing_stats['lpips'] * 1000
+                # v4.7.2: Percent of total step time (EMA-based)
+                "timing_pct/data_load": _pct(timing_stats['data_load']),
+                "timing_pct/forward_total": _pct(timing_stats['forward_total']),
+                "timing_pct/embed_film": _pct(timing_stats['embed_film']),
+                "timing_pct/model_step": _pct(timing_stats['model_step']),
+                "timing_pct/loss_semantic": _pct(timing_stats['loss_semantic']),
+                "timing_pct/loss_lpips_total": _pct(timing_stats['loss_lpips_total']),
+                "timing_pct/action_rank": _pct(timing_stats['action_rank']),
+                "timing_pct/backward_total": _pct(timing_stats['backward_total']),
+                "timing_pct/backward": _pct(timing_stats['backward']),
+                "timing_pct/unscale": _pct(timing_stats['unscale']),
+                "timing_pct/grad_clip": _pct(timing_stats['grad_clip']),
+                "timing_pct/optimizer_total": _pct(timing_stats['optimizer_total']),
+                "timing_pct/optimizer_step": _pct(timing_stats['optimizer_step']),
+                "timing_pct/scaler_update": _pct(timing_stats['scaler_update']),
+            }
 
             wandb.log(log_dict, step=global_step)
 

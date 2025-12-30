@@ -610,3 +610,8 @@ train.py
 Target: Fix v4.7.0's LPIPS degradation (0.12→0.24) and action conditioning failure via adaptive AR curriculum + explicit action supervision
 
 Expected: TF LPIPS 0.11-0.15, AR LPIPS <2× TF, action_response >0.05 (vs 0.015)
+
+**v4.7.2**
+
+train.py
+- Replaced coarse forward/backward timings with per-step EMA breakdown (embed+FiLM, model_step, semantic, LPIPS total + ms/call, action_rank, backward sub-steps, optimizer sub-steps)
