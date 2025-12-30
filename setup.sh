@@ -3,12 +3,6 @@
 # Run with: bash setup.sh
 set -e  # Exit on error
 
-echo "Setting up Project Ochre environment..."
-git clone https://github.com/peanutChowder/project-ochre
-cd project-ochre
-bash install_vast.sh
-cd ..
-
 echo "Installing vqvae checkpoint..."
 
 pip install gdown
