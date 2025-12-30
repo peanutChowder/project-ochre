@@ -102,8 +102,8 @@ FILM_LR_MULT = 3.0              # FiLM learning rate multiplier (3× base LR)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.2-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.2"
+RUN_NAME = "v4.7.3-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.3"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
