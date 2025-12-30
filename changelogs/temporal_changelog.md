@@ -620,3 +620,4 @@ train.py
 
 train.py
 - Turned `SEMANTIC_WEIGHT = 0` and added conditional skip computation when 0
+- Doubled `BATCH_SIZE`, `LR`, `MIN_LR`, `WARMUP_STEPS`

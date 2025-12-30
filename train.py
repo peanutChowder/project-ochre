@@ -41,11 +41,11 @@ VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
-BATCH_SIZE = 32
+BATCH_SIZE = 64         # v4.7.3 doubled batch size
 MAX_STEPS = 50_000  # v4.7.0: Step-based training (replaces EPOCHS)
-LR = 3e-5
-WARMUP_STEPS = 500
-MIN_LR = 1e-6         
+LR = 6e-5               # v4.7.3 doubled LR
+WARMUP_STEPS = 1000     # v4.7.3 doubled warmup
+MIN_LR = 2e-6           # v4.7.3 doubled minimum LR
 USE_CHECKPOINTING = False 
 
 # --- LOSS WEIGHTS ---
@@ -790,7 +790,7 @@ while global_step < MAX_STEPS:
                 loss_texture = semantic_criterion(logits_flat, target_flat, global_step=global_step)
             else:
                 loss_texture = torch.tensor(0.0, device=DEVICE)
-                
+
             loss_semantic_time_total += (time.perf_counter() - t_semantic_start)
 
             # 3. LPIPS Perceptual Loss (v4.6.2: Differentiable via Gumbel-Softmax)
