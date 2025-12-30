@@ -676,7 +676,7 @@ while global_step < MAX_STEPS:
         loader_iter = iter(loader)
 
     # Get next batch
-    t_step_start = time.time()
+    t_step_start = time.perf_counter()
     try:
         batch = next(loader_iter)
     except StopIteration:
