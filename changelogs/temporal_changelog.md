@@ -621,3 +621,13 @@ train.py
 train.py
 - Turned `SEMANTIC_WEIGHT = 0` and added conditional skip computation when 0
 - Doubled `BATCH_SIZE`, `LR`, `MIN_LR`, `WARMUP_STEPS`
+
+Results, step 40k:
+- `live_inference.py` quality faces the same issues as previous verison - strong initial scene that maintains quality until camera movements triggered -> scene collapse
+  - WASD+jump fully ignored
+- Wandb indicates poor FiLM gradients, increasing but then *declining* gamma and sensitivity.
+- AR len never increases: Starts at AR len 3, but due to AR loss decreasing slowly at the *same* rate as TF loss, LPIPS ratio stays around ~1.5.
+
+- Possible culprits:
+  - Insufficient AR learning signals vs TF signals
+  - Weak action conditioning still - ~0.03 `film_norm` vs ~0.4 `dynamics_norm` -> 13x slower learning for FiLM
