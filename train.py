@@ -1104,7 +1104,6 @@ while global_step < MAX_STEPS:
                 # v4.7.1: AR curriculum diagnostics with adaptive brake
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
-                "ar_len": ar_len,  # Explicit root-level logging (requested)
                 "curriculum/ar_cutoff": ar_cutoff,
                 "curriculum/lpips_tf_ema": lpips_tf_ema if lpips_tf_ema is not None else 0.0,
                 "curriculum/lpips_ar_ema": lpips_ar_ema if lpips_ar_ema is not None else 0.0,
