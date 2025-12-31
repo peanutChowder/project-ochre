@@ -631,3 +631,13 @@ Results, step 40k:
 - Possible culprits:
   - Insufficient AR learning signals vs TF signals
   - Weak action conditioning still - ~0.03 `film_norm` vs ~0.4 `dynamics_norm` -> 13x slower learning for FiLM
+
+**v4.7.4**
+
+train.py
+- Re-enabled semantic loss: `SEMANTIC_WEIGHT = 0.5` (provides gradients to action pathway)
+- AR loss upweighting: `AR_LOSS_WEIGHT = 2.5` (emphasizes deployment condition, AR now ~40% of loss vs 15%)
+- FiLM gradient balancing: `FILM_LR_MULT = 15.0` (addresses 13× gradient imbalance: film_norm=0.03 vs dynamics_norm=0.4)
+- Stronger action supervision: `ACTION_RANK_WEIGHT = 2.0`, `ACTION_RANK_FREQ = 5` (4× stronger, 2× more frequent)
+
+Target: Fix v4.7.3's gradient imbalance + LPIPS ratio stuck at 1.45-1.5 preventing ar_len progression

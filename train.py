@@ -49,13 +49,17 @@ MIN_LR = 1.5e-6         # v4.7.3: 1.5× minimum LR
 USE_CHECKPOINTING = False 
 
 # --- LOSS WEIGHTS ---
-# v4.6.5: Focus on perceptual sharpness via LPIPS
-# Only 2 loss components: Semantic + LPIPS (neighbor removed)
-SEMANTIC_WEIGHT = 0.0   # Embedding MSE (token prediction accuracy) - v4.6.3: Disabled to test whether is preventing LPIPS improvement
+# v4.7.4: Re-enable semantic loss + AR upweighting to fix gradient imbalance
+SEMANTIC_WEIGHT = 0.5    # Re-enabled: provides gradient signal to action pathway
 LPIPS_WEIGHT = 2.0       # Perceptual loss (sharpness, visual quality) - v4.6.5: 1.0 -> 2.0
                          # Combined with LPIPS_FREQ=1, this makes LPIPS the dominant signal
 LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flashing artifact
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
+
+# v4.7.4: AR loss upweighting (emphasize deployment condition)
+AR_LOSS_WEIGHT = 2.5     # Static upweighting of AR loss vs TF loss
+                         # Rationale: AR is deployment condition, TF and AR were improving at same rate
+                         # despite AR being harder task (3 frames vs 17 frames contributing to loss)
 
 # --- CURRICULUM ---
 # v4.7.1: seq_len curriculum removed - seq_len dynamically grows with ar_len
@@ -79,31 +83,28 @@ AR_BRAKE_HYSTERESIS = 0.05      # Prevent oscillation
 AR_BRAKE_RATIO_UPPER = 1.8      # If AR LPIPS >1.8x TF, reduce AR intensity
 AR_BRAKE_RATIO_LOWER = 1.3      # If AR LPIPS <1.3x TF, allow increases
 
-# Optional: AR frame weighting (keep disabled; can induce blur)
-AR_FRAME_WEIGHTING = False
-AR_WEIGHT_SCALE = 0.5
-
 # v4.6.6: Single-step AR mix DISABLED in v4.7.1 (replaced by guaranteed AR exposure)
 AR_MIX_ENABLED = False          # Disabled: v4.7.1 uses guaranteed AR exposure instead
 AR_MIX_PROB = 0.0               # Not used
 
 # --- ACTION CONDITIONING (TIER 1) ---
-# v4.7.1: Action-contrastive ranking loss (correctness supervision)
-ACTION_RANK_WEIGHT = 0.5        # Weight for action ranking loss
-ACTION_RANK_FREQ = 10           # Compute ranking loss every N steps
+# v4.7.4: Strengthened action-contrastive ranking loss
+ACTION_RANK_WEIGHT = 2.0        # Increased from 0.5 - stronger action supervision
+ACTION_RANK_FREQ = 5            # Increased from 10 - more frequent action gradients
 ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
 
 # NOTE: ACTION_RANK_NUM_NEG removed - hardcoded to 1 for efficiency
 # NOTE: ACTION_NOISE_SCALE not implemented - reserved for future use
 
 # --- OPTIMIZATION ---
-# v4.7.1: Address gradient imbalance (dynamics >> FiLM)
-FILM_LR_MULT = 3.0              # FiLM learning rate multiplier (3× base LR)
+# v4.7.4: Drastically increase FiLM LR to address 13× gradient imbalance
+FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient imbalance
+                                # v4.7.3 showed dynamics_norm=0.4, film_norm=0.03 (13× ratio)
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.3-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.3"
+RUN_NAME = "v4.7.4-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.4"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -850,11 +851,10 @@ while global_step < MAX_STEPS:
             else:
                 teacher_losses.append(loss_step)
 
-        loss = torch.stack(step_losses).mean()
-
-        # v4.7.0: Compute split losses for logging
+        # v4.7.4: Apply AR loss upweighting (emphasize deployment condition)
         loss_teacher = torch.stack(teacher_losses).mean() if teacher_losses else torch.tensor(0.0, device=DEVICE)
         loss_ar = torch.stack(ar_losses).mean() if ar_losses else torch.tensor(0.0, device=DEVICE)
+        loss = loss_teacher + AR_LOSS_WEIGHT * loss_ar
 
         # v4.7.1+: Action-contrastive ranking loss (every ACTION_RANK_FREQ steps)
         t_action_rank_start = time.perf_counter()
