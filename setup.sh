@@ -18,7 +18,7 @@ ls preprocessedv4
 
 echo "🚀 Installing dependencies"
 
-# Detect CUDA version
+# Detect CUDA version and GPU architecture
 if command -v nvcc &> /dev/null; then
     CUDA_VERSION=$(nvcc --version | grep "release" | sed 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/')
     echo "✅ Detected CUDA version: $CUDA_VERSION"
@@ -27,17 +27,29 @@ else
     CUDA_VERSION="auto"
 fi
 
-# Install PyTorch based on CUDA version
-# CUDA 12.x requires PyTorch 2.2.0+
-if [[ "$CUDA_VERSION" == "11.8"* ]]; then
+# Detect if RTX 5090 or other Blackwell GPUs present (requires PyTorch 2.7.0+)
+GPU_NEEDS_SM120=false
+if command -v nvidia-smi &> /dev/null; then
+    if nvidia-smi --query-gpu=name --format=csv,noheader | grep -qi "50[0-9][0-9]"; then
+        echo "✅ Detected RTX 50-series GPU (Blackwell architecture)"
+        GPU_NEEDS_SM120=true
+    fi
+fi
+
+# Install PyTorch based on CUDA version and GPU architecture
+# RTX 5090 (sm_120) requires PyTorch 2.7.0+
+if [[ "$GPU_NEEDS_SM120" == "true" ]]; then
+    echo "📦 Installing PyTorch 2.7.0+ for Blackwell architecture (RTX 50-series)..."
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
     echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
     pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 elif [[ "$CUDA_VERSION" == "12."* ]]; then
-    echo "📦 Installing PyTorch 2.2.0 for CUDA 12.x (compatible with $CUDA_VERSION)..."
-    pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+    echo "📦 Installing PyTorch 2.7.0+ for CUDA 12.x (compatible with $CUDA_VERSION)..."
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 else
-    echo "📦 Installing PyTorch 2.2.0 (auto-detect CUDA)..."
-    pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0
+    echo "📦 Installing PyTorch 2.7.0+ (auto-detect CUDA)..."
+    pip install torch torchvision torchaudio
 fi
 
 # Install other dependencies (matching Kaggle setup)
