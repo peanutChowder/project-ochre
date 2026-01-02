@@ -659,3 +659,12 @@ train.py
   - Previous versions: `x_in = X_seq[:, t]` during teacher forcing (target frame embedding → actions irrelevant)
   - v4.8.0: `x_in = X_seq[:, t-1]` during teacher forcing, so must use hidden state and actions to predict next frame, much more like `live_inference.py`
 Target: Force model to learn action conditioning by removing visual shortcut that made actions irrelevant
+
+**v4.8.1**
+
+train.py
+- Multi-step action conditioning validation: measures action response at 1, 5, and 10 step rollouts
+  - New metrics: `action_response/average_{1,5,10}step` to catch degradation over longer AR sequences
+  - Replaced old AR rollout visualization with 30-frame action rollouts (4 actions × 6 timesteps)
+  - Logs to `visuals/action_rollout_30step` - shows if action conditioning persists or collapses during extended rollouts
+Target: Early detection of action conditioning failures that only appear during multi-step inference (matching live_inference.py failure mode)

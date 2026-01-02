@@ -42,7 +42,7 @@ MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
 BATCH_SIZE = 32         # v4.7.4: 48 -> 32
-MAX_STEPS = 50_000  # v4.7.0: Step-based training (replaces EPOCHS)
+MAX_STEPS = 300_000  # v4.7.0: Step-based training (replaces EPOCHS)
 LR = 3e-5             # v4.7.4: 4.5e-5 -> 3e-5
 WARMUP_STEPS = 750      # v4.7.3: 1.5× warmup (500 → 750)
 MIN_LR = 1e-6         # v4.7.4: 1.5e-6 -> 1e-6
@@ -114,6 +114,11 @@ SPIKE_LOSS = 15.0
 SPIKE_GRAD = 400
 EMERGENCY_SAVE_INTERVAL_HRS = 11.8
 MILESTONE_SAVE_STEPS = 10000  # v4.6.6: Save checkpoint every N steps
+
+# --- ACTION VALIDATION ---
+# v4.8.1: Multi-step action conditioning validation
+ACTION_VALIDATION_STEPS = [1, 5, 10]  # Test action response at different rollout lengths
+ACTION_VISUAL_ROLLOUT_LEN = 30         # Full rollout length for visual logging
 
 # v4.7.2: Fine-grained timing & throughput tracking
 TIMING_EMA_ALPHA = 0.1  # Smoothing factor for exponential moving average (0.1 = ~10 step window)
@@ -289,10 +294,47 @@ def log_ar_rollout_to_wandb(model, vqvae, Z_seq, A_seq, Z_target, global_step, a
         }, step=global_step)
 
 
+def compute_multistep_action_response(model, vqvae, z_start, action_vec, num_steps, device):
+    """
+    v4.8.1: Perform multi-step AR rollout with a fixed action.
+
+    Args:
+        model: World model
+        vqvae: VQ-VAE decoder
+        z_start: (1, H, W) starting frame tokens
+        action_vec: (1, 5) action to apply at each step
+        num_steps: Number of AR steps to roll out
+        device: torch device
+
+    Returns:
+        list of (3, IMG_H, IMG_W) RGB frames
+    """
+    with torch.no_grad():
+        x_t = model._embed_tokens(z_start)
+        h_state = model.init_state(1, device=device)
+
+        frames = []
+        for _ in range(num_steps):
+            # Get FiLM parameters for this action
+            gammas, betas = model.film(action_vec)  # (L, 1, C, 1, 1)
+
+            # Predict next frame
+            logits, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=gammas, betas_t=betas)
+            pred_tokens = logits.argmax(dim=1)  # (1, H, W)
+            pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
+
+            frames.append(pred_rgb.cpu())
+
+            # Update for next step (AR)
+            x_t = model._embed_tokens(pred_tokens)
+
+        return frames
+
+
 def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_step):
     """
-    v4.7.0: Action-specific validation to catch action conditioning failures.
-    Tests model response to different action types: static, camera movements, player movement.
+    v4.8.1: Multi-step action conditioning validation to catch degradation over AR rollouts.
+    Tests model response to different action types at multiple rollout lengths.
 
     Args:
         model: World model
@@ -303,7 +345,7 @@ def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_st
         global_step: Current training step
 
     Returns:
-        dict: Metrics for different action conditions
+        dict: Metrics for different action conditions and rollout lengths
     """
     if wandb is None: return {}
 
@@ -311,8 +353,6 @@ def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_st
         device = Z_seq.device
         # Use first sample
         z_start = Z_seq[0:1, 0]  # (1, H, W) - starting frame
-        x_start = model._embed_tokens(z_start)
-        h_start = model.init_state(1, device=device)
 
         # Action format: [yaw, pitch, move_x, move_z, action_5] (5-dim)
         # Test different action conditions
@@ -323,56 +363,68 @@ def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_st
             'move_forward': torch.tensor([[0.0, 0.0, 0.0, 0.5, 0.0]], device=device),  # Forward
         }
 
-        # Predict from same starting state with different actions
-        predictions = {}
+        # v4.8.1: Multi-step rollouts for each action
+        rollout_predictions = {}  # {action_name: {num_steps: [frames]}}
         for action_name, action_vec in test_actions.items():
-            # Get FiLM parameters for this action
-            gammas, betas = model.film(action_vec)  # (L, 1, C, 1, 1)
+            rollout_predictions[action_name] = {}
+            for num_steps in ACTION_VALIDATION_STEPS:
+                frames = compute_multistep_action_response(model, vqvae, z_start, action_vec, num_steps, device)
+                rollout_predictions[action_name][num_steps] = frames
 
-            # Single-step prediction
-            logits, _ = model.step(None, None, h_start, x_t=x_start, gammas_t=gammas, betas_t=betas)
-            pred_tokens = logits.argmax(dim=1)  # (1, H, W)
-            pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
+        # v4.8.1: Compute action response metrics at each rollout length
+        metrics = {}
+        for num_steps in ACTION_VALIDATION_STEPS:
+            # Get final frame from each rollout
+            static_frame = rollout_predictions['static'][num_steps][-1].flatten()
+            camera_l_frame = rollout_predictions['camera_left'][num_steps][-1].flatten()
+            camera_r_frame = rollout_predictions['camera_right'][num_steps][-1].flatten()
+            move_fwd_frame = rollout_predictions['move_forward'][num_steps][-1].flatten()
 
-            predictions[action_name] = pred_rgb.cpu()
+            # L2 distance between final frames (higher = better action response)
+            diff_camera_l = (static_frame - camera_l_frame).pow(2).mean().sqrt().item()
+            diff_camera_r = (static_frame - camera_r_frame).pow(2).mean().sqrt().item()
+            diff_move_fwd = (static_frame - move_fwd_frame).pow(2).mean().sqrt().item()
 
-        # Visualize: show all action-conditioned predictions side-by-side
-        vis_frames = []
+            # Average action response magnitude
+            action_response = (diff_camera_l + diff_camera_r + diff_move_fwd) / 3
+
+            # Store metrics with step suffix
+            step_suffix = f"_{num_steps}step" if num_steps > 1 else ""
+            metrics[f'action_response/camera_left_diff{step_suffix}'] = diff_camera_l
+            metrics[f'action_response/camera_right_diff{step_suffix}'] = diff_camera_r
+            metrics[f'action_response/move_forward_diff{step_suffix}'] = diff_move_fwd
+            metrics[f'action_response/average{step_suffix}'] = action_response
+
+        # v4.8.1: 30-frame rollout visualization - replaces old AR rollout
+        # Generate 30-frame rollouts for visual logging
+        rollout_30_predictions = {}
+        for action_name, action_vec in test_actions.items():
+            frames_30 = compute_multistep_action_response(model, vqvae, z_start, action_vec, ACTION_VISUAL_ROLLOUT_LEN, device)
+            rollout_30_predictions[action_name] = frames_30
+
+        # Show evenly spaced frames from 30-frame rollout (6 frames per action)
+        num_vis_frames = 6
+        vis_frames_30 = []
         for action_name in ['static', 'camera_left', 'camera_right', 'move_forward']:
-            pred_frame = torch.clamp(predictions[action_name], 0.0, 1.0)
-            vis_frames.append(pred_frame)
+            frames = rollout_30_predictions[action_name]
+            # Select evenly spaced frames
+            indices = [int(i * (ACTION_VISUAL_ROLLOUT_LEN - 1) / (num_vis_frames - 1)) for i in range(num_vis_frames)]
+            for idx in indices:
+                vis_frames_30.append(torch.clamp(frames[idx], 0.0, 1.0))
 
-        vis_tensor = torch.stack(vis_frames, dim=0)
-        grid = make_grid(vis_tensor, nrow=4, normalize=False, value_range=(0, 1), padding=2)
-        grid_np = (grid.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Create grid: 4 rows (actions) x 6 columns (time)
+        vis_tensor_30 = torch.stack(vis_frames_30, dim=0)
+        grid_30 = make_grid(vis_tensor_30, nrow=num_vis_frames, normalize=False, value_range=(0, 1), padding=2)
+        grid_np_30 = (grid_30.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
         wandb.log({
-            "visuals/action_conditioning": wandb.Image(
-                grid_np,
-                caption=f"Action Test | Static | Camera L | Camera R | Move Fwd | Step {global_step}"
+            "visuals/action_rollout_30step": wandb.Image(
+                grid_np_30,
+                caption=f"30-Step AR Rollouts (6 frames shown) | Rows: Static, Cam-L, Cam-R, Move-Fwd | Step {global_step}"
             )
         }, step=global_step)
 
-        # Compute diversity metrics: how different are action-conditioned predictions?
-        static_pred = predictions['static'].flatten()
-        camera_l_pred = predictions['camera_left'].flatten()
-        camera_r_pred = predictions['camera_right'].flatten()
-        move_fwd_pred = predictions['move_forward'].flatten()
-
-        # L2 distance between predictions (higher = better action response)
-        diff_camera_l = (static_pred - camera_l_pred).pow(2).mean().sqrt().item()
-        diff_camera_r = (static_pred - camera_r_pred).pow(2).mean().sqrt().item()
-        diff_move_fwd = (static_pred - move_fwd_pred).pow(2).mean().sqrt().item()
-
-        # Average action response magnitude
-        action_response = (diff_camera_l + diff_camera_r + diff_move_fwd) / 3
-
-        return {
-            'action_response/camera_left_diff': diff_camera_l,
-            'action_response/camera_right_diff': diff_camera_r,
-            'action_response/move_forward_diff': diff_move_fwd,
-            'action_response/average': action_response,
-        }
+        return metrics
 
 
 class GTTokenDataset(Dataset):
@@ -1148,10 +1200,7 @@ while global_step < MAX_STEPS:
     # Image Logs (Visual Confirmation)
     if global_step % IMAGE_LOG_STEPS == 0:
         log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
-        # v4.7.0: Also log AR rollout visualization when AR is active
-        if ar_len > 0:
-            log_ar_rollout_to_wandb(model, vqvae_model, Z_seq, A_seq, Z_target, global_step, ar_len)
-        # v4.7.0: Action conditioning validation
+        # v4.8.1: Multi-step action conditioning validation (replaces old AR rollout viz)
         action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, A_seq, Z_target, global_step)
         if wandb and action_metrics:
             wandb.log(action_metrics, step=global_step)
