@@ -40,25 +40,39 @@ else
     CUDA_VERSION="auto"
 fi
 
-# Detect if RTX 5090 or other Blackwell GPUs present (requires PyTorch nightly)
-GPU_NEEDS_SM120=false
+# Detect if RTX 50-series (Blackwell) GPUs present
+GPU_IS_BLACKWELL=false
 if command -v nvidia-smi &> /dev/null; then
     if nvidia-smi --query-gpu=name --format=csv,noheader | grep -qi "50[0-9][0-9]"; then
-        echo "⚠️  Detected RTX 50-series GPU (Blackwell architecture)"
-        echo "⚠️  RTX 5090 is not yet supported by stable PyTorch releases"
-        echo "⚠️  Please use a different GPU (RTX 4090, H100, A100) or wait for PyTorch 2.11+ stable"
-        GPU_NEEDS_SM120=true
+        echo "✅ Detected RTX 50-series GPU (Blackwell architecture)"
+        GPU_IS_BLACKWELL=true
     fi
 fi
 
 # Install PyTorch based on CUDA version and GPU architecture
-# RTX 5090 (sm_120) NOT YET SUPPORTED - warn and skip
-if [[ "$GPU_NEEDS_SM120" == "true" ]]; then
-    echo "❌ Skipping PyTorch installation - RTX 5090 requires sm_120 support"
-    echo "   Current PyTorch releases only support up to sm_90 (H100, RTX 4090)"
-    echo "   Manually install nightly build: pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126"
-    echo "   Note: Even nightly builds may not have sm_120 support yet as of 2025-12-31"
-    exit 1
+#
+# Blackwell (RTX 50-series) support:
+# - Prefer stable CUDA 12.6 wheels from the official PyTorch index.
+# - If that fails (temporary packaging gaps), fall back to nightly.
+if [[ "$GPU_IS_BLACKWELL" == "true" ]]; then
+    echo "📦 Installing PyTorch for Blackwell (prefer stable cu126 wheels; fallback to nightly if needed)..."
+    set +e
+    pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "⚠️  Stable cu126 install failed; retrying with nightly cu126..."
+        pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
+        status=$?
+    fi
+    set -e
+    if [[ $status -ne 0 ]]; then
+        echo "❌ Failed to install PyTorch for Blackwell GPU."
+        echo "   Try running manually:"
+        echo "   pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126"
+        echo "   or nightly:"
+        echo "   pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126"
+        exit 1
+    fi
 elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
     echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
     pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
