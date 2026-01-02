@@ -1109,16 +1109,6 @@ while global_step < MAX_STEPS:
                 "curriculum/lpips_ar_ema": lpips_ar_ema if lpips_ar_ema is not None else 0.0,
                 "curriculum/lpips_ratio": (lpips_ar_ema / (lpips_tf_ema + 1e-6)) if (lpips_ar_ema and lpips_tf_ema) else 0.0,
 
-                # v4.7.1: Brake state tracking
-                "curriculum/brake_increase_count": brake_increase_count,
-                "curriculum/brake_decrease_count": brake_decrease_count,
-                "curriculum/brake_stable_count": brake_stable_count,
-
-                # v4.6.6: AR mix diagnostics (DISABLED in v4.7.1)
-                "ar_mix/enabled": 0.0,
-                "ar_mix/probability": 0.0,
-                "ar_mix/actual_frequency": 0.0,
-
                 # Action diagnostics
                 "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
                 "action_diagnostics/film_beta_magnitude": beta_magnitude,
@@ -1130,35 +1120,19 @@ while global_step < MAX_STEPS:
                 "diagnostics/unique_codes": unique_codes,
 
                 # v4.5: NEW diagnostics
-                "diagnostics/spatial_gradient": spatial_gradient.item(),
                 "diagnostics/confidence_std": confidence_std.item(),
                 "diagnostics/confidence_min": confidence_min.item(),
 
                 "train/grad_norm": float(grad_norm),
                 "grad/film_norm": grad_film,           # v4.7.0
                 "grad/dynamics_norm": grad_dynamics,   # v4.7.0
+                "grad/spatial_gradient": spatial_gradient.item(),
 
                 # v4.7.2: Timing & throughput metrics
                 # Keep total step time in ms + LPIPS ms/call as absolute units; everything else is logged as percentages below.
                 "timing/step_total_ms": timing_stats['step_total'] * 1000 if timing_stats['step_total'] else 0,
                 "timing/loss_lpips_call_ms": timing_stats['loss_lpips_call'] * 1000 if timing_stats['loss_lpips_call'] else 0,
-                "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0,
-
-                # v4.7.2: Percent of total step time (EMA-based)
-                "timing_pct/data_load": _pct(timing_stats['data_load']),
-                "timing_pct/forward_total": _pct(timing_stats['forward_total']),
-                "timing_pct/embed_film": _pct(timing_stats['embed_film']),
-                "timing_pct/model_step": _pct(timing_stats['model_step']),
-                "timing_pct/loss_semantic": _pct(timing_stats['loss_semantic']),
-                "timing_pct/loss_lpips_total": _pct(timing_stats['loss_lpips_total']),
-                "timing_pct/action_rank": _pct(timing_stats['action_rank']),
-                "timing_pct/backward_total": _pct(timing_stats['backward_total']),
-                "timing_pct/backward": _pct(timing_stats['backward']),
-                "timing_pct/unscale": _pct(timing_stats['unscale']),
-                "timing_pct/grad_clip": _pct(timing_stats['grad_clip']),
-                "timing_pct/optimizer_total": _pct(timing_stats['optimizer_total']),
-                "timing_pct/optimizer_step": _pct(timing_stats['optimizer_step']),
-                "timing_pct/scaler_update": _pct(timing_stats['scaler_update']),
+                "timing/throughput_steps_per_sec": 1.0 / timing_stats['step_total'] if timing_stats['step_total'] and timing_stats['step_total'] > 0 else 0
             }
 
             wandb.log(log_dict, step=global_step)
