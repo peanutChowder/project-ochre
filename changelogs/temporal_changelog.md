@@ -643,11 +643,19 @@ train.py
 Target: Fix v4.7.3's gradient imbalance + LPIPS ratio stuck at 1.45-1.5 preventing ar_len progression
 
 Results, step 50k:
-- **Gradient imbalance worsened**: 13× → 33× (film_norm: 0.03→0.09, dynamics_norm: 0.4→3.0)
+- Gradient imbalance worsened: 13× → 33× (film_norm: 0.03→0.09, dynamics_norm: 0.4→3.0)
   - FILM_LR_MULT=15 insufficient - dynamics gradients increased 6× while film only 3×
-- **Action conditioning still broken**: film_gamma declining (6.5→3.0), WASD/jump non-functional
+- Action conditioning still broken: film_gamma declining (6.5→3.0), WASD/jump non-functional
   - action_response metrics <0.03 (target >0.05), action_rank/loss stuck at 0.049 (target <0.01)
-- **LPIPS ratio stuck at 1.45** - ar_len remains at 3, no progression
-- **Visual improvements**: 3D block edges visible during camera movement (new), WandB samples nearly match GT
-- **Live inference**: Initial frames strong, static rollouts stable, but camera input causes quality drop (better than v4.7.3 though - retains 3D structure for <20s before blob collapse)
-- **Diagnosis**: Gradient sign conflict suspected - film_norm increasing but gamma declining suggests reconstruction losses dominating and learning "ignore actions"
+- LPIPS ratio stuck at 1.45 - ar_len remains at 3, no progression
+- Visual improvements: 3D block edges visible during camera movement (new), WandB samples nearly match GT
+- Live inference: Initial frames strong, static rollouts stable, but camera input causes quality drop (better than v4.7.3 though - retains 3D structure for <20s before blob collapse)
+- Diagnosis: Gradient sign conflict suspected - film_norm increasing but gamma declining suggests reconstruction losses dominating and learning "ignore actions"
+
+**v4.7.5**
+
+train.py
+- Potentially critical fix for FiLM conditioning: teacher forcing now uses previous frame (not target frame) as input
+  - Previous versions: `x_in = X_seq[:, t]` during teacher forcing (target frame embedding → actions irrelevant)
+  - v4.7.5: `x_in = X_seq[:, t-1]` during teacher forcing, so must use hidden state and actions to predict next frame, much more like `live_inference.py`
+Target: Force model to learn action conditioning by removing visual shortcut that made actions irrelevant

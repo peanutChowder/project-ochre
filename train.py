@@ -103,8 +103,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.4-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.4"
+RUN_NAME = "v4.7.5-step0"
+MODEL_OUT_PREFIX = "ochre-v4.7.5"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -743,18 +743,26 @@ while global_step < MAX_STEPS:
                           t < ar_cutoff and  # Only apply AR mix in teacher-forced region
                           prev_pred_tokens is not None and
                           random.random() < AR_MIX_PROB)
-            
+
             is_ar_step = use_ar_rollout or use_ar_mix
 
-            if is_ar_step:
-                # Use previous prediction (detached to prevent gradient backprop through time)
+            # v4.7.5: CRITICAL FIX - Always use PREVIOUS frame as input (match live inference)
+            # Previous versions used X_seq[:, t] (target frame) during teacher forcing
+            # This created train/test mismatch - model had access to target during training
+            # but only previous frame during inference, making actions irrelevant
+            if t == 0:
+                # First frame: use ground truth (no previous frame available)
+                x_in = X_seq[:, 0]
+            elif is_ar_step:
+                # AR step: Use previous prediction (detached to prevent gradient backprop through time)
                 with torch.no_grad():
                     x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
                 if use_ar_mix:
                     ar_mix_count += 1
             else:
-                # Normal teacher forcing (ground truth)
-                x_in = X_seq[:, t]
+                # Teacher forcing: Use PREVIOUS ground truth frame (not target frame!)
+                # This forces model to use actions to transform prev->next
+                x_in = X_seq[:, t-1]
 
             # Step
             g_t = Gammas_seq[:, :, t]
