@@ -103,8 +103,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.8.0-step0"
-MODEL_OUT_PREFIX = "ochre-v4.8.0"
+RUN_NAME = "v4.8.1-step0"
+MODEL_OUT_PREFIX = "ochre-v4.8.1"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
