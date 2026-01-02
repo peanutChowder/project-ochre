@@ -652,10 +652,10 @@ Results, step 50k:
 - Live inference: Initial frames strong, static rollouts stable, but camera input causes quality drop (better than v4.7.3 though - retains 3D structure for <20s before blob collapse)
 - Diagnosis: Gradient sign conflict suspected - film_norm increasing but gamma declining suggests reconstruction losses dominating and learning "ignore actions"
 
-**v4.7.5**
+**v4.8.0**
 
 train.py
 - Potentially critical fix for FiLM conditioning: teacher forcing now uses previous frame (not target frame) as input
   - Previous versions: `x_in = X_seq[:, t]` during teacher forcing (target frame embedding → actions irrelevant)
-  - v4.7.5: `x_in = X_seq[:, t-1]` during teacher forcing, so must use hidden state and actions to predict next frame, much more like `live_inference.py`
+  - v4.8.0: `x_in = X_seq[:, t-1]` during teacher forcing, so must use hidden state and actions to predict next frame, much more like `live_inference.py`
 Target: Force model to learn action conditioning by removing visual shortcut that made actions irrelevant

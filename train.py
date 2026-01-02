@@ -103,8 +103,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.7.5-step0"
-MODEL_OUT_PREFIX = "ochre-v4.7.5"
+RUN_NAME = "v4.8.0-step0"
+MODEL_OUT_PREFIX = "ochre-v4.8.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -746,7 +746,7 @@ while global_step < MAX_STEPS:
 
             is_ar_step = use_ar_rollout or use_ar_mix
 
-            # v4.7.5: CRITICAL FIX - Always use PREVIOUS frame as input (match live inference)
+            # v4.8.0: CRITICAL FIX - Always use PREVIOUS frame as input (match live inference)
             # Previous versions used X_seq[:, t] (target frame) during teacher forcing
             # This created train/test mismatch - model had access to target during training
             # but only previous frame during inference, making actions irrelevant
