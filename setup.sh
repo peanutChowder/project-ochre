@@ -1,20 +1,33 @@
 #!/bin/bash
 # Installation script for Vast.ai / Linux CUDA environments
-# Run with: bash setup.sh
+# Run with: bash setup.sh (from project-ochre directory or parent)
 set -e  # Exit on error
 
 echo "Installing vqvae checkpoint..."
 
 pip install gdown
-cd project-ochre
-mkdir checkpoints && cd checkpoints
+
+# Create checkpoints directory if it doesn't exist
+mkdir -p checkpoints
+cd checkpoints
 gdown 1hpBa3d-JX3vmHtH-e1FkSEdvyBtzcN6z # vqvae v2.1.6
-cd ../..
+cd ..
 
 echo "Installing dataset..."
-gdown 104I8PGlrUdshuI4LPT5TXDwjWvaxVu2i
-unzip preprocessedv4.zip
-ls preprocessedv4
+# Download to parent directory or current directory based on location
+if [[ $(basename "$PWD") == "project-ochre" ]]; then
+    # Already in project-ochre, go up one level for dataset
+    cd ..
+    gdown 104I8PGlrUdshuI4LPT5TXDwjWvaxVu2i
+    unzip -q preprocessedv4.zip
+    ls preprocessedv4
+    cd project-ochre
+else
+    # In parent directory
+    gdown 104I8PGlrUdshuI4LPT5TXDwjWvaxVu2i
+    unzip -q preprocessedv4.zip
+    ls preprocessedv4
+fi
 
 echo "🚀 Installing dependencies"
 
@@ -27,20 +40,25 @@ else
     CUDA_VERSION="auto"
 fi
 
-# Detect if RTX 5090 or other Blackwell GPUs present (requires PyTorch 2.7.0+)
+# Detect if RTX 5090 or other Blackwell GPUs present (requires PyTorch nightly)
 GPU_NEEDS_SM120=false
 if command -v nvidia-smi &> /dev/null; then
     if nvidia-smi --query-gpu=name --format=csv,noheader | grep -qi "50[0-9][0-9]"; then
-        echo "✅ Detected RTX 50-series GPU (Blackwell architecture)"
+        echo "⚠️  Detected RTX 50-series GPU (Blackwell architecture)"
+        echo "⚠️  RTX 5090 is not yet supported by stable PyTorch releases"
+        echo "⚠️  Please use a different GPU (RTX 4090, H100, A100) or wait for PyTorch 2.11+ stable"
         GPU_NEEDS_SM120=true
     fi
 fi
 
 # Install PyTorch based on CUDA version and GPU architecture
-# RTX 5090 (sm_120) requires PyTorch 2.7.0+
+# RTX 5090 (sm_120) NOT YET SUPPORTED - warn and skip
 if [[ "$GPU_NEEDS_SM120" == "true" ]]; then
-    echo "📦 Installing PyTorch 2.7.0+ for Blackwell architecture (RTX 50-series)..."
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    echo "❌ Skipping PyTorch installation - RTX 5090 requires sm_120 support"
+    echo "   Current PyTorch releases only support up to sm_90 (H100, RTX 4090)"
+    echo "   Manually install nightly build: pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126"
+    echo "   Note: Even nightly builds may not have sm_120 support yet as of 2025-12-31"
+    exit 1
 elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
     echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
     pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
