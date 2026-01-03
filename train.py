@@ -72,25 +72,25 @@ SEQ_LEN_INCREASE_STEPS = 5000   # Not used
 # v4.7.1: AR curriculum with adaptive brake (TIER 2 - PRIMARY)
 # Warm up with teacher forcing, then guarantee some AR exposure with adaptive quality control
 CURRICULUM_AR = True             # Re-enabled: AR rollout during training
-AR_WARMUP_STEPS = 5000          # Warm up before starting AR 
-AR_MIN_LEN = 3                  # Minimum AR length (after warmup)
-AR_MAX_LEN = 25                 # Maximum AR rollout length 
+AR_WARMUP_STEPS = 5000          # Warm up before starting AR
+AR_MIN_LEN = 10                 # v4.9.0: Increased from 3 to force longer rollouts
+AR_MAX_LEN = 25                 # Maximum AR rollout length
 
 # Adaptive AR brake: prevent LPIPS degradation by monitoring AR vs TF quality
 ADAPTIVE_AR_BRAKE = True
 AR_BRAKE_EMA_ALPHA = 0.98       # Smoothing for LPIPS tracking
 AR_BRAKE_HYSTERESIS = 0.05      # Prevent oscillation
-AR_BRAKE_RATIO_UPPER = 1.8      # If AR LPIPS >1.8x TF, reduce AR intensity
-AR_BRAKE_RATIO_LOWER = 1.3      # If AR LPIPS <1.3x TF, allow increases
+AR_BRAKE_RATIO_UPPER = 2.0      # v4.9.0: Increased from 1.8 - more lenient
+AR_BRAKE_RATIO_LOWER = 1.6      # v4.9.0: Increased from 1.3 - allow progression at current 1.5 ratio
 
 # v4.6.6: Single-step AR mix DISABLED in v4.7.1 (replaced by guaranteed AR exposure)
 AR_MIX_ENABLED = False          # Disabled: v4.7.1 uses guaranteed AR exposure instead
 AR_MIX_PROB = 0.0               # Not used
 
 # --- ACTION CONDITIONING (TIER 1) ---
-# v4.7.4: Strengthened action-contrastive ranking loss
+# v4.9.0: Action ranking loss per step with proper hidden state
 ACTION_RANK_WEIGHT = 2.0        # Increased from 0.5 - stronger action supervision
-ACTION_RANK_FREQ = 5            # Increased from 10 - more frequent action gradients
+ACTION_RANK_FREQ = 1            # v4.9.0: Every step (was 5) - continuous action gradients
 ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
 
 # NOTE: ACTION_RANK_NUM_NEG removed - hardcoded to 1 for efficiency
@@ -103,8 +103,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.8.1-step0"
-MODEL_OUT_PREFIX = "ochre-v4.8.1"
+RUN_NAME = "v4.9.0-step0"
+MODEL_OUT_PREFIX = "ochre-v4.9.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -771,9 +771,16 @@ while global_step < MAX_STEPS:
     lpips_loss_steps = []    # v4.6.2: Track LPIPS losses across sequence
     lpips_tf_steps = []      # v4.7.1: Track TF LPIPS separately
     lpips_ar_steps = []      # v4.7.1: Track AR LPIPS separately
-    logits_last = None
+    logits_last = None       # v4.9.0: Track logits for AR gradient flow
     prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
     ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
+
+    # v4.9.0: Action ranking (Option A) - capture a single realistic hidden state/input
+    # Instead of caching all h_states (huge memory), sample one timestep and capture h_state and x_in used there.
+    do_action_rank = (global_step % ACTION_RANK_FREQ == 0 and K > 1)
+    t_rank = random.randint(1, K - 1) if do_action_rank else None
+    h_rank = None
+    x_rank = None
 
     model_step_time_total = 0.0
     loss_semantic_time_total = 0.0
@@ -806,9 +813,21 @@ while global_step < MAX_STEPS:
                 # First frame: use ground truth (no previous frame available)
                 x_in = X_seq[:, 0]
             elif is_ar_step:
-                # AR step: Use previous prediction (detached to prevent gradient backprop through time)
-                with torch.no_grad():
-                    x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]  # (B, H, W) -> (B, 1, H, W) -> (B, D, H, W)
+                # v4.9.0: AR with gradient flow via Gumbel-Softmax
+                # Previous approach detached gradients, preventing BPTT through AR chain
+                # New approach: Use differentiable soft token selection
+                tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
+
+                # Gumbel-Softmax for differentiable token selection
+                logits_flat = logits_last.permute(0, 2, 3, 1).reshape(-1, logits_last.size(1))  # (B*H*W, codebook_size)
+                probs = F.gumbel_softmax(logits_flat, tau=tau, hard=False, dim=-1)  # (B*H*W, codebook_size)
+                probs = probs.reshape(B, H, W, -1)  # (B, H, W, codebook_size)
+
+                # Soft embedding lookup (gradients flow!)
+                soft_embeddings = torch.matmul(probs, codebook)  # (B, H, W, embed_dim)
+                soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, embed_dim, H, W)
+                x_in = model.in_proj(soft_embeddings)  # (B, hidden_dim, H, W)
+
                 if use_ar_mix:
                     ar_mix_count += 1
             else:
@@ -819,6 +838,13 @@ while global_step < MAX_STEPS:
             # Step
             g_t = Gammas_seq[:, :, t]
             b_t = Betas_seq[:, :, t]
+
+            # v4.9.0: Option A - capture the realistic hidden state and actual input used at t_rank
+            # Capture BEFORE the step (this is the state used to predict frame t).
+            if do_action_rank and t_rank is not None and t == t_rank:
+                # Detach to avoid backpropagating through the whole unroll (keeps memory bounded).
+                h_rank = h_state.detach().clone()
+                x_rank = x_in
 
             t_model_step_start = time.perf_counter()
             if USE_CHECKPOINTING:
@@ -916,19 +942,12 @@ while global_step < MAX_STEPS:
         loss_ar = torch.stack(ar_losses).mean() if ar_losses else torch.tensor(0.0, device=DEVICE)
         loss = loss_teacher + AR_LOSS_WEIGHT * loss_ar
 
-        # v4.7.1+: Action-contrastive ranking loss (every ACTION_RANK_FREQ steps)
+        # v4.9.0: Action-contrastive ranking loss with realistic hidden state (Option A)
         t_action_rank_start = time.perf_counter()
         loss_action_rank = torch.tensor(0.0, device=DEVICE)
-        if global_step % ACTION_RANK_FREQ == 0 and K > 1:
-            # Select a random timestep to evaluate action conditioning
-            # Use teacher-forced context for stability (avoid AR compounding errors)
-            t_rank = random.randint(1, K - 1)
-
-            # Get starting state (teacher-forced up to t_rank-1 for realistic h_state)
-            # NOTE: For efficiency, we use fresh h_state here (minimal version)
-            # Better approach: replay TF forward to t_rank for realistic hidden state
-            h_rank = model.init_state(B, device=DEVICE)
-            x_rank = X_seq[:, t_rank]  # Ground truth at t_rank
+        if do_action_rank:
+            if h_rank is None or x_rank is None or t_rank is None:
+                raise RuntimeError("Action ranking enabled but failed to capture h_rank/x_rank during unroll.")
 
             # True action: should predict target better
             g_true = Gammas_seq[:, :, t_rank]
@@ -945,7 +964,8 @@ while global_step < MAX_STEPS:
             a_neg = A_seq[:, t_rank][perm]  # Shuffled actions
             g_neg, b_neg = model.compute_film(a_neg.unsqueeze(1))  # (B, 1, A) -> (L, B, C, 1, 1)
 
-            # Compute prediction with wrong action (detach h_state to prevent interference)
+            # Compute prediction with wrong action
+            # Detach state for the negative branch to avoid gradients that "make negatives worse" via state dynamics.
             logits_neg, _ = model.step(None, None, h_rank.detach(), x_t=x_rank,
                                       gammas_t=g_neg[:, :, 0], betas_t=b_neg[:, :, 0])
 
@@ -984,7 +1004,7 @@ while global_step < MAX_STEPS:
             grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params]), 2).item()
 
     t_clip_start = time.perf_counter()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.5: Tighter clipping (was 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # v4.9.0: Increased from 0.5 for BPTT through AR
     t_clip_end = time.perf_counter()
     t_backward_end = time.perf_counter()
 

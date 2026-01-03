@@ -668,3 +668,16 @@ train.py
   - Replaced old AR rollout visualization with 30-frame action rollouts (4 actions × 6 timesteps)
   - Logs to `visuals/action_rollout_30step` - shows if action conditioning persists or collapses during extended rollouts
 Target: Early detection of action conditioning failures that only appear during multi-step inference (matching live_inference.py failure mode)
+
+**v4.9.0**
+
+train.py
+- AR gradient flow via Gumbel-Softmax: Removed gradient detachment in AR rollout to enable BPTT through time
+  - Soft token selection allows gradients from frame t+10 to improve action conditioning at frame t
+- Aggressive curriculum: `AR_MIN_LEN = 10` (3->10), `AR_BRAKE_RATIO_LOWER = 1.6` (1.3->1.6), `AR_BRAKE_RATIO_UPPER = 2.0` (1.8->2.0)
+  - Forces longer AR rollouts (10 frames) where visual shortcuts should fail, making actions necessary
+- Action ranking improvements: `ACTION_RANK_FREQ = 1` (every step, was 5), realistic hidden states from forward pass
+  - 5x stronger action supervision signal (every step vs every 5)
+  - Captures actual h_state during unroll instead of fresh init (memory efficient single-timestep sampling)
+- Gradient clipping increased: 0.5->1.0 to provide headroom for longer BPTT gradient chains
+Target: Combined approach - attack action conditioning from multiple angles (visual shortcut + gradient flow + stronger supervision)
