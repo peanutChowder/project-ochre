@@ -8,7 +8,14 @@ venv/
 preprocessed*/
 MineRLNavigate-v0/
 outputs/
+*.zip
+
+detailed-changelogs/
 
 
 # models
 checkpoints/
+
+.*/
+.*
+
