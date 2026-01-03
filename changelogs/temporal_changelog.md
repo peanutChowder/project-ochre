@@ -681,3 +681,15 @@ train.py
   - Captures actual h_state during unroll instead of fresh init (memory efficient single-timestep sampling)
 - Gradient clipping increased: 0.5->1.0 to provide headroom for longer BPTT gradient chains
 Target: Combined approach - attack action conditioning from multiple angles (visual shortcut + gradient flow + stronger supervision)
+
+Results, step 80k:
+- Catastrophic failure: Gradient explosion to ~800 in both FiLM and dynamics pathways (10-15k onset)
+- Visual quality degraded progressively (10k good → 40k severe → 80k dark/poor)
+  - Solid color blocks (brown, gray, orange, black) - repetitive patterns
+  - Unique codes: 25-30 (2.4-2.9% of 1024 codebook) vs v4.8.1's 40-43
+- LPIPS stable at 0.30-0.35 while visuals collapsed (metric failure)
+- Noiser action conditioning metrics: action_rank/loss converged to v4.8.1 baseline (0.048), response metrics weak/noisy
+- AR curriculum instability: ar_len reached 20-25 (higher than v4.8.1's 17) but oscillated, quality didn't improve
+- BPTT failure mechanism: 10-step gradient chain caused exponential growth (clipping 800→1.0 destroyed 99.875% of gradient info)
+- v4.9.0 objectively worse than v4.8.1 across all meaningful metrics - BPTT not viable without architectural changes
+
