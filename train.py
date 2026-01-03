@@ -805,12 +805,11 @@ while global_step < MAX_STEPS:
 
             is_ar_step = use_ar_rollout or use_ar_mix
 
-            # v4.8.0: CRITICAL FIX - Always use PREVIOUS frame as input (match live inference)
-            # Previous versions used X_seq[:, t] (target frame) during teacher forcing
-            # This created train/test mismatch - model had access to target during training
-            # but only previous frame during inference, making actions irrelevant
+            # Teacher forcing: use current frame embedding as input
+            # Dataset alignment: Z_target[:, t] is next frame, A_seq[:, t] is action at t
+            # So we use X_seq[:, t] (current frame) + A_seq[:, t] (action) to predict Z_target[:, t] (next frame)
             if t == 0:
-                # First frame: use ground truth (no previous frame available)
+                # First frame: use ground truth
                 x_in = X_seq[:, 0]
             elif is_ar_step:
                 # v4.9.0: AR with gradient flow via Gumbel-Softmax
@@ -823,17 +822,17 @@ while global_step < MAX_STEPS:
                 probs = F.gumbel_softmax(logits_flat, tau=tau, hard=False, dim=-1)  # (B*H*W, codebook_size)
                 probs = probs.reshape(B, H, W, -1)  # (B, H, W, codebook_size)
 
-                # Soft embedding lookup (gradients flow!)
-                soft_embeddings = torch.matmul(probs, codebook)  # (B, H, W, embed_dim)
-                soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, embed_dim, H, W)
+                # Soft embedding lookup using world model's embedding table (NOT VQ-VAE codebook!)
+                # model.embed.weight shape: (codebook_size, embed_dim=256)
+                soft_embeddings = torch.matmul(probs, model.embed.weight)  # (B, H, W, embed_dim=256)
+                soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, embed_dim=256, H, W)
                 x_in = model.in_proj(soft_embeddings)  # (B, hidden_dim, H, W)
 
                 if use_ar_mix:
                     ar_mix_count += 1
             else:
-                # Teacher forcing: Use PREVIOUS ground truth frame (not target frame!)
-                # This forces model to use actions to transform prev->next
-                x_in = X_seq[:, t-1]
+                # Teacher forcing: Use current ground truth frame
+                x_in = X_seq[:, t]
 
             # Step
             g_t = Gammas_seq[:, :, t]
