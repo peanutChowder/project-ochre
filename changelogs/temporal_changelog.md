@@ -693,3 +693,10 @@ Results, step 80k:
 - BPTT failure mechanism: 10-step gradient chain caused exponential growth (clipping 800→1.0 destroyed 99.875% of gradient info)
 - v4.9.0 objectively worse than v4.8.1 across all meaningful metrics - BPTT not viable without architectural changes
 
+**v4.10.0**
+
+- Inverse Dynamics Module: Auxiliary head predicts actions from hidden state transitions (h_t -> h_{t+1}), forces model to encode action info in states
+- Reverted v4.9.0 BPTT (gradient explosion to ~800) → stable detached AR from v4.8.1
+- Kept: AR_MIN_LEN=10, ACTION_RANK_FREQ=1, realistic h_state, loosened brake (1.6/2.0)
+Target: Stable action conditioning via auxiliary supervision (DreamerV3 approach)
+

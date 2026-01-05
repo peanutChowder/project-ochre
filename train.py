@@ -96,6 +96,11 @@ ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
 # NOTE: ACTION_RANK_NUM_NEG removed - hardcoded to 1 for efficiency
 # NOTE: ACTION_NOISE_SCALE not implemented - reserved for future use
 
+# --- INVERSE DYNAMICS MODULE (v4.10.0) ---
+IDM_LOSS_WEIGHT = 1.0  # Weight for IDM loss
+                       # Actions in [-1,1], expected MSE ~0.1-0.5
+                       # Start conservative, increase to 2.0 if film_gamma doesn't respond
+
 # --- OPTIMIZATION ---
 # v4.7.4: Drastically increase FiLM LR to address 13× gradient imbalance
 FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient imbalance
@@ -103,8 +108,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.9.0-step0"
-MODEL_OUT_PREFIX = "ochre-v4.9.0"
+RUN_NAME = "v4.10.0-step0"
+MODEL_OUT_PREFIX = "ochre-v4.10.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -775,6 +780,9 @@ while global_step < MAX_STEPS:
     prev_pred_tokens = None  # v4.6.6: Track previous prediction for AR mix
     ar_mix_count = 0         # v4.6.6: Count AR mix steps for diagnostics
 
+    # v4.10.0: IDM loss accumulation
+    idm_losses = []
+
     # v4.9.0: Action ranking (Option A) - capture a single realistic hidden state/input
     # Instead of caching all h_states (huge memory), sample one timestep and capture h_state and x_in used there.
     do_action_rank = (global_step % ACTION_RANK_FREQ == 0 and K > 1)
@@ -812,21 +820,11 @@ while global_step < MAX_STEPS:
                 # First frame: use ground truth
                 x_in = X_seq[:, 0]
             elif is_ar_step:
-                # v4.9.0: AR with gradient flow via Gumbel-Softmax
-                # Previous approach detached gradients, preventing BPTT through AR chain
-                # New approach: Use differentiable soft token selection
-                tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
-
-                # Gumbel-Softmax for differentiable token selection
-                logits_flat = logits_last.permute(0, 2, 3, 1).reshape(-1, logits_last.size(1))  # (B*H*W, codebook_size)
-                probs = F.gumbel_softmax(logits_flat, tau=tau, hard=False, dim=-1)  # (B*H*W, codebook_size)
-                probs = probs.reshape(B, H, W, -1)  # (B, H, W, codebook_size)
-
-                # Soft embedding lookup using world model's embedding table (NOT VQ-VAE codebook!)
-                # model.embed.weight shape: (codebook_size, embed_dim=256)
-                soft_embeddings = torch.matmul(probs, model.embed.weight)  # (B, H, W, embed_dim=256)
-                soft_embeddings = soft_embeddings.permute(0, 3, 1, 2)  # (B, embed_dim=256, H, W)
-                x_in = model.in_proj(soft_embeddings)  # (B, hidden_dim, H, W)
+                # v4.10.0: Detached AR (reverted from v4.9.0)
+                # Gradient detachment prevents BPTT instability
+                # IDM provides action conditioning instead
+                with torch.no_grad():
+                    x_in = model.compute_embeddings(prev_pred_tokens.unsqueeze(1))[:, 0]
 
                 if use_ar_mix:
                     ar_mix_count += 1
@@ -837,6 +835,10 @@ while global_step < MAX_STEPS:
             # Step
             g_t = Gammas_seq[:, :, t]
             b_t = Betas_seq[:, :, t]
+
+            # v4.10.0: Capture previous hidden state for IDM (detach to truncate BPTT).
+            # We want IDM gradients to shape the current transition, not backprop through the whole unroll.
+            h_prev_for_idm = h_state.detach()
 
             # v4.9.0: Option A - capture the realistic hidden state and actual input used at t_rank
             # Capture BEFORE the step (this is the state used to predict frame t).
@@ -860,6 +862,15 @@ while global_step < MAX_STEPS:
             else:
                 logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
             model_step_time_total += (time.perf_counter() - t_model_step_start)
+
+            # v4.10.0: Inverse Dynamics Module loss
+            # Predict action from hidden state transition (h_t → h_{t+1}) for this step's action A_seq[:, t].
+            h_prev_top = h_prev_for_idm[-1]  # top layer (most processed representation)
+            h_next_top = h_state[-1]
+            action_pred = model.idm(h_prev_top, h_next_top)  # (B, action_dim)
+            action_gt = A_seq[:, t]  # action applied on this step
+            loss_idm_step = F.mse_loss(action_pred, action_gt)
+            idm_losses.append(loss_idm_step)
 
             logits_last = logits_t
 
@@ -980,6 +991,10 @@ while global_step < MAX_STEPS:
             loss = loss + ACTION_RANK_WEIGHT * loss_action_rank
         action_rank_time = time.perf_counter() - t_action_rank_start
 
+        # v4.10.0: Add IDM loss
+        loss_idm = torch.stack(idm_losses).mean() if idm_losses else torch.tensor(0.0, device=DEVICE)
+        loss = loss + IDM_LOSS_WEIGHT * loss_idm
+
     t_forward_end = time.perf_counter()
     t_backward_start = time.perf_counter()
     t_backward_compute_start = time.perf_counter()
@@ -1003,7 +1018,7 @@ while global_step < MAX_STEPS:
             grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params]), 2).item()
 
     t_clip_start = time.perf_counter()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # v4.9.0: Increased from 0.5 for BPTT through AR
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.10.0: Revert to v4.8.1 clipping (v4.9.0 used 1.0 for BPTT headroom)
     t_clip_end = time.perf_counter()
     t_backward_end = time.perf_counter()
 
@@ -1105,7 +1120,10 @@ while global_step < MAX_STEPS:
             throughput = 1.0 / timing_stats['step_total'] if timing_stats['step_total'] > 0 else 0
             lpips_call_ms = int(timing_stats['loss_lpips_call'] * 1000) if timing_stats['loss_lpips_call'] is not None else 0
             print(
-                f"[Step {global_step}] Loss: {loss.item():.4f} | {throughput:.2f} steps/s | "
+                f"[Step {global_step}] Loss: {loss.item():.4f} "
+                f"(TF: {loss_teacher.item():.3f}, AR: {loss_ar.item():.3f}, "
+                f"IDM: {loss_idm.item():.3f}, Rank: {loss_action_rank.item():.3f}) | "
+                f"{throughput:.2f} steps/s | "
                 f"Total: {timing_stats['step_total']*1000:.1f}ms "
                 f"(Data: {timing_stats['data_load']*1000:.0f}ms, "
                 f"Emb+FiLM: {timing_stats['embed_film']*1000:.0f}ms, "
@@ -1177,6 +1195,10 @@ while global_step < MAX_STEPS:
                 # v4.7.1: Action ranking loss
                 "action_rank/loss": loss_action_rank.item(),
 
+                # v4.10.0: IDM diagnostics
+                "idm/loss": loss_idm.item(),
+                "idm/loss_per_action": loss_idm.item() / 5,  # Normalize by action_dim
+
                 # v4.6.0: Gumbel-Softmax tau annealing
                 "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
 
@@ -1192,6 +1214,7 @@ while global_step < MAX_STEPS:
                 "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
                 "action_diagnostics/film_beta_magnitude": beta_magnitude,
                 "action_diagnostics/sensitivity": action_sensitivity,
+                "action_diagnostics/action_magnitude": A_seq.abs().mean().item(),  # v4.10.0: Track dataset action distribution
 
                 # Existing diagnostics
                 "diagnostics/entropy": entropy.item(),

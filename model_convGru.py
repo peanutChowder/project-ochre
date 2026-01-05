@@ -85,6 +85,60 @@ class ActionFiLM(nn.Module):
         return torch.stack(gammas), torch.stack(betas)
 
 
+class InverseDynamicsModule(nn.Module):
+    """
+    Predicts action a_t from hidden state transition (h_t, h_{t+1}).
+
+    Theory: If h_{t+1} properly encodes the transition caused by a_t,
+    we should be able to invert this to predict a_t. Forces model to
+    encode action information in hidden states.
+
+    v4.10.0: Uses adaptive spatial pooling (18×32 → 9×16) to maintain
+    general location information while reducing dimensionality.
+    """
+    def __init__(self, hidden_dim: int = 256, action_dim: int = 5):
+        super().__init__()
+
+        # Spatial pooling: 18×32 → 9×16 (preserves 4×2 spatial grid)
+        # Rationale: Maintains left/right, top/bottom quadrants for camera movements
+        self.pool = nn.AdaptiveAvgPool2d((9, 16))
+
+        # Input: concatenated [h_t_pooled, h_{t+1}_pooled]
+        # Pooled dims: hidden_dim × 9 × 16 = 256 × 144 = 36,864 per state
+        # Concatenated: 2 × 36,864 = 73,728
+        pooled_size = hidden_dim * 9 * 16
+
+        # MLP: 2-layer with 512 hidden dim (similar to FiLM internal dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(pooled_size * 2, 512),
+            nn.SiLU(),
+            nn.Linear(512, action_dim)
+        )
+
+    def forward(self, h_t, h_next):
+        """
+        Args:
+            h_t: (B, hidden_dim, H, W) hidden state at time t
+            h_next: (B, hidden_dim, H, W) hidden state at time t+1
+
+        Returns:
+            action_pred: (B, action_dim) predicted action
+        """
+        # Pool spatial dimensions
+        h_t_pooled = self.pool(h_t)  # (B, 256, 9, 16)
+        h_next_pooled = self.pool(h_next)  # (B, 256, 9, 16)
+
+        # Flatten and concatenate
+        h_t_flat = h_t_pooled.flatten(1)  # (B, 36864)
+        h_next_flat = h_next_pooled.flatten(1)  # (B, 36864)
+        combined = torch.cat([h_t_flat, h_next_flat], dim=1)  # (B, 73728)
+
+        # Predict action
+        action_pred = self.mlp(combined)  # (B, 5)
+
+        return action_pred
+
+
 # ----------------------------
 # World model: token space ConvGRU + FiLM
 # ----------------------------
@@ -122,6 +176,8 @@ class WorldModelConvFiLM(nn.Module):
         self.in_proj = nn.Conv2d(embed_dim, hidden_dim, kernel_size=1)
         self.grus = nn.ModuleList([ConvGRUCell(hidden_dim) for _ in range(n_layers)])
         self.film = ActionFiLM(action_dim, hidden_dim, n_layers)
+        # v4.10.0: Inverse Dynamics Module for action conditioning
+        self.idm = InverseDynamicsModule(hidden_dim, action_dim)
         self.out = nn.Conv2d(hidden_dim, codebook_size, kernel_size=1)
 
         # Optional delta mode: learn residual over identity; identity bias via zero init
