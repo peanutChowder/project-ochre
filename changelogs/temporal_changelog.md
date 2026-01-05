@@ -700,3 +700,9 @@ Results, step 80k:
 - Kept: AR_MIN_LEN=10, ACTION_RANK_FREQ=1, realistic h_state, loosened brake (1.6/2.0)
 Target: Stable action conditioning via auxiliary supervision (DreamerV3 approach)
 
+**v4.10.1**
+
+- Loss rebalancing to fix mode collapse @ v4.10.0 step 19.5k (unique_codes ~35, repetitive green stripes)
+- Increased reconstruction: SEMANTIC 0.5→1.0 (+100%), LPIPS 2.0→3.0 (+50%); Reduced action: IDM 1.0→0.5 (-50%)
+Target: Maintain action conditioning (film_gamma >3.0, ranking <0.01) while recovering diversity (unique_codes >70)
+

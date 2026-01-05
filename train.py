@@ -49,9 +49,9 @@ MIN_LR = 1e-6         # v4.7.4: 1.5e-6 -> 1e-6
 USE_CHECKPOINTING = False 
 
 # --- LOSS WEIGHTS ---
-# v4.7.4: Re-enable semantic loss + AR upweighting to fix gradient imbalance
-SEMANTIC_WEIGHT = 0.5    # Re-enabled: provides gradient signal to action pathway
-LPIPS_WEIGHT = 2.0       # Perceptual loss (sharpness, visual quality) - v4.6.5: 1.0 -> 2.0
+# v4.10.1: Rebalance to fight mode collapse while maintaining action conditioning
+SEMANTIC_WEIGHT = 1.0    # v4.10.1: Increased from 0.5 to encourage codebook diversity
+LPIPS_WEIGHT = 3.0       # v4.10.1: Increased from 2.0 to fight repetitive patterns
                          # Combined with LPIPS_FREQ=1, this makes LPIPS the dominant signal
 LPIPS_FREQ = 1           # v4.6.5: Every step (was 5) - eliminates periodic flashing artifact
 GUMBEL_TAU_STEPS = 20000 # Gumbel-Softmax annealing: 1.0→0.1 over this many steps
@@ -97,9 +97,9 @@ ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
 # NOTE: ACTION_NOISE_SCALE not implemented - reserved for future use
 
 # --- INVERSE DYNAMICS MODULE (v4.10.0) ---
-IDM_LOSS_WEIGHT = 1.0  # Weight for IDM loss
-                       # Actions in [-1,1], expected MSE ~0.1-0.5
-                       # Start conservative, increase to 2.0 if film_gamma doesn't respond
+IDM_LOSS_WEIGHT = 0.5  # v4.10.1: Reduced from 1.0 to reduce dominance over reconstruction
+                       # v4.10.0 @ 19.5k: IDM too strong → mode collapse (unique_codes ~35)
+                       # Need to rebalance: maintain action conditioning while improving diversity
 
 # --- OPTIMIZATION ---
 # v4.7.4: Drastically increase FiLM LR to address 13× gradient imbalance
@@ -108,8 +108,8 @@ FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient 
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.10.0-step0"
-MODEL_OUT_PREFIX = "ochre-v4.10.0"
+RUN_NAME = "v4.10.1-step0"
+MODEL_OUT_PREFIX = "ochre-v4.10.1"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
