@@ -706,3 +706,12 @@ Target: Stable action conditioning via auxiliary supervision (DreamerV3 approach
 - Increased reconstruction: SEMANTIC 0.5→1.0 (+100%), LPIPS 2.0→3.0 (+50%); Reduced action: IDM 1.0→0.5 (-50%)
 Target: Maintain action conditioning (film_gamma >3.0, ranking <0.01) while recovering diversity (unique_codes >70)
 
+Results, step 80k:
+- First run achieving functional action conditioning: action_rank 0.003-0.005 (10× better than v4.8.1), stable FiLM magnitudes (3.2-3.3), IDM converged (0.018-0.025)
+- Best 3D structure preservation: Approximate block shapes retained vs previous 2D collapse
+- Gradient imbalance improved: 16× (vs v4.8.1's 25×)
+- Unique codes recovered: 43-45 (vs v4.10.0's 35)
+- Camera response hierarchy: Pitch (up/down) excellent; Yaw (left/right) degrades over rollouts; WASD minimal; Jump partial (upward drift only)
+- Hierarchical action learning observed: Model learned by gradient signal strength (pitch > yaw > movement)
+- AR-sharpness trade-off: AR curriculum reduces reconstruction sharpness (~20% LPIPS increase) for rollout stability
+
