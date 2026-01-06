@@ -80,7 +80,7 @@ AR_MAX_LEN = 25                 # Maximum AR rollout length
 ADAPTIVE_AR_BRAKE = True
 AR_BRAKE_EMA_ALPHA = 0.98       # Smoothing for LPIPS tracking
 AR_BRAKE_HYSTERESIS = 0.05      # Prevent oscillation
-AR_BRAKE_RATIO_UPPER = 2.0      # v4.9.0: Increased from 1.8 - more lenient
+AR_BRAKE_RATIO_UPPER = 2.5      # v4.11.0: Increased from 2.0 - allow curriculum to progress past current 1.5 ratio
 AR_BRAKE_RATIO_LOWER = 1.6      # v4.9.0: Increased from 1.3 - allow progression at current 1.5 ratio
 
 # v4.6.6: Single-step AR mix DISABLED in v4.7.1 (replaced by guaranteed AR exposure)
@@ -88,28 +88,36 @@ AR_MIX_ENABLED = False          # Disabled: v4.7.1 uses guaranteed AR exposure i
 AR_MIX_PROB = 0.0               # Not used
 
 # --- ACTION CONDITIONING (TIER 1) ---
-# v4.9.0: Action ranking loss per step with proper hidden state
-ACTION_RANK_WEIGHT = 2.0        # Increased from 0.5 - stronger action supervision
+# v4.11.0: Reduced action ranking weight to balance with stronger IDM
+ACTION_RANK_WEIGHT = 1.0        # Reduced from 2.0 - make room for multi-step IDM
 ACTION_RANK_FREQ = 1            # v4.9.0: Every step (was 5) - continuous action gradients
 ACTION_RANK_MARGIN = 0.05       # Margin for ranking hinge loss
 
 # NOTE: ACTION_RANK_NUM_NEG removed - hardcoded to 1 for efficiency
 # NOTE: ACTION_NOISE_SCALE not implemented - reserved for future use
 
-# --- INVERSE DYNAMICS MODULE (v4.10.0) ---
+# --- INVERSE DYNAMICS MODULE (v4.11.0: Variable-Span "Time Telescope") ---
 IDM_LOSS_WEIGHT = 0.5  # v4.10.1: Reduced from 1.0 to reduce dominance over reconstruction
                        # v4.10.0 @ 19.5k: IDM too strong → mode collapse (unique_codes ~35)
                        # Need to rebalance: maintain action conditioning while improving diversity
 
+# v4.11.0: Multi-step IDM configuration
+MAX_IDM_SPAN = 5       # Maximum look-ahead frames for IDM (Time Telescope)
+                       # Movement velocity visible over 3-5 frames, not 1 frame
+MOVEMENT_WEIGHT = 10.0 # Penalty multiplier for Move_X / Move_Z actions
+                       # Single-step supervision insufficient for movement (weak gradient)
+JUMP_WEIGHT = 5.0      # Penalty multiplier for Jump action
+                       # Multi-step supervision helps capture jump arc dynamics
+
 # --- OPTIMIZATION ---
-# v4.7.4: Drastically increase FiLM LR to address 13× gradient imbalance
-FILM_LR_MULT = 15.0             # Increased from 3.0 to match observed gradient imbalance
-                                # v4.7.3 showed dynamics_norm=0.4, film_norm=0.03 (13× ratio)
+# v4.11.0: Further increase FiLM LR to provide more action gradient headroom
+FILM_LR_MULT = 25.0             # Increased from 15.0 (v4.10.1 still showed 16× imbalance)
+                                # Target: stronger action gradients for movement/yaw learning
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.10.1-step0"
-MODEL_OUT_PREFIX = "ochre-v4.10.1"
+RUN_NAME = "v4.11.0-step0"
+MODEL_OUT_PREFIX = "ochre-v4.11.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -527,6 +535,7 @@ print(f"VQ-VAE codebook shape (after transpose): {codebook.shape}, size: {codebo
 model = WorldModelConvFiLM(
     codebook_size=codebook_size,
     action_dim=5,
+    idm_max_span=MAX_IDM_SPAN,
     H=18,
     W=32,
     use_checkpointing=USE_CHECKPOINTING,
@@ -783,6 +792,9 @@ while global_step < MAX_STEPS:
     # v4.10.0: IDM loss accumulation
     idm_losses = []
 
+    # v4.11.0: Buffer for Time Telescope IDM
+    h_buffer = []  # Stores detached hidden states for variable-span IDM
+
     # v4.9.0: Action ranking (Option A) - capture a single realistic hidden state/input
     # Instead of caching all h_states (huge memory), sample one timestep and capture h_state and x_in used there.
     do_action_rank = (global_step % ACTION_RANK_FREQ == 0 and K > 1)
@@ -799,6 +811,13 @@ while global_step < MAX_STEPS:
     with autocast('cuda' if DEVICE == "cuda" else 'cpu'):
         # v4.7.0: Restore AR curriculum - use ar_len to determine AR rollout
         ar_cutoff = K - ar_len  # Steps [0, ar_cutoff) are teacher-forced, [ar_cutoff, K) are AR
+
+        # v4.11.0: Reuse tensors to reduce per-step allocations
+        dt_tensor = torch.empty((B,), device=DEVICE, dtype=torch.long)
+        action_weights = torch.tensor(
+            [1.0, 1.0, MOVEMENT_WEIGHT, MOVEMENT_WEIGHT, JUMP_WEIGHT],
+            device=DEVICE,
+        )
 
         for t in range(K):
             # Determine input source based on AR curriculum and AR mix
@@ -863,13 +882,35 @@ while global_step < MAX_STEPS:
                 logits_t, h_state = model.step(None, None, h_state, x_t=x_in, gammas_t=g_t, betas_t=b_t)
             model_step_time_total += (time.perf_counter() - t_model_step_start)
 
-            # v4.10.0: Inverse Dynamics Module loss
-            # Predict action from hidden state transition (h_t → h_{t+1}) for this step's action A_seq[:, t].
-            h_prev_top = h_prev_for_idm[-1]  # top layer (most processed representation)
-            h_next_top = h_state[-1]
-            action_pred = model.idm(h_prev_top, h_next_top)  # (B, action_dim)
-            action_gt = A_seq[:, t]  # action applied on this step
-            loss_idm_step = F.mse_loss(action_pred, action_gt)
+            # v4.11.0: Store detached state for IDM buffer
+            # Only store top layer to save memory (reduce from ~2.8GB to ~0.9GB)
+            h_buffer.append(h_state[-1].detach())
+
+            # v4.11.0: Variable-Span IDM ("Time Telescope")
+            loss_idm_step = torch.tensor(0.0, device=DEVICE)
+
+            if t >= 1:  # Need at least 1 past frame
+                # Random span: k ∈ [1, min(t, MAX_IDM_SPAN)]
+                max_lookback = min(t, MAX_IDM_SPAN)
+                k = random.randint(1, max_lookback)
+
+                # Retrieve states (buffer index: t → buffer[-1], t-k → buffer[-1-k])
+                # h_buffer now stores only top layer tensors (memory optimized)
+                h_end = h_buffer[-1]      # Current state, top layer
+                h_start = h_buffer[-1-k]  # Past state k steps ago, top layer
+
+                # Cumulative action target: sum(A_seq[:, t-k+1:t+1]) → (B, 5)
+                action_segment = A_seq[:, t-k+1:t+1]  # (B, k, 5)
+                action_target = action_segment.sum(dim=1)  # (B, 5)
+
+                # Predict with time-delta embedding
+                dt_tensor.fill_(k)
+                pred_action = model.idm(h_start, h_end, dt_tensor)  # (B, 5)
+
+                # Weighted loss: 10× movement, 5× jump
+                raw_loss = F.mse_loss(pred_action, action_target, reduction='none')  # (B, 5)
+                loss_idm_step = (raw_loss * action_weights).mean()
+
             idm_losses.append(loss_idm_step)
 
             logits_last = logits_t
@@ -1195,9 +1236,10 @@ while global_step < MAX_STEPS:
                 # v4.7.1: Action ranking loss
                 "action_rank/loss": loss_action_rank.item(),
 
-                # v4.10.0: IDM diagnostics
+                # v4.11.0: IDM diagnostics
                 "idm/loss": loss_idm.item(),
                 "idm/loss_per_action": loss_idm.item() / 5,  # Normalize by action_dim
+                "idm/max_span": MAX_IDM_SPAN,  # Track for reference
 
                 # v4.6.0: Gumbel-Softmax tau annealing
                 "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),

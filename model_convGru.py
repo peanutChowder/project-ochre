@@ -81,62 +81,70 @@ class ActionFiLM(nn.Module):
             
             gammas.append(g)
             betas.append(b)
-            
-        return torch.stack(gammas), torch.stack(betas)
+
+        # v4.11.0: Hard Clamp to prevent 1-frame flashes
+        # Gamma + 1.0 ranges 0.5 to 2.0. Values > 5.0 cause washout artifacts.
+        gammas = torch.stack(gammas)
+        betas = torch.stack(betas)
+
+        gammas = torch.clamp(gammas, -5.0, 5.0)
+        betas = torch.clamp(betas, -5.0, 5.0)
+
+        return gammas, betas
 
 
 class InverseDynamicsModule(nn.Module):
     """
-    Predicts action a_t from hidden state transition (h_t, h_{t+1}).
+    v4.11.0: Variable-Span IDM (The "Time Telescope")
+    Predicts cumulative action between h_t and h_{t+k} where k ∈ [1, max_span].
+    Includes Time-Delta embedding to tell the network the span length.
 
-    Theory: If h_{t+1} properly encodes the transition caused by a_t,
-    we should be able to invert this to predict a_t. Forces model to
-    encode action information in hidden states.
-
-    v4.10.0: Uses adaptive spatial pooling (18×32 → 9×16) to maintain
-    general location information while reducing dimensionality.
+    Theory: Movement velocity is visible over 3-5 frames (player displacement),
+    not 1 frame. Multi-step action prediction forces model to encode movement
+    momentum and temporal dynamics.
     """
-    def __init__(self, hidden_dim: int = 256, action_dim: int = 5):
+    def __init__(self, hidden_dim: int = 256, action_dim: int = 5, max_span: int = 5):
         super().__init__()
 
-        # Spatial pooling: 18×32 → 9×16 (preserves 4×2 spatial grid)
-        # Rationale: Maintains left/right, top/bottom quadrants for camera movements
+        # Spatial pooling: 18×32 → 9×16
+        # Maintains coarse spatial location (Left vs Right, Top vs Bottom)
         self.pool = nn.AdaptiveAvgPool2d((9, 16))
 
-        # Input: concatenated [h_t_pooled, h_{t+1}_pooled]
-        # Pooled dims: hidden_dim × 9 × 16 = 256 × 144 = 36,864 per state
-        # Concatenated: 2 × 36,864 = 73,728
-        pooled_size = hidden_dim * 9 * 16
+        # v4.11.0: Time-Delta Embedding
+        # Encodes scalar 'k' (span length) into a vector
+        self.dt_embed = nn.Embedding(max_span + 1, 64)
 
-        # MLP: 2-layer with 512 hidden dim (similar to FiLM internal dim)
+        # Input: (Pooled_State * 2) + Time_Embedding
+        pooled_size = hidden_dim * 9 * 16  # 256 * 144 = 36,864 per state
+        input_dim = (pooled_size * 2) + 64  # 73,728 + 64 = 73,792
+
         self.mlp = nn.Sequential(
-            nn.Linear(pooled_size * 2, 512),
+            nn.Linear(input_dim, 512),
             nn.SiLU(),
             nn.Linear(512, action_dim)
         )
 
-    def forward(self, h_t, h_next):
+    def forward(self, h_start, h_end, dt):
         """
         Args:
-            h_t: (B, hidden_dim, H, W) hidden state at time t
-            h_next: (B, hidden_dim, H, W) hidden state at time t+1
+            h_start: (B, hidden_dim, H, W) hidden state at time t-k
+            h_end: (B, hidden_dim, H, W) hidden state at time t
+            dt: (B,) Integer tensor of time deltas (span lengths, e.g., [1, 3, 5...])
 
         Returns:
-            action_pred: (B, action_dim) predicted action
+            action_pred: (B, action_dim) predicted cumulative action over span
         """
-        # Pool spatial dimensions
-        h_t_pooled = self.pool(h_t)  # (B, 256, 9, 16)
-        h_next_pooled = self.pool(h_next)  # (B, 256, 9, 16)
+        # 1. Pool and Flatten States
+        z_start = self.pool(h_start).flatten(1)  # (B, 36864)
+        z_end = self.pool(h_end).flatten(1)      # (B, 36864)
 
-        # Flatten and concatenate
-        h_t_flat = h_t_pooled.flatten(1)  # (B, 36864)
-        h_next_flat = h_next_pooled.flatten(1)  # (B, 36864)
-        combined = torch.cat([h_t_flat, h_next_flat], dim=1)  # (B, 73728)
+        # 2. Embed Time Delta
+        t_emb = self.dt_embed(dt)  # (B, 64)
 
-        # Predict action
-        action_pred = self.mlp(combined)  # (B, 5)
-
-        return action_pred
+        # 3. Concatenate and Predict
+        # [Start State, End State, Time Gap] -> Cumulative Action
+        combined = torch.cat([z_start, z_end, t_emb], dim=1)  # (B, 73792)
+        return self.mlp(combined)  # (B, action_dim)
 
 
 # ----------------------------
@@ -166,6 +174,7 @@ class WorldModelConvFiLM(nn.Module):
         H: int = 16,
         W: int = 16,
         action_dim: int = 4,
+        idm_max_span: int = 5,
         use_delta: bool = False,
         zero_init_head: bool = True,
         use_checkpointing: bool = False,
@@ -177,7 +186,7 @@ class WorldModelConvFiLM(nn.Module):
         self.grus = nn.ModuleList([ConvGRUCell(hidden_dim) for _ in range(n_layers)])
         self.film = ActionFiLM(action_dim, hidden_dim, n_layers)
         # v4.10.0: Inverse Dynamics Module for action conditioning
-        self.idm = InverseDynamicsModule(hidden_dim, action_dim)
+        self.idm = InverseDynamicsModule(hidden_dim, action_dim, max_span=idm_max_span)
         self.out = nn.Conv2d(hidden_dim, codebook_size, kernel_size=1)
 
         # Optional delta mode: learn residual over identity; identity bias via zero init

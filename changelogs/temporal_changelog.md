@@ -715,3 +715,10 @@ Results, step 80k:
 - Hierarchical action learning observed: Model learned by gradient signal strength (pitch > yaw > movement)
 - AR-sharpness trade-off: AR curriculum reduces reconstruction sharpness (~20% LPIPS increase) for rollout stability
 
+**v4.11.0**
+
+- Variable-span IDM ("Time Telescope"): predict cumulative action from (h_{t-k}, h_t) with time-delta embedding, k val range [1..5]
+- Movement-weighted IDM loss: 10× Move_X/Move_Z, 5× Jump
+- FiLM clamping: clamp gammas/betas to [-5, 5] to reduce 1-frame flash artifacts
+- Gradient/curriculum tuning: FILM_LR_MULT 15→25, AR_BRAKE_RATIO_UPPER 2.0→2.5, ACTION_RANK_WEIGHT 2.0→1.0
+Target: Improve WASD responsiveness and yaw stability over longer rollouts while preventing FiLM overshoot artifacts
