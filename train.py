@@ -813,7 +813,9 @@ while global_step < MAX_STEPS:
         ar_cutoff = K - ar_len  # Steps [0, ar_cutoff) are teacher-forced, [ar_cutoff, K) are AR
 
         # v4.11.0: Reuse tensors to reduce per-step allocations
-        dt_tensor = torch.empty((B,), device=DEVICE, dtype=torch.long)
+        # NOTE: Do not reuse a single dt tensor with in-place updates across timesteps.
+        # dt is used as indices into nn.Embedding; mutating it in-place before backward
+        # triggers autograd "modified by an inplace operation" version-counter errors.
         action_weights = torch.tensor(
             [1.0, 1.0, MOVEMENT_WEIGHT, MOVEMENT_WEIGHT, JUMP_WEIGHT],
             device=DEVICE,
@@ -904,7 +906,7 @@ while global_step < MAX_STEPS:
                 action_target = action_segment.sum(dim=1)  # (B, 5)
 
                 # Predict with time-delta embedding
-                dt_tensor.fill_(k)
+                dt_tensor = torch.full((B,), k, device=DEVICE, dtype=torch.long)
                 pred_action = model.idm(h_start, h_end, dt_tensor)  # (B, 5)
 
                 # Weighted loss: 10× movement, 5× jump
