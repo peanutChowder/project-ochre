@@ -97,6 +97,106 @@ def build_action_matrix_gamefactory(actions_dict: dict, angle_scale: float = 0.3
     pitch = np.clip(pitch, -1.0, 1.0)
     return np.stack([yaw, pitch, move_x, move_z, jump], axis=1).astype(np.float32)
 
+
+def build_action_matrix_gamefactory_v5(actions_dict: dict, angle_scale: float = 0.3) -> np.ndarray:
+    """
+    v5.0: Build [T, 15] float32 matrix with discrete action encoding.
+
+    Format: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
+
+    Yaw bins (5D one-hot):
+      Bin 0: [-1.0, -0.5] = Hard Left
+      Bin 1: (-0.5, -0.1] = Left
+      Bin 2: (-0.1, 0.1]  = Center
+      Bin 3: (0.1, 0.5]   = Right
+      Bin 4: (0.5, 1.0]   = Hard Right
+
+    Pitch bins (3D one-hot):
+      Bin 0: [-1.0, -0.2] = Down
+      Bin 1: (-0.2, 0.2]  = Level
+      Bin 2: (0.2, 1.0]   = Up
+
+    WASD (4D multi-hot): Can have multiple 1s for diagonal movement
+      Dim 8:  W (forward)
+      Dim 9:  A (left)
+      Dim 10: S (backward)
+      Dim 11: D (right)
+
+    Jump/Sprint/Sneak (3D binary):
+      Dim 12: Jump (Space, scs=1)
+      Dim 13: Sprint (Ctrl, scs=3)
+      Dim 14: Sneak (Shift, scs=2)
+
+    Expected per-step keys:
+      - ws: 0/1/2 → none / W (forward) / S (backward)
+      - ad: 0/1/2 → none / A (left) / D (right)
+      - yaw_delta, pitch_delta: float deltas
+      - scs: 0/1/2/3 → none / jump (Space) / sneak (Shift) / sprint (Ctrl)
+    """
+    T = len(actions_dict)
+    action_matrix = np.zeros((T, 15), dtype=np.float32)
+
+    for i, k in enumerate(sorted(actions_dict.keys(), key=int)):
+        a = actions_dict[k]
+
+        # 1. YAW BINNING (5D one-hot)
+        yaw_raw = float(a.get("yaw_delta", 0.0)) / angle_scale
+        yaw_raw = np.clip(yaw_raw, -1.0, 1.0)
+
+        if yaw_raw <= -0.5:
+            action_matrix[i, 0] = 1.0  # Hard Left
+        elif yaw_raw <= -0.1:
+            action_matrix[i, 1] = 1.0  # Left
+        elif yaw_raw <= 0.1:
+            action_matrix[i, 2] = 1.0  # Center
+        elif yaw_raw <= 0.5:
+            action_matrix[i, 3] = 1.0  # Right
+        else:
+            action_matrix[i, 4] = 1.0  # Hard Right
+
+        # 2. PITCH BINNING (3D one-hot)
+        pitch_raw = float(a.get("pitch_delta", 0.0)) / angle_scale
+        pitch_raw = np.clip(pitch_raw, -1.0, 1.0)
+
+        if pitch_raw <= -0.2:
+            action_matrix[i, 5] = 1.0  # Down
+        elif pitch_raw <= 0.2:
+            action_matrix[i, 6] = 1.0  # Level
+        else:
+            action_matrix[i, 7] = 1.0  # Up
+
+        # 3. WASD (4D multi-hot - can have multiple 1s)
+        ws = int(a.get("ws", 0))
+        ad = int(a.get("ad", 0))
+
+        if ws == 1:  # W pressed
+            action_matrix[i, 8] = 1.0
+        elif ws == 2:  # S pressed
+            action_matrix[i, 10] = 1.0
+
+        if ad == 1:  # A pressed
+            action_matrix[i, 9] = 1.0
+        elif ad == 2:  # D pressed
+            action_matrix[i, 11] = 1.0
+
+        # 4. JUMP (1D binary)
+        scs = int(a.get("scs", 0))
+        if scs == 1:
+            action_matrix[i, 12] = 1.0
+        # 5. SPRINT/SNEAK (2D binary - future)
+        elif scs == 3:  # Sprint (Ctrl)
+            action_matrix[i, 13] = 1.0
+        elif scs == 2:  # Sneak (Shift)
+            action_matrix[i, 14] = 1.0
+
+    return action_matrix
+
+
+def build_action_matrix_gamefactory_v412(actions_dict: dict, angle_scale: float = 0.3) -> np.ndarray:
+    """Back-compat alias for v5.0 15D discrete action encoding."""
+    return build_action_matrix_gamefactory_v5(actions_dict, angle_scale=angle_scale)
+
+
 def load_vqvae(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device)
     emb_dim = 256
@@ -191,7 +291,8 @@ def main(parent_dir: str,
         actions_dict = meta.get("actions", {})
         if not actions_dict:
             continue
-        per_step_actions = build_action_matrix_gamefactory(actions_dict, angle_scale=angle_scale)
+        # v5.0: Use 15D discrete action encoding
+        per_step_actions = build_action_matrix_gamefactory_v5(actions_dict, angle_scale=angle_scale)
         T = per_step_actions.shape[0]
 
         try:

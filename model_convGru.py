@@ -41,13 +41,16 @@ class ActionFiLM(nn.Module):
 
     v4.7.0: Increased internal MLP hidden dimension to 512 (was same as hidden_dim=256)
     to strengthen action conditioning. Camera rotations require complex geometric mappings.
+
+    v5.0: Scale internal dimension with both action_dim and hidden_dim for 15D actions.
     """
     def __init__(self, action_dim: int, hidden_dim: int, n_layers: int):
         super().__init__()
         self.n_layers = n_layers
         self.mlps = nn.ModuleList()
-        # v4.7.0: Use larger internal MLP hidden dim for stronger action encoding
-        film_internal_dim = 512  # Increased from hidden_dim (256) for better action capacity
+        # v5.0: Scale with both action_dim and hidden_dim
+        # For action_dim=15, hidden_dim=640: 640 * 2 = 1280
+        film_internal_dim = max(1024, hidden_dim * 2)
         for _ in range(n_layers):
             self.mlps.append(
                 nn.Sequential(
@@ -102,26 +105,34 @@ class InverseDynamicsModule(nn.Module):
     Theory: Movement velocity is visible over 3-5 frames (player displacement),
     not 1 frame. Multi-step action prediction forces model to encode movement
     momentum and temporal dynamics.
+
+    v5.0: AGGRESSIVE spatial pooling (18×32 → 4×8) to prevent parameter explosion
+    with larger hidden_dim. 3-layer MLP with dropout for better regularization.
     """
-    def __init__(self, hidden_dim: int = 256, action_dim: int = 5, max_span: int = 5):
+    def __init__(self, hidden_dim: int = 640, action_dim: int = 15, max_span: int = 5):
         super().__init__()
 
-        # Spatial pooling: 18×32 → 9×16
-        # Maintains coarse spatial location (Left vs Right, Top vs Bottom)
-        self.pool = nn.AdaptiveAvgPool2d((9, 16))
+        # v5.0: AGGRESSIVE pooling 18×32 → 4×8 (16× spatial reduction)
+        # Maintains coarse spatial awareness (left/right, top/bottom quadrants)
+        # Prevents parameter explosion: 640×4×8 = 20,480 (vs 640×9×16 = 92,160)
+        self.pool = nn.AdaptiveAvgPool2d((4, 8))
 
         # v4.11.0: Time-Delta Embedding
         # Encodes scalar 'k' (span length) into a vector
         self.dt_embed = nn.Embedding(max_span + 1, 64)
 
         # Input: (Pooled_State * 2) + Time_Embedding
-        pooled_size = hidden_dim * 9 * 16  # 256 * 144 = 36,864 per state
-        input_dim = (pooled_size * 2) + 64  # 73,728 + 64 = 73,792
+        pooled_size = hidden_dim * 4 * 8  # 640 * 32 = 20,480 per state
+        input_dim = (pooled_size * 2) + 64  # 40,960 + 64 = 41,024
 
+        # v5.0: 3-layer MLP with dropout for better action abstraction
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.SiLU(),
-            nn.Linear(512, action_dim)
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.SiLU(),
+            nn.Linear(256, action_dim)
         )
 
     def forward(self, h_start, h_end, dt):
@@ -168,16 +179,17 @@ class WorldModelConvFiLM(nn.Module):
     def __init__(
         self,
         codebook_size: int = 2048,
-        embed_dim: int = 256,
-        hidden_dim: int = 256,
-        n_layers: int = 3,
+        embed_dim: int = 320,        # v5.0: Was 256
+        hidden_dim: int = 640,       # v5.0: Was 256
+        n_layers: int = 6,           # v5.0: Was 3
         H: int = 16,
         W: int = 16,
-        action_dim: int = 4,
+        action_dim: int = 15,        # v5.0: Was 4 (now 15D discrete)
         idm_max_span: int = 5,
         use_delta: bool = False,
         zero_init_head: bool = True,
         use_checkpointing: bool = False,
+        use_residuals: bool = True,  # v5.0: NEW - residual connections every 2 layers
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -199,6 +211,7 @@ class WorldModelConvFiLM(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.use_checkpointing = use_checkpointing
+        self.use_residuals = use_residuals  # v5.0
 
     def _embed_tokens(self, Z):
         """
@@ -289,7 +302,11 @@ class WorldModelConvFiLM(nn.Module):
             # Compute the new hidden state for *this* GRU layer at *this* time step.
             # This is the recurrent state that will be passed to the *next time step*.
             h_new_recurrent_state = gru(modulated_input_to_gru, h_p)
-            
+
+            # v5.0: Residual connections every 2 layers (for gradient flow in deeper 6-layer stack)
+            if self.use_residuals and i > 0 and i % 2 == 0:
+                h_new_recurrent_state = h_new_recurrent_state + current_layer_input
+
             # Store this new recurrent state.
             new_h_list.append(h_new_recurrent_state)
             

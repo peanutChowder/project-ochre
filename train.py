@@ -109,15 +109,25 @@ MOVEMENT_WEIGHT = 10.0 # Penalty multiplier for Move_X / Move_Z actions
 JUMP_WEIGHT = 5.0      # Penalty multiplier for Jump action
                        # Multi-step supervision helps capture jump arc dynamics
 
+# v5.0: Per-dimension weights for 15D discrete action vector
+# Format: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
+ACTION_WEIGHTS = torch.tensor([
+    1.0, 1.0, 1.0, 1.0, 1.0,    # Yaw bins (5D one-hot) - camera control
+    1.0, 1.0, 1.0,               # Pitch bins (3D one-hot) - camera control
+    10.0, 10.0, 10.0, 10.0,      # WASD (4D multi-hot) - HIGH weight for movement
+    5.0,                          # Jump (1D binary) - moderate weight
+    2.0, 2.0                      # Sprint/Sneak (2D binary) - lower weight
+], device=DEVICE)
+
 # --- OPTIMIZATION ---
-# v4.11.0: Further increase FiLM LR to provide more action gradient headroom
-FILM_LR_MULT = 25.0             # Increased from 15.0 (v4.10.1 still showed 16× imbalance)
-                                # Target: stronger action gradients for movement/yaw learning
+# v5.0: Adjust FiLM LR multiplier for higher FiLM capacity (1280 internal dim)
+FILM_LR_MULT = 20.0             # v5.0: 25.0 -> 20.0 (FiLM capacity increased 2.5×, reduce multiplier)
+                                # Previous: 15.0 (v4.10.1) with 512 internal dim
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v4.11.0-step0"
-MODEL_OUT_PREFIX = "ochre-v4.11.0"
+RUN_NAME = "v5.0-step0"
+MODEL_OUT_PREFIX = "ochre-v5.0"
 RESUME_PATH = ""
 
 LOG_STEPS = 10
@@ -532,13 +542,18 @@ codebook_size = codebook.shape[0]  # Now correctly extracts num_embeddings
 print(f"VQ-VAE codebook shape (after transpose): {codebook.shape}, size: {codebook_size}")
 
 # C. Initialize World Model with correct codebook size
+# v5.0: Scaled capacity (640×6×15) with residual connections
 model = WorldModelConvFiLM(
     codebook_size=codebook_size,
-    action_dim=5,
+    embed_dim=320,              # v5.0: Was 256
+    hidden_dim=640,             # v5.0: Was 256
+    n_layers=6,                 # v5.0: Was 3
+    action_dim=15,              # v5.0: Was 5 (15D discrete actions)
     idm_max_span=MAX_IDM_SPAN,
     H=18,
     W=32,
     use_checkpointing=USE_CHECKPOINTING,
+    use_residuals=True,         # v5.0: NEW - residual connections every 2 layers
     zero_init_head=False  # Disable zero-init to prevent mode collapse at cold start
 ).to(DEVICE)
 
@@ -816,10 +831,9 @@ while global_step < MAX_STEPS:
         # NOTE: Do not reuse a single dt tensor with in-place updates across timesteps.
         # dt is used as indices into nn.Embedding; mutating it in-place before backward
         # triggers autograd "modified by an inplace operation" version-counter errors.
-        action_weights = torch.tensor(
-            [1.0, 1.0, MOVEMENT_WEIGHT, MOVEMENT_WEIGHT, JUMP_WEIGHT],
-            device=DEVICE,
-        )
+
+        # v4.12.0: Use global ACTION_WEIGHTS tensor for 15D actions
+        action_weights = ACTION_WEIGHTS
 
         for t in range(K):
             # Determine input source based on AR curriculum and AR mix
@@ -885,7 +899,9 @@ while global_step < MAX_STEPS:
             model_step_time_total += (time.perf_counter() - t_model_step_start)
 
             # v4.11.0: Store detached state for IDM buffer
-            # Only store top layer to save memory (reduce from ~2.8GB to ~0.9GB)
+            # Only store top layer to save memory.
+            # Note: we keep past states detached, but use the current (non-detached) state as h_end
+            # so IDM gradients can shape the dynamics trunk.
             h_buffer.append(h_state[-1].detach())
 
             # v4.11.0: Variable-Span IDM ("Time Telescope")
@@ -896,22 +912,38 @@ while global_step < MAX_STEPS:
                 max_lookback = min(t, MAX_IDM_SPAN)
                 k = random.randint(1, max_lookback)
 
-                # Retrieve states (buffer index: t → buffer[-1], t-k → buffer[-1-k])
-                # h_buffer now stores only top layer tensors (memory optimized)
-                h_end = h_buffer[-1]      # Current state, top layer
-                h_start = h_buffer[-1-k]  # Past state k steps ago, top layer
+                # Retrieve states (buffer index: t-k → buffer[-1-k]).
+                # Use current non-detached state for h_end so IDM gradients flow into the dynamics trunk.
+                h_start = h_buffer[-1-k]  # Past state k steps ago, top layer (detached)
+                h_end = h_state[-1]       # Current state, top layer (NOT detached)
 
-                # Cumulative action target: sum(A_seq[:, t-k+1:t+1]) → (B, 5)
-                action_segment = A_seq[:, t-k+1:t+1]  # (B, k, 5)
-                action_target = action_segment.sum(dim=1)  # (B, 5)
+                # Action targets over span (t-k+1 ... t), shape: (B, k, 15)
+                action_segment = A_seq[:, t-k+1:t+1]
 
                 # Predict with time-delta embedding
                 dt_tensor = torch.full((B,), k, device=DEVICE, dtype=torch.long)
-                pred_action = model.idm(h_start, h_end, dt_tensor)  # (B, 5)
+                pred_action = model.idm(h_start, h_end, dt_tensor)  # (B, 15)
 
-                # Weighted loss: 10× movement, 5× jump
-                raw_loss = F.mse_loss(pred_action, action_target, reduction='none')  # (B, 5)
-                loss_idm_step = (raw_loss * action_weights).mean()
+                # v5.0: Discrete-action IDM loss (match encoding)
+                # - Yaw (5) / Pitch (3): cross-entropy to soft targets (mean one-hot over window)
+                # - WASD + jump/sprint/sneak (7): BCEWithLogits to windowed probabilities
+                yaw_target = action_segment[:, :, 0:5].mean(dim=1)   # (B, 5), sums to ~1
+                pitch_target = action_segment[:, :, 5:8].mean(dim=1) # (B, 3), sums to ~1
+                bin_target = action_segment[:, :, 8:15].mean(dim=1)  # (B, 7), in [0,1]
+
+                yaw_logits = pred_action[:, 0:5]
+                pitch_logits = pred_action[:, 5:8]
+                bin_logits = pred_action[:, 8:15]
+
+                yaw_log_probs = F.log_softmax(yaw_logits, dim=-1)
+                pitch_log_probs = F.log_softmax(pitch_logits, dim=-1)
+                loss_yaw = -(yaw_target * yaw_log_probs).sum(dim=-1).mean()
+                loss_pitch = -(pitch_target * pitch_log_probs).sum(dim=-1).mean()
+
+                bin_bce = F.binary_cross_entropy_with_logits(bin_logits, bin_target, reduction='none')  # (B, 7)
+                loss_bin = (bin_bce * action_weights[8:15]).mean()
+
+                loss_idm_step = loss_yaw + loss_pitch + loss_bin
 
             idm_losses.append(loss_idm_step)
 
@@ -1061,7 +1093,7 @@ while global_step < MAX_STEPS:
             grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params]), 2).item()
 
     t_clip_start = time.perf_counter()
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # v4.10.0: Revert to v4.8.1 clipping (v4.9.0 used 1.0 for BPTT headroom)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # v5.0: Increase for larger model (was 0.5)
     t_clip_end = time.perf_counter()
     t_backward_end = time.perf_counter()
 
@@ -1240,7 +1272,7 @@ while global_step < MAX_STEPS:
 
                 # v4.11.0: IDM diagnostics
                 "idm/loss": loss_idm.item(),
-                "idm/loss_per_action": loss_idm.item() / 5,  # Normalize by action_dim
+                "idm/loss_per_action": loss_idm.item() / 15,  # Normalize by action_dim
                 "idm/max_span": MAX_IDM_SPAN,  # Track for reference
 
                 # v4.6.0: Gumbel-Softmax tau annealing

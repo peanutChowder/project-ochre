@@ -722,3 +722,17 @@ Results, step 80k:
 - FiLM clamping: clamp gammas/betas to [-5, 5] to reduce 1-frame flash artifacts
 - Gradient/curriculum tuning: FILM_LR_MULT 15→25, AR_BRAKE_RATIO_UPPER 2.0→2.5, ACTION_RANK_WEIGHT 2.0→1.0
 Target: Improve WASD responsiveness and yaw stability over longer rollouts while preventing FiLM overshoot artifacts
+
+### v5.0
+
+Dataset:
+- 15D discrete action encoding: yaw(5 one-hot) + pitch(3 one-hot) + WASD(4 multi-hot) + jump/sprint/sneak(3)
+
+model_convGru.py
+- Capacity scaling defaults: embed_dim 320, hidden_dim 640, layers 6; residual connections every 2 layers
+- FiLM scaling: internal dim 512→max(1024, 2×hidden_dim) (e.g. 1280 @ 640)
+- IDM scaling: aggressive pooling 9×16→4×8 + deeper MLP (+dropout) to control params; keep time-delta embedding + variable-span k∈[1..5]
+
+train.py
+- IDM training fix: CE for yaw/pitch bins + BCE for WASD/jump/sprint/sneak over the k-window; ensure IDM gradients hit current dynamics state (no full BPTT)
+Target: Remove action-gradient interference (movement vs camera) and add enough capacity for sharper recon + functional movement mechanics

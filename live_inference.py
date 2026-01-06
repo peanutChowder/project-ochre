@@ -18,8 +18,8 @@ FRAME_H = IMAGE_HEIGHT  # 72
 FRAME_W = IMAGE_WIDTH   # 128
 LATENT_H = 18
 LATENT_W = 32
-CTX_LEN = 6  # rolling token/action window
-ACTION_DIM = 5 # [yaw, pitch, move_x, move_z, jump]
+CTX_LEN = 30  # rolling token/action window
+ACTION_DIM = 15  # v5.0: 15D discrete encoding [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
 
 
 def load_vqvae(vqvae_ckpt: str, device: torch.device) -> VQVAE:
@@ -103,12 +103,16 @@ def main():
 
     # --- Load models ---
     vqvae = load_vqvae(args.vqvae_ckpt, device)
-    # Instantiate with correct dimensions from training
+    # v5.0: Instantiate with scaled capacity
     model = WorldModelConvFiLM(
         codebook_size=1024,
-        action_dim=ACTION_DIM, 
-        H=LATENT_H, 
-        W=LATENT_W
+        embed_dim=320,
+        hidden_dim=640,
+        n_layers=6,
+        action_dim=ACTION_DIM,  # 15D discrete actions
+        H=LATENT_H,
+        W=LATENT_W,
+        use_residuals=True
     ).to(device)
     try_load_state_dict(model, args.checkpoint, device)
     model.eval()
@@ -195,25 +199,67 @@ def main():
     button_font = pygame.font.SysFont("Arial", max(14, int(14 * args.scale / 5)), bold=True)
 
     def get_action_vec():
+        """
+        v5.0: Encode keyboard input as 15D discrete action vector.
+        Format: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
+        """
         keys = pygame.key.get_pressed()
-        move_x = float(keys[pygame.K_d]) - float(keys[pygame.K_a])
-        move_z = float(keys[pygame.K_w]) - float(keys[pygame.K_s])
-        jump   = float(keys[pygame.K_SPACE])
+        action = [0.0] * 15
 
-        # Arrow keys for camera look
+        # Arrow keys for camera look (continuous input)
         key_yaw = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
         key_pitch = float(keys[pygame.K_DOWN]) - float(keys[pygame.K_UP])
+        yaw_raw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
+        pitch_raw = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
 
-        yaw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
-        pitch = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
+        # Yaw binning (5D one-hot)
+        if yaw_raw <= -0.5:
+            action[0] = 1.0  # Hard Left
+        elif yaw_raw <= -0.1:
+            action[1] = 1.0  # Left
+        elif yaw_raw <= 0.1:
+            action[2] = 1.0  # Center
+        elif yaw_raw <= 0.5:
+            action[3] = 1.0  # Right
+        else:
+            action[4] = 1.0  # Hard Right
 
-        # Action vector: [yaw, pitch, move_x, move_z, jump]
-        return [yaw, pitch, move_x, move_z, jump]
+        # Pitch binning (3D one-hot)
+        if pitch_raw <= -0.2:
+            action[5] = 1.0  # Down
+        elif pitch_raw <= 0.2:
+            action[6] = 1.0  # Level
+        else:
+            action[7] = 1.0  # Up
+
+        # WASD multi-hot (can have multiple 1s for diagonal movement)
+        if keys[pygame.K_w]:
+            action[8] = 1.0
+        if keys[pygame.K_a]:
+            action[9] = 1.0
+        if keys[pygame.K_s]:
+            action[10] = 1.0
+        if keys[pygame.K_d]:
+            action[11] = 1.0
+
+        # Jump
+        if keys[pygame.K_SPACE]:
+            action[12] = 1.0
+
+        # Sprint (Shift key)
+        if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+            action[13] = 1.0
+
+        # Sneak (Ctrl key)
+        if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]:
+            action[14] = 1.0
+
+        return action
 
     if args.use_context_actions:
         print("🎬 Replaying GT actions from context (no user input)")
     else:
-        print("🎮 W/A/S/D move • Space jump • Arrows look • ESC/Q quit")
+        print("🎮 W/A/S/D move • Space jump • Shift sprint • Ctrl sneak • Arrows look • ESC/Q quit")
 
     # Frame counter for context action indexing
     frame_idx = 0
