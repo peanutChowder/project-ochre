@@ -41,12 +41,12 @@ VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
-BATCH_SIZE = 32         # v4.7.4: 48 -> 32
+BATCH_SIZE = 16         # v5.0: 32 -> 16 (OOM mitigation for 640×6 model)
 MAX_STEPS = 300_000  # v4.7.0: Step-based training (replaces EPOCHS)
-LR = 3e-5             # v4.7.4: 4.5e-5 -> 3e-5
-WARMUP_STEPS = 750      # v4.7.3: 1.5× warmup (500 → 750)
-MIN_LR = 1e-6         # v4.7.4: 1.5e-6 -> 1e-6
-USE_CHECKPOINTING = False 
+LR = 2.5e-5           # v5.0: 3e-5 -> 2.5e-5 (stability for larger model)
+WARMUP_STEPS = 1000   # v5.0: 750 -> 1000 (longer warmup for larger model)
+MIN_LR = 8e-7         # v5.0: 1e-6 -> 8e-7 (proportional to LR reduction)
+USE_CHECKPOINTING = True  # v5.0: False -> True (activation memory reduction)
 
 # --- LOSS WEIGHTS ---
 # v4.10.1: Rebalance to fight mode collapse while maintaining action conditioning
@@ -64,7 +64,7 @@ AR_LOSS_WEIGHT = 2.5     # Static upweighting of AR loss vs TF loss
 # --- CURRICULUM ---
 # v4.7.1: seq_len curriculum removed - seq_len dynamically grows with ar_len
 # Live inference uses CTX_LEN=6, so training seq_len doesn't need to match
-BASE_SEQ_LEN = 20               # Minimum sequence length (will grow to ar_len + 1)
+BASE_SEQ_LEN = 16               # v5.0: 20 -> 16 (OOM mitigation; seq_len grows to ar_len + 1)
 CURRICULUM_SEQ_LEN = False      # Disabled (seq_len now auto-adjusts to AR curriculum)
 MAX_SEQ_LEN = 50                # Not used
 SEQ_LEN_INCREASE_STEPS = 5000   # Not used
@@ -74,7 +74,7 @@ SEQ_LEN_INCREASE_STEPS = 5000   # Not used
 CURRICULUM_AR = True             # Re-enabled: AR rollout during training
 AR_WARMUP_STEPS = 5000          # Warm up before starting AR
 AR_MIN_LEN = 10                 # v4.9.0: Increased from 3 to force longer rollouts
-AR_MAX_LEN = 25                 # Maximum AR rollout length
+AR_MAX_LEN = 20                 # v5.0: 25 -> 20 (OOM mitigation)
 
 # Adaptive AR brake: prevent LPIPS degradation by monitoring AR vs TF quality
 ADAPTIVE_AR_BRAKE = True
