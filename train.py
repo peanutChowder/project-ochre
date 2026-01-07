@@ -36,7 +36,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
 
 # --- PATHS ---
-DATA_DIR = "../preprocessedv4"
+DATA_DIR = "../preprocessedv5"
 VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt" 
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
