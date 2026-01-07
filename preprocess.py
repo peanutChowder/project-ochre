@@ -28,6 +28,7 @@ from tqdm import tqdm
 import imageio.v3 as iio
 import torch
 from vq_vae.vq_vae import Encoder, VectorQuantizerEMA, IMAGE_HEIGHT, IMAGE_WIDTH
+from action_encoding import encode_action_v5_np
 
 PROGRESS_FILENAME = "progress.json"
 
@@ -138,56 +139,24 @@ def build_action_matrix_gamefactory_v5(actions_dict: dict, angle_scale: float = 
 
     for i, k in enumerate(sorted(actions_dict.keys(), key=int)):
         a = actions_dict[k]
+        yaw_raw = float(a.get("yaw_delta", 0.0)) / max(angle_scale, 1e-6)
+        pitch_raw = float(a.get("pitch_delta", 0.0)) / max(angle_scale, 1e-6)
 
-        # 1. YAW BINNING (5D one-hot)
-        yaw_raw = float(a.get("yaw_delta", 0.0)) / angle_scale
-        yaw_raw = np.clip(yaw_raw, -1.0, 1.0)
-
-        if yaw_raw <= -0.5:
-            action_matrix[i, 0] = 1.0  # Hard Left
-        elif yaw_raw <= -0.1:
-            action_matrix[i, 1] = 1.0  # Left
-        elif yaw_raw <= 0.1:
-            action_matrix[i, 2] = 1.0  # Center
-        elif yaw_raw <= 0.5:
-            action_matrix[i, 3] = 1.0  # Right
-        else:
-            action_matrix[i, 4] = 1.0  # Hard Right
-
-        # 2. PITCH BINNING (3D one-hot)
-        pitch_raw = float(a.get("pitch_delta", 0.0)) / angle_scale
-        pitch_raw = np.clip(pitch_raw, -1.0, 1.0)
-
-        if pitch_raw <= -0.2:
-            action_matrix[i, 5] = 1.0  # Down
-        elif pitch_raw <= 0.2:
-            action_matrix[i, 6] = 1.0  # Level
-        else:
-            action_matrix[i, 7] = 1.0  # Up
-
-        # 3. WASD (4D multi-hot - can have multiple 1s)
         ws = int(a.get("ws", 0))
         ad = int(a.get("ad", 0))
-
-        if ws == 1:  # W pressed
-            action_matrix[i, 8] = 1.0
-        elif ws == 2:  # S pressed
-            action_matrix[i, 10] = 1.0
-
-        if ad == 1:  # A pressed
-            action_matrix[i, 9] = 1.0
-        elif ad == 2:  # D pressed
-            action_matrix[i, 11] = 1.0
-
-        # 4. JUMP (1D binary)
         scs = int(a.get("scs", 0))
-        if scs == 1:
-            action_matrix[i, 12] = 1.0
-        # 5. SPRINT/SNEAK (2D binary - future)
-        elif scs == 3:  # Sprint (Ctrl)
-            action_matrix[i, 13] = 1.0
-        elif scs == 2:  # Sneak (Shift)
-            action_matrix[i, 14] = 1.0
+
+        action_matrix[i] = encode_action_v5_np(
+            yaw_raw=yaw_raw,
+            pitch_raw=pitch_raw,
+            w=(ws == 1),
+            s=(ws == 2),
+            a=(ad == 1),
+            d=(ad == 2),
+            jump=(scs == 1),
+            sneak=(scs == 2),
+            sprint=(scs == 3),
+        )
 
     return action_matrix
 

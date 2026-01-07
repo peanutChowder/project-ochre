@@ -27,6 +27,8 @@ if 'WANDB_API_KEY' in os.environ:
 else:
     raise Exception("No wandb key found")
 
+from action_encoding import encode_action_v5_np
+
 
 # ==========================================
 # 1. CONFIGURATION
@@ -325,7 +327,7 @@ def compute_multistep_action_response(model, vqvae, z_start, action_vec, num_ste
         model: World model
         vqvae: VQ-VAE decoder
         z_start: (1, H, W) starting frame tokens
-        action_vec: (1, 5) action to apply at each step
+        action_vec: (1, A) action to apply at each step
         num_steps: Number of AR steps to roll out
         device: torch device
 
@@ -377,13 +379,13 @@ def validate_action_conditioning(model, vqvae, Z_seq, A_seq, Z_target, global_st
         # Use first sample
         z_start = Z_seq[0:1, 0]  # (1, H, W) - starting frame
 
-        # Action format: [yaw, pitch, move_x, move_z, action_5] (5-dim)
+        # v5.0 action format: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak] (15-dim)
         # Test different action conditions
         test_actions = {
-            'static': torch.zeros(1, 5, device=device),  # No movement
-            'camera_left': torch.tensor([[0.5, 0.0, 0.0, 0.0, 0.0]], device=device),  # Yaw left
-            'camera_right': torch.tensor([[-0.5, 0.0, 0.0, 0.0, 0.0]], device=device),  # Yaw right
-            'move_forward': torch.tensor([[0.0, 0.0, 0.0, 0.5, 0.0]], device=device),  # Forward
+            'static': torch.tensor(encode_action_v5_np(), device=device).unsqueeze(0),  # Center/level, no movement
+            'camera_left': torch.tensor(encode_action_v5_np(yaw_raw=-0.5), device=device).unsqueeze(0),
+            'camera_right': torch.tensor(encode_action_v5_np(yaw_raw=0.5), device=device).unsqueeze(0),
+            'move_forward': torch.tensor(encode_action_v5_np(w=1.0), device=device).unsqueeze(0),
         }
 
         # v4.8.1: Multi-step rollouts for each action

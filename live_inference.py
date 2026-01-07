@@ -12,6 +12,7 @@ Controls:
 import argparse, os, time, numpy as np, torch, pygame
 from vq_vae.vq_vae import VQVAE, IMAGE_HEIGHT, IMAGE_WIDTH
 from model_convGru import WorldModelConvFiLM
+from action_encoding import encode_action_v5_np
 
 # ---------------------- Constants ----------------------
 FRAME_H = IMAGE_HEIGHT  # 72
@@ -204,57 +205,24 @@ def main():
         Format: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
         """
         keys = pygame.key.get_pressed()
-        action = [0.0] * 15
-
         # Arrow keys for camera look (continuous input)
         key_yaw = float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT])
         key_pitch = float(keys[pygame.K_DOWN]) - float(keys[pygame.K_UP])
         yaw_raw = clamp(key_yaw * args.key_look_gain, -1.0, 1.0)
         pitch_raw = clamp(key_pitch * args.key_look_gain, -1.0, 1.0)
+        action = encode_action_v5_np(
+            yaw_raw=yaw_raw,
+            pitch_raw=pitch_raw,
+            w=keys[pygame.K_w],
+            a=keys[pygame.K_a],
+            s=keys[pygame.K_s],
+            d=keys[pygame.K_d],
+            jump=keys[pygame.K_SPACE],
+            sprint=(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]),
+            sneak=(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]),
+        )
 
-        # Yaw binning (5D one-hot)
-        if yaw_raw <= -0.5:
-            action[0] = 1.0  # Hard Left
-        elif yaw_raw <= -0.1:
-            action[1] = 1.0  # Left
-        elif yaw_raw <= 0.1:
-            action[2] = 1.0  # Center
-        elif yaw_raw <= 0.5:
-            action[3] = 1.0  # Right
-        else:
-            action[4] = 1.0  # Hard Right
-
-        # Pitch binning (3D one-hot)
-        if pitch_raw <= -0.2:
-            action[5] = 1.0  # Down
-        elif pitch_raw <= 0.2:
-            action[6] = 1.0  # Level
-        else:
-            action[7] = 1.0  # Up
-
-        # WASD multi-hot (can have multiple 1s for diagonal movement)
-        if keys[pygame.K_w]:
-            action[8] = 1.0
-        if keys[pygame.K_a]:
-            action[9] = 1.0
-        if keys[pygame.K_s]:
-            action[10] = 1.0
-        if keys[pygame.K_d]:
-            action[11] = 1.0
-
-        # Jump
-        if keys[pygame.K_SPACE]:
-            action[12] = 1.0
-
-        # Sprint (Shift key)
-        if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
-            action[13] = 1.0
-
-        # Sneak (Ctrl key)
-        if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]:
-            action[14] = 1.0
-
-        return action
+        return action.tolist()
 
     if args.use_context_actions:
         print("🎬 Replaying GT actions from context (no user input)")
