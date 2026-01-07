@@ -48,7 +48,7 @@ MAX_STEPS = 300_000  # v4.7.0: Step-based training (replaces EPOCHS)
 LR = 2.5e-5           # v5.0: 3e-5 -> 2.5e-5 (stability for larger model)
 WARMUP_STEPS = 1000   # v5.0: 750 -> 1000 (longer warmup for larger model)
 MIN_LR = 8e-7         # v5.0: 1e-6 -> 8e-7 (proportional to LR reduction)
-USE_CHECKPOINTING = True  # v5.0: False -> True (activation memory reduction)
+USE_CHECKPOINTING = False  # v5.0: False -> True (activation memory reduction)
 
 # --- LOSS WEIGHTS ---
 # v4.10.1: Rebalance to fight mode collapse while maintaining action conditioning
@@ -635,6 +635,7 @@ timing_stats = {
     'loss_semantic': None,       # Sum of semantic loss compute across sequence
     'loss_lpips_total': None,    # Sum of LPIPS blocks across sequence (total)
     'loss_lpips_call': None,     # Mean time per LPIPS call (EMA)
+    'loss_idm': None,            # Sum of IDM forward + loss compute across sequence
     'action_rank': None,         # Action ranking loss block
 
     # Backward breakdown
@@ -821,6 +822,7 @@ while global_step < MAX_STEPS:
 
     model_step_time_total = 0.0
     loss_semantic_time_total = 0.0
+    loss_idm_time_total = 0.0
     lpips_time_total = 0.0
     lpips_call_count = 0
     action_rank_time = 0.0
@@ -910,6 +912,8 @@ while global_step < MAX_STEPS:
             loss_idm_step = torch.tensor(0.0, device=DEVICE)
 
             if t >= 1:  # Need at least 1 past frame
+                t_idm_start = time.perf_counter()
+
                 # Random span: k ∈ [1, min(t, MAX_IDM_SPAN)]
                 max_lookback = min(t, MAX_IDM_SPAN)
                 k = random.randint(1, max_lookback)
@@ -946,6 +950,8 @@ while global_step < MAX_STEPS:
                 loss_bin = (bin_bce * action_weights[8:15]).mean()
 
                 loss_idm_step = loss_yaw + loss_pitch + loss_bin
+
+                loss_idm_time_total += (time.perf_counter() - t_idm_start)
 
             idm_losses.append(loss_idm_step)
 
@@ -1136,6 +1142,7 @@ while global_step < MAX_STEPS:
         timing_stats['loss_semantic'] = loss_semantic_time_total
         timing_stats['loss_lpips_total'] = lpips_time_total
         timing_stats['loss_lpips_call'] = lpips_call_time
+        timing_stats['loss_idm'] = loss_idm_time_total
         timing_stats['action_rank'] = action_rank_time
 
         timing_stats['backward_total'] = backward_time
@@ -1157,6 +1164,7 @@ while global_step < MAX_STEPS:
         timing_stats['loss_semantic'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_semantic'] + TIMING_EMA_ALPHA * loss_semantic_time_total
         timing_stats['loss_lpips_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_lpips_total'] + TIMING_EMA_ALPHA * lpips_time_total
         timing_stats['loss_lpips_call'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_lpips_call'] + TIMING_EMA_ALPHA * lpips_call_time
+        timing_stats['loss_idm'] = (1 - TIMING_EMA_ALPHA) * timing_stats['loss_idm'] + TIMING_EMA_ALPHA * loss_idm_time_total
         timing_stats['action_rank'] = (1 - TIMING_EMA_ALPHA) * timing_stats['action_rank'] + TIMING_EMA_ALPHA * action_rank_time
 
         timing_stats['backward_total'] = (1 - TIMING_EMA_ALPHA) * timing_stats['backward_total'] + TIMING_EMA_ALPHA * backward_time
@@ -1208,6 +1216,7 @@ while global_step < MAX_STEPS:
                 f"Sem: {timing_stats['loss_semantic']*1000:.0f}ms, "
                 f"LPIPS: {timing_stats['loss_lpips_total']*1000:.0f}ms"
                 f"{f' ({lpips_call_ms}ms/call)' if lpips_call_ms > 0 else ''}, "
+                f"IDM: {timing_stats['loss_idm']*1000:.0f}ms, "
                 f"Rank: {timing_stats['action_rank']*1000:.0f}ms, "
                 f"Bwd: {timing_stats['backward_total']*1000:.0f}ms, "
                 f"Opt: {timing_stats['optimizer_total']*1000:.0f}ms)"
