@@ -1334,6 +1334,17 @@ while global_step < MAX_STEPS:
         if wandb and action_metrics:
             wandb.log(action_metrics, step=global_step)
 
+    # v5.0: GPU memory diagnostics (every 1000 steps)
+    if DEVICE == "cuda" and global_step % 1000 == 0:
+        torch.cuda.synchronize()
+        mem_alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        mem_reserved_gb = torch.cuda.memory_reserved() / (1024 ** 3)
+        mem_max_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        print(
+            f"[Step {global_step}] GPU mem (GB): "
+            f"allocated={mem_alloc_gb:.2f} reserved={mem_reserved_gb:.2f} max_alloc={mem_max_alloc_gb:.2f}"
+        )
+
     # v4.6.6: Milestone Save (every 10k steps)
     if global_step > 0 and global_step % MILESTONE_SAVE_STEPS == 0:
         save_checkpoint(global_step, is_milestone=True)
