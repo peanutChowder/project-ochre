@@ -120,6 +120,7 @@ def main():
 
     # --- Initialize state ---
     h_state = model.init_state(1, device=device)
+    temporal_buffer = [] if getattr(model, "temporal_attn", None) is not None else None
 
     # Store context actions for --use_context_actions flag
     actions_ctx = None
@@ -164,7 +165,11 @@ def main():
                 for i in range(warmup):
                     z_t = z_warmup[:, i] # (1, H, W)
                     a_t = a_warmup[:, i] # (1, A)
-                    _, h_state = model.step(z_t, a_t, h_state)
+                    _, h_state = model.step(z_t, a_t, h_state, temporal_buffer=temporal_buffer)
+                    if temporal_buffer is not None:
+                        temporal_buffer.append(model.temporal_attn.pool_state(h_state[-1].detach()))
+                        if len(temporal_buffer) > model.temporal_context_len:
+                            temporal_buffer.pop(0)
 
             # Set current token to the last one from context
             current_z = z_warmup[:, -1]
@@ -295,7 +300,11 @@ def main():
         # 2. Step Model
         with torch.no_grad():
             # z_t: (1, H, W), a_t: (1, A), h_prev: (...)
-            logits, h_state = model.step(current_z, current_a, h_state)
+            logits, h_state = model.step(current_z, current_a, h_state, temporal_buffer=temporal_buffer)
+            if temporal_buffer is not None:
+                temporal_buffer.append(model.temporal_attn.pool_state(h_state[-1].detach()))
+                if len(temporal_buffer) > model.temporal_context_len:
+                    temporal_buffer.pop(0)
 
             # 3. Choose next tokens
             if args.greedy:

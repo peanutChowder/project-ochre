@@ -736,3 +736,20 @@ model_convGru.py
 train.py
 - IDM training fix: CE for yaw/pitch bins + BCE for WASD/jump/sprint/sneak over the k-window; ensure IDM gradients hit current dynamics state (no full BPTT)
 Target: Remove action-gradient interference (movement vs camera) and add enough capacity for sharper recon + functional movement mechanics
+
+### v6.1
+
+Motivation: v5.0 converged on reconstruction/IDM metrics but failed in live inference with “action watermark/flash” shortcuts and weak/no coherent multi-step motion.
+
+model_convGru.py
+- Separate FiLM pathways (camera vs movement) to reduce gradient competition.
+- Add lightweight causal temporal attention over pooled recent hidden states to support explicit multi-frame comparison.
+- Replace additive temporal position embeddings with relative attention-logit bias (avoid leaking position into V / shortcut patterns).
+- Redesign IDM to strided-conv compressor + dt embedding for cheaper, more stable auxiliary supervision.
+
+train.py
+- New v6.1 config/loop (`hidden_dim=512`, temporal ctx=8); remove action-ranking; increase reliance on IDM; simplify logging + weights-only checkpointing.
+- Fixes discovered during review: correct component-wise VQ-VAE loading; AR brake guardrails; pooled temporal buffer passed into `model.step`.
+
+live_inference.py
+- Maintain/pass pooled temporal buffer during warmup + rollout so temporal attention is active at inference (train/inference parity).
