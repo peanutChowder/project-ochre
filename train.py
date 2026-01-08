@@ -78,6 +78,13 @@ LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000 
 MILESTONE_SAVE_STEPS = 20000  
 
+# v5.0-style timing / throughput tracking (EMA)
+TIMING_EMA_ALPHA = 0.1
+
+# v5.0-style action validation (runs on image logging steps)
+ACTION_VALIDATION_STEPS = [1, 5, 10]
+ACTION_VISUAL_ROLLOUT_LEN = 30
+
 # ==========================================
 # HELPERS
 # ==========================================
@@ -145,6 +152,103 @@ def log_images_to_wandb(vqvae, Z_target, logits, global_step):
         grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
         wandb.log({"visuals/reconstruction": wandb.Image(grid_np, caption=f"Top: GT | Bot: Pred (Step {global_step})")}, step=global_step)
+
+def compute_multistep_action_response(model, vqvae, z_start, action_vec, num_steps, device):
+    """
+    Perform multi-step AR rollout with a fixed action.
+    Returns list of decoded RGB frames (length=num_steps).
+    """
+    with torch.no_grad():
+        x_t = model._embed_tokens(z_start)
+        h_state = model.init_state(1, device=device)
+        temporal_buffer = [] if getattr(model, "temporal_attn", None) is not None else None
+
+        frames = []
+        for _ in range(num_steps):
+            gammas, betas = model.film(action_vec)  # (L, 1, C, 1, 1)
+            logits, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=gammas, betas_t=betas, temporal_buffer=temporal_buffer)
+            pred_tokens = logits.argmax(dim=1)  # (1, H, W)
+            pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
+            frames.append(pred_rgb.cpu())
+
+            if temporal_buffer is not None:
+                temporal_buffer.append(model.temporal_attn.pool_state(h_state[-1].detach()))
+                if len(temporal_buffer) > model.temporal_context_len:
+                    temporal_buffer.pop(0)
+
+            x_t = model._embed_tokens(pred_tokens)
+
+        return frames
+
+def validate_action_conditioning(model, vqvae, Z_seq, global_step):
+    """
+    Multi-step action conditioning validation to catch degradation over AR rollouts.
+    Logs scalar action-response diffs and a 30-frame visualization grid.
+    """
+    if wandb is None:
+        return {}
+
+    with torch.no_grad():
+        device = Z_seq.device
+        z_start = Z_seq[0:1, 0]  # (1, H, W)
+
+        test_actions = {
+            "static": torch.tensor(encode_action_v5_np(), device=device).unsqueeze(0),
+            "camera_left": torch.tensor(encode_action_v5_np(yaw_raw=-0.5), device=device).unsqueeze(0),
+            "camera_right": torch.tensor(encode_action_v5_np(yaw_raw=0.5), device=device).unsqueeze(0),
+            "move_forward": torch.tensor(encode_action_v5_np(w=1.0), device=device).unsqueeze(0),
+        }
+
+        rollout_predictions = {}
+        for action_name, action_vec in test_actions.items():
+            rollout_predictions[action_name] = {}
+            for num_steps in ACTION_VALIDATION_STEPS:
+                frames = compute_multistep_action_response(model, vqvae, z_start, action_vec, num_steps, device)
+                rollout_predictions[action_name][num_steps] = frames
+
+        metrics = {}
+        for num_steps in ACTION_VALIDATION_STEPS:
+            static_frame = rollout_predictions["static"][num_steps][-1].flatten()
+            camera_l_frame = rollout_predictions["camera_left"][num_steps][-1].flatten()
+            camera_r_frame = rollout_predictions["camera_right"][num_steps][-1].flatten()
+            move_fwd_frame = rollout_predictions["move_forward"][num_steps][-1].flatten()
+
+            diff_camera_l = (static_frame - camera_l_frame).pow(2).mean().sqrt().item()
+            diff_camera_r = (static_frame - camera_r_frame).pow(2).mean().sqrt().item()
+            diff_move_fwd = (static_frame - move_fwd_frame).pow(2).mean().sqrt().item()
+            action_response = (diff_camera_l + diff_camera_r + diff_move_fwd) / 3
+
+            step_suffix = f"_{num_steps}step" if num_steps > 1 else ""
+            metrics[f"action_response/camera_left_diff{step_suffix}"] = diff_camera_l
+            metrics[f"action_response/camera_right_diff{step_suffix}"] = diff_camera_r
+            metrics[f"action_response/move_forward_diff{step_suffix}"] = diff_move_fwd
+            metrics[f"action_response/average{step_suffix}"] = action_response
+
+        rollout_30_predictions = {}
+        for action_name, action_vec in test_actions.items():
+            frames_30 = compute_multistep_action_response(model, vqvae, z_start, action_vec, ACTION_VISUAL_ROLLOUT_LEN, device)
+            rollout_30_predictions[action_name] = frames_30
+
+        num_vis_frames = 6
+        vis_frames_30 = []
+        for action_name in ["static", "camera_left", "camera_right", "move_forward"]:
+            frames = rollout_30_predictions[action_name]
+            indices = [int(i * (ACTION_VISUAL_ROLLOUT_LEN - 1) / (num_vis_frames - 1)) for i in range(num_vis_frames)]
+            for idx in indices:
+                vis_frames_30.append(torch.clamp(frames[idx], 0.0, 1.0))
+
+        vis_tensor_30 = torch.stack(vis_frames_30, dim=0)
+        grid_30 = make_grid(vis_tensor_30, nrow=num_vis_frames, normalize=False, value_range=(0, 1), padding=2)
+        grid_np_30 = (grid_30.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        wandb.log({
+            "visuals/action_rollout_30step": wandb.Image(
+                grid_np_30,
+                caption=f"30-Step AR Rollouts (6 frames shown) | Rows: Static, Cam-L, Cam-R, Move-Fwd | Step {global_step}"
+            )
+        }, step=global_step)
+
+        return metrics
 
 class GTTokenDataset(Dataset):
     def __init__(self, manifest_path, root_dir, seq_len=6):
@@ -270,7 +374,23 @@ model.train()
 prev_lpips_tf = 0.0
 prev_lpips_ar = 0.0
 
+timing_stats = {
+    "step_total": None,
+    "data_load": None,
+    "forward_total": None,
+    "embed_film": None,
+    "model_step": None,
+    "loss_semantic": None,
+    "loss_lpips_total": None,
+    "loss_lpips_call": None,
+    "loss_idm": None,
+    "backward_total": None,
+    "optimizer_total": None,
+}
+
 while global_step < MAX_STEPS:
+    t_step_start = time.perf_counter()
+
     # 1. Update Curriculum
     ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar)
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
@@ -290,6 +410,8 @@ while global_step < MAX_STEPS:
     except StopIteration:
         loader_iter = iter(loader)
         batch = next(loader_iter)
+
+    t_data_end = time.perf_counter()
         
     Z_seq, A_seq, Z_target, _, _, _ = batch
     Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
@@ -304,11 +426,16 @@ while global_step < MAX_STEPS:
     optimizer.zero_grad()
     
     # 4. Forward Pass
+    t_forward_start = time.perf_counter()
+    t_embed_film_start = time.perf_counter()
+
     with autocast(enabled=(DEVICE == "cuda")):
         # Pre-computes
         X_seq = model.compute_embeddings(Z_seq)
         Gammas, Betas = model.compute_film(A_seq)
         h = model.init_state(B, device=DEVICE)
+
+        t_embed_film_end = time.perf_counter()
         
         # Losses
         loss_sem_list = []
@@ -323,6 +450,11 @@ while global_step < MAX_STEPS:
         temporal_buffer = []  # For temporal attention
 
         logits_last = None
+        model_step_time_total = 0.0
+        loss_sem_time_total = 0.0
+        lpips_time_total = 0.0
+        lpips_call_count = 0
+        loss_idm_time_total = 0.0
 
         for t in range(K):
             # Teacher Forcing vs AR
@@ -339,6 +471,7 @@ while global_step < MAX_STEPS:
                 x_in = X_seq[:, t]
 
             # Step Model (v6.1: pass temporal_buffer for temporal attention)
+            t_model_step_start = time.perf_counter()
             logits_t, h = model.step(
                 None, None, h,
                 x_t=x_in,
@@ -346,6 +479,7 @@ while global_step < MAX_STEPS:
                 betas_t=Betas[:, :, t],
                 temporal_buffer=temporal_buffer
             )
+            model_step_time_total += (time.perf_counter() - t_model_step_start)
             logits_last = logits_t
 
             # Store State for IDM (Detached)
@@ -360,13 +494,16 @@ while global_step < MAX_STEPS:
             # --- Loss Calculation ---
             
             # A. Semantic Loss
+            t_sem_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
             loss_sem = semantic_criterion(logits_flat, target_flat, global_step)
             loss_sem_list.append(loss_sem)
+            loss_sem_time_total += (time.perf_counter() - t_sem_start)
             
             # B. LPIPS Loss
             if t % LPIPS_FREQ == 0:
+                t_lpips_start = time.perf_counter()
                 tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
                 probs = F.gumbel_softmax(logits_flat, tau=tau, hard=False, dim=-1)
                 probs = probs.reshape(B, H, W, -1)
@@ -384,9 +521,12 @@ while global_step < MAX_STEPS:
                     loss_lpips_ar_list.append(lpips_val)
                 else:
                     loss_lpips_tf_list.append(lpips_val)
+                lpips_time_total += (time.perf_counter() - t_lpips_start)
+                lpips_call_count += 1
 
             # C. IDM Loss (Variable Span)
             if t >= 1:
+                t_idm_start = time.perf_counter()
                 # Random lookback k
                 k = random.randint(1, min(t, MAX_IDM_SPAN))
                 
@@ -413,6 +553,7 @@ while global_step < MAX_STEPS:
                 lb = (F.binary_cross_entropy_with_logits(pred_action[:, 8:15], bin_target, reduction='none') * ACTION_WEIGHTS[8:15]).mean()
                 
                 loss_idm_list.append(ly + lp + lb)
+                loss_idm_time_total += (time.perf_counter() - t_idm_start)
 
         # Aggregate
         loss_sem_total = torch.stack(loss_sem_list).mean()
@@ -433,16 +574,94 @@ while global_step < MAX_STEPS:
                      (LPIPS_WEIGHT * loss_lpips_total) + \
                      (IDM_LOSS_WEIGHT * loss_idm_total)
 
+    t_forward_end = time.perf_counter()
+
     # 5. Backward
+    t_backward_start = time.perf_counter()
     scaler.scale(total_loss).backward()
     scaler.unscale_(optimizer)
+    # v5.0-style grad norms (FiLM vs dynamics) for imbalance diagnosis
+    grad_film = 0.0
+    grad_dynamics = 0.0
+    if global_step % LOG_STEPS == 0:
+        film_params_with_grad = [p for n, p in model.named_parameters() if ("film" in n or "action" in n) and p.grad is not None]
+        dynamics_params_with_grad = [p for n, p in model.named_parameters() if ("film" not in n and "action" not in n) and p.grad is not None]
+        if film_params_with_grad:
+            grad_film = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in film_params_with_grad]), 2).item()
+        if dynamics_params_with_grad:
+            grad_dynamics = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in dynamics_params_with_grad]), 2).item()
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     scaler.step(optimizer)
     scaler.update()
+    t_backward_end = time.perf_counter()
+
+    t_opt_end = time.perf_counter()
+
+    # --- Timing EMA update ---
+    data_time = t_data_end - t_step_start
+    forward_time = t_forward_end - t_forward_start
+    step_time = t_opt_end - t_step_start
+    backward_time = t_backward_end - t_backward_start
+    optimizer_time = t_opt_end - t_backward_end
+
+    lpips_call_time = (lpips_time_total / lpips_call_count) if lpips_call_count > 0 else 0.0
+
+    def _ema(prev, curr):
+        return curr if prev is None else ((1 - TIMING_EMA_ALPHA) * prev + TIMING_EMA_ALPHA * curr)
+
+    timing_stats["step_total"] = _ema(timing_stats["step_total"], step_time)
+    timing_stats["data_load"] = _ema(timing_stats["data_load"], data_time)
+    timing_stats["forward_total"] = _ema(timing_stats["forward_total"], forward_time)
+    timing_stats["embed_film"] = _ema(timing_stats["embed_film"], t_embed_film_end - t_embed_film_start)
+    timing_stats["model_step"] = _ema(timing_stats["model_step"], model_step_time_total)
+    timing_stats["loss_semantic"] = _ema(timing_stats["loss_semantic"], loss_sem_time_total)
+    timing_stats["loss_lpips_total"] = _ema(timing_stats["loss_lpips_total"], lpips_time_total)
+    timing_stats["loss_lpips_call"] = _ema(timing_stats["loss_lpips_call"], lpips_call_time)
+    timing_stats["loss_idm"] = _ema(timing_stats["loss_idm"], loss_idm_time_total)
+    timing_stats["backward_total"] = _ema(timing_stats["backward_total"], backward_time)
+    timing_stats["optimizer_total"] = _ema(timing_stats["optimizer_total"], optimizer_time)
 
     # 6. Log
+    # Diagnostics that were present in v5.0 (token diversity + confidence)
+    with torch.no_grad():
+        probs_last = F.softmax(logits_last.float(), dim=1) if logits_last is not None else None
+        if probs_last is not None:
+            entropy = -(probs_last * torch.log(probs_last + 1e-9)).sum(dim=1).mean()
+            confidence = probs_last.max(dim=1)[0].mean()
+            unique_codes = logits_last.argmax(dim=1).unique().numel()
+            top1_conf = probs_last.max(dim=1)[0]
+            confidence_std = top1_conf.std()
+            confidence_min = top1_conf.min()
+        else:
+            entropy = torch.tensor(0.0)
+            confidence = torch.tensor(0.0)
+            unique_codes = 0
+            confidence_std = torch.tensor(0.0)
+            confidence_min = torch.tensor(0.0)
+
+        # Action diagnostics (FiLM magnitude proxy)
+        gamma_magnitude = Gammas.abs().mean().item()
+        beta_magnitude = Betas.abs().mean().item()
+        action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
+
     if global_step % LOG_STEPS == 0:
-        print(f"[Step {global_step}] Loss: {total_loss.item():.4f} | Sem: {loss_sem_total.item():.4f} | IDM: {loss_idm_total.item():.4f}")
+        throughput = 1.0 / timing_stats["step_total"] if timing_stats["step_total"] and timing_stats["step_total"] > 0 else 0.0
+        lpips_call_ms = int((timing_stats["loss_lpips_call"] or 0.0) * 1000)
+        print(
+            f"[Step {global_step}] Loss: {total_loss.item():.4f} | "
+            f"Sem: {loss_sem_total.item():.4f} | LPIPS: {loss_lpips_total.item():.4f} | IDM: {loss_idm_total.item():.4f} | "
+            f"{throughput:.2f} steps/s | Total: {(timing_stats['step_total'] or 0.0)*1000:.1f}ms "
+            f"(Data: {(timing_stats['data_load'] or 0.0)*1000:.0f}ms, "
+            f"Emb+FiLM: {(timing_stats['embed_film'] or 0.0)*1000:.0f}ms, "
+            f"Step: {(timing_stats['model_step'] or 0.0)*1000:.0f}ms, "
+            f"Sem: {(timing_stats['loss_semantic'] or 0.0)*1000:.0f}ms, "
+            f"LPIPS: {(timing_stats['loss_lpips_total'] or 0.0)*1000:.0f}ms"
+            f"{f' ({lpips_call_ms}ms/call)' if lpips_call_ms > 0 else ''}, "
+            f"IDM: {(timing_stats['loss_idm'] or 0.0)*1000:.0f}ms, "
+            f"Bwd: {(timing_stats['backward_total'] or 0.0)*1000:.0f}ms, "
+            f"Opt: {(timing_stats['optimizer_total'] or 0.0)*1000:.0f}ms)"
+        )
         if wandb:
             wandb.log({
                 "train/loss": total_loss.item(),
@@ -451,13 +670,33 @@ while global_step < MAX_STEPS:
                 "train/loss_lpips_tf": loss_lpips_tf.item(),
                 "train/loss_lpips_ar": loss_lpips_ar.item(),
                 "train/loss_idm": loss_idm_total.item(),
+                "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
+                "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
+                "curriculum/ar_cutoff": ar_cutoff,
                 "curriculum/lpips_ratio": prev_lpips_ar / (prev_lpips_tf + 1e-6),
-                "train/grad_norm": float(norm)
+                "train/grad_norm": float(norm),
+                "grad/film_norm": grad_film,
+                "grad/dynamics_norm": grad_dynamics,
+                "action_diagnostics/film_gamma_magnitude": gamma_magnitude,
+                "action_diagnostics/film_beta_magnitude": beta_magnitude,
+                "action_diagnostics/sensitivity": action_sensitivity,
+                "action_diagnostics/action_magnitude": A_seq.abs().mean().item(),
+                "diagnostics/entropy": float(entropy),
+                "diagnostics/confidence": float(confidence),
+                "diagnostics/unique_codes": unique_codes,
+                "diagnostics/confidence_std": float(confidence_std),
+                "diagnostics/confidence_min": float(confidence_min),
+                "timing/step_total_ms": (timing_stats["step_total"] or 0.0) * 1000,
+                "timing/loss_lpips_call_ms": (timing_stats["loss_lpips_call"] or 0.0) * 1000,
+                "timing/throughput_steps_per_sec": throughput,
             }, step=global_step)
             
     if global_step % IMAGE_LOG_STEPS == 0:
         log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)
+        action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, global_step)
+        if wandb and action_metrics:
+            wandb.log(action_metrics, step=global_step)
 
     if global_step % MILESTONE_SAVE_STEPS == 0:
         torch.save(model.state_dict(), f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step}.pt")
