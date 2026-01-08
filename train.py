@@ -117,13 +117,16 @@ class ARCurriculum:
             
         # Brake Logic
         ratio = self.ar_ema / (self.tf_ema + 1e-6)
-        
+
+        prev_ar_len = self.ar_len
         if ratio > self.brake_ratio_upper + 0.05:
             self.ar_len = max(AR_MIN_LEN, self.ar_len - 2)
-            print(f"[Curriculum] Brake ENGAGED: Ratio {ratio:.2f} -> Reducing AR to {self.ar_len}")
+            if self.ar_len != prev_ar_len:
+                print(f"[Curriculum] Brake ENGAGED: Ratio {ratio:.2f} -> Reducing AR to {self.ar_len}")
         elif ratio < self.brake_ratio_lower - 0.05:
             self.ar_len = min(AR_MAX_LEN, self.ar_len + 2)
-            print(f"[Curriculum] Brake RELEASED: Ratio {ratio:.2f} -> Increasing AR to {self.ar_len}")
+            if self.ar_len != prev_ar_len:
+                print(f"[Curriculum] Brake RELEASED: Ratio {ratio:.2f} -> Increasing AR to {self.ar_len}")
             
         return self.ar_len
 
