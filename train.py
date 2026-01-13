@@ -23,8 +23,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
 
 # --- PATHS ---
-DATA_DIR = "../preprocessedv5"
-VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt" 
+DATA_DIR = "./preprocessedv5"
+VQVAE_PATH = "./vq_vae/checkpoints/vqvae_v2.1.6__epoch100.pt" 
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
@@ -40,7 +40,8 @@ TEMPORAL_CONTEXT_LEN = 8  # v6.1: Frames for temporal attention
 SEMANTIC_WEIGHT = 1.0    
 LPIPS_WEIGHT = 3.0       
 LPIPS_FREQ = 1           # v6.0: Keep at 1 (model learns periodic artifacts otherwise)
-GUMBEL_TAU_STEPS = 20000 
+GUMBEL_TAU_STEPS = 80_000  # v6.2: Slow down hardening to reduce early collapse
+GUMBEL_TAU_MIN = 0.30      # v6.2: Higher floor to preserve token diversity early
 
 AR_LOSS_WEIGHT = 2.5     
 
@@ -51,10 +52,28 @@ AR_WARMUP_STEPS = 5000
 AR_MIN_LEN = 10                 
 AR_MAX_LEN = 20                 
 
+# v6.2: Gate AR growth on token diversity to avoid pushing AR while in a collapsed regime.
+AR_DIVERSITY_GATE_START = 5000
+MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
+
 # --- IDM CONFIG ---
 IDM_LOSS_WEIGHT = 1.0   # Increased from 0.5 to compensate for lack of Ranking
 MAX_IDM_SPAN = 5       
 ACTION_DIM = 15
+
+# v6.2: Teacher forcing token corruption to break the "identity map" shortcut.
+TOKEN_CORRUPT_MAX_P = 0.05
+TOKEN_CORRUPT_RAMP_STEPS = 50_000
+
+# v6.2: Temporary entropy bonus (anti-collapse) applied only when LPIPS is computed.
+ENTROPY_BONUS_WEIGHT = 0.01
+ENTROPY_BONUS_STEPS = 50_000
+
+# v6.2: Action-conditional LPIPS reweighting to address 87% signal masking.
+# Diagnostic finding: 87% of frames have camera+movement co-occurring, camera gradients dominate.
+# Solution: Boost LPIPS weight on movement-active frames to amplify weak movement signal.
+LPIPS_MOVEMENT_BOOST = 4.0  # Boost LPIPS weight when any WASD/jump/sprint/sneak active
+LPIPS_MOVEMENT_BOOST_RAMP_STEPS = 30_000  # Ramp from 1.0 → LPIPS_MOVEMENT_BOOST
 
 # Per-dimension weights for 15D discrete action vector
 ACTION_WEIGHTS = torch.tensor([
@@ -70,8 +89,8 @@ FILM_LR_MULT = 10.0             # Lowered for smaller internal dim
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v6.1-step0"
-MODEL_OUT_PREFIX = "ochre-v6.1"
+RUN_NAME = "v6.2-step0"
+MODEL_OUT_PREFIX = "ochre-v6.2"
 RESUME_PATH = "" 
 
 LOG_STEPS = 10
@@ -89,6 +108,25 @@ ACTION_VISUAL_ROLLOUT_LEN = 30
 # HELPERS
 # ==========================================
 
+def compute_gumbel_tau(step: int) -> float:
+    frac = min(1.0, step / float(GUMBEL_TAU_STEPS))
+    return max(GUMBEL_TAU_MIN, 1.0 - frac * (1.0 - GUMBEL_TAU_MIN))
+
+
+def compute_token_corrupt_p(step: int) -> float:
+    if TOKEN_CORRUPT_MAX_P <= 0:
+        return 0.0
+    frac = min(1.0, step / float(TOKEN_CORRUPT_RAMP_STEPS))
+    return float(frac * TOKEN_CORRUPT_MAX_P)
+
+
+def compute_lpips_movement_boost(step: int) -> float:
+    """Ramp LPIPS movement boost from 1.0 to LPIPS_MOVEMENT_BOOST over LPIPS_MOVEMENT_BOOST_RAMP_STEPS."""
+    if LPIPS_MOVEMENT_BOOST_RAMP_STEPS <= 0:
+        return LPIPS_MOVEMENT_BOOST
+    frac = min(1.0, step / float(LPIPS_MOVEMENT_BOOST_RAMP_STEPS))
+    return 1.0 + frac * (LPIPS_MOVEMENT_BOOST - 1.0)
+
 class ARCurriculum:
     """Manages AR Length and Adaptive Brake Logic"""
     def __init__(self):
@@ -99,9 +137,18 @@ class ARCurriculum:
         self.brake_ratio_upper = 2.5
         self.brake_ratio_lower = 1.6
         
-    def update(self, step, lpips_tf, lpips_ar):
+    def update(self, step, lpips_tf, lpips_ar, unique_codes=None):
         if step < AR_WARMUP_STEPS:
             return 0
+
+        # v6.2: Hold back AR growth while token diversity is low (collapse-like regime).
+        if (
+            unique_codes is not None
+            and step >= AR_DIVERSITY_GATE_START
+            and unique_codes < MIN_UNIQUE_CODES_FOR_AR_GROWTH
+        ):
+            self.ar_len = max(AR_MIN_LEN, self.ar_len - 2)
+            return self.ar_len
 
         # Only apply brake once AR LPIPS is available; otherwise keep minimum exposure.
         if lpips_ar <= 0 or lpips_tf <= 0:
@@ -338,6 +385,9 @@ model = WorldModelConvFiLM(
     action_dim=ACTION_DIM,
     idm_max_span=MAX_IDM_SPAN,
     temporal_context_len=TEMPORAL_CONTEXT_LEN,  # v6.1: For temporal attention
+    enable_camera_warp=True,     # v6.2: Explicit spatial transport bias for yaw/pitch
+    max_yaw_warp=2,
+    max_pitch_warp=2,
     H=18, W=32,
     use_checkpointing=USE_CHECKPOINTING,
     use_residuals=True
@@ -371,11 +421,12 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                     num_workers=4, pin_memory=True, persistent_workers=True)
 loader_iter = iter(loader)
 
-print(f"Training Start: v6.1 (512-dim, SeparateFiLM, TemporalAttn), LPIPS freq={LPIPS_FREQ}")
+print(f"Training Start: v6.2 (camera warp + token corruption + anti-collapse), LPIPS freq={LPIPS_FREQ}")
 
 model.train()
 prev_lpips_tf = 0.0
 prev_lpips_ar = 0.0
+prev_unique_codes = None
 
 timing_stats = {
     "step_total": None,
@@ -395,7 +446,7 @@ while global_step < MAX_STEPS:
     t_step_start = time.perf_counter()
 
     # 1. Update Curriculum
-    ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar)
+    ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
     
     # Reload loader if seq_len changes
@@ -432,9 +483,20 @@ while global_step < MAX_STEPS:
     t_forward_start = time.perf_counter()
     t_embed_film_start = time.perf_counter()
 
+    # v6.2: Corrupt teacher-forcing inputs (on-manifold) to weaken the "copy Z_t" shortcut.
+    token_corrupt_p = compute_token_corrupt_p(global_step)
+    if token_corrupt_p > 0:
+        Z_seq_tf = Z_seq.clone()
+        # Do not corrupt t=0 (bootstraps the hidden state).
+        mask = torch.rand((B, K - 1, H, W), device=DEVICE) < token_corrupt_p
+        rand_tokens = torch.randint(0, codebook_size, (B, K - 1, H, W), device=DEVICE, dtype=Z_seq_tf.dtype)
+        Z_seq_tf[:, 1:] = torch.where(mask, rand_tokens, Z_seq_tf[:, 1:])
+    else:
+        Z_seq_tf = Z_seq
+
     with autocast(enabled=(DEVICE == "cuda")):
         # Pre-computes
-        X_seq = model.compute_embeddings(Z_seq)
+        X_seq = model.compute_embeddings(Z_seq_tf)
         Gammas, Betas = model.compute_film(A_seq)
         h = model.init_state(B, device=DEVICE)
 
@@ -445,7 +507,9 @@ while global_step < MAX_STEPS:
         loss_lpips_tf_list = []
         loss_lpips_ar_list = []
         loss_idm_list = []
-        
+        loss_entropy_list = []
+        movement_active_counts = []  # v6.2: Track movement-active frames for diagnostics
+
         ar_cutoff = K - ar_len
         
         # v6.1: Store h states for IDM and temporal attention
@@ -458,6 +522,7 @@ while global_step < MAX_STEPS:
         lpips_time_total = 0.0
         lpips_call_count = 0
         loss_idm_time_total = 0.0
+        entropy_bonus_weight = ENTROPY_BONUS_WEIGHT if global_step < ENTROPY_BONUS_STEPS else 0.0
 
         for t in range(K):
             # Teacher Forcing vs AR
@@ -476,7 +541,7 @@ while global_step < MAX_STEPS:
             # Step Model (v6.1: pass temporal_buffer for temporal attention)
             t_model_step_start = time.perf_counter()
             logits_t, h = model.step(
-                None, None, h,
+                None, A_seq[:, t], h,
                 x_t=x_in,
                 gammas_t=Gammas[:, :, t],
                 betas_t=Betas[:, :, t],
@@ -507,9 +572,14 @@ while global_step < MAX_STEPS:
             # B. LPIPS Loss
             if t % LPIPS_FREQ == 0:
                 t_lpips_start = time.perf_counter()
-                tau = max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9)
+                tau = compute_gumbel_tau(global_step)
                 probs = F.gumbel_softmax(logits_flat, tau=tau, hard=False, dim=-1)
                 probs = probs.reshape(B, H, W, -1)
+
+                if entropy_bonus_weight > 0:
+                    entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
+                    # Minimize negative entropy => encourage higher entropy early (anti-collapse).
+                    loss_entropy_list.append(-entropy)
 
                 soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
                 pred_rgb = vqvae_model.decoder(soft_emb)
@@ -517,7 +587,18 @@ while global_step < MAX_STEPS:
                 with torch.no_grad():
                     tgt_rgb = vqvae_model.decode_code(Z_target[:, t])
 
-                lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
+                # v6.2: Action-conditional LPIPS reweighting
+                # Detect movement-active frames (any WASD/jump/sprint/sneak active)
+                movement_active = torch.any(A_seq[:, t, 8:15] > 0.5, dim=-1)  # (B,) bool
+                movement_active_counts.append(movement_active.float().sum().item())  # Track for diagnostics
+                # Boost LPIPS weight on movement frames (ramped over 30k steps)
+                movement_boost = compute_lpips_movement_boost(global_step)
+                lpips_weight = torch.where(movement_active,
+                                          torch.tensor(movement_boost, device=DEVICE),
+                                          torch.tensor(1.0, device=DEVICE))  # (B,)
+
+                lpips_raw = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1)  # (B, 1, 1, 1)
+                lpips_val = (lpips_raw.squeeze() * lpips_weight).mean()  # Weighted average
 
                 # Track TF vs AR separately for curriculum
                 if is_ar_step:
@@ -563,6 +644,7 @@ while global_step < MAX_STEPS:
         loss_lpips_tf = torch.stack(loss_lpips_tf_list).mean() if loss_lpips_tf_list else torch.tensor(0.0, device=DEVICE)
         loss_lpips_ar = torch.stack(loss_lpips_ar_list).mean() if loss_lpips_ar_list else torch.tensor(0.0, device=DEVICE)
         loss_idm_total = torch.stack(loss_idm_list).mean() if loss_idm_list else torch.tensor(0.0, device=DEVICE)
+        loss_entropy_total = torch.stack(loss_entropy_list).mean() if loss_entropy_list else torch.tensor(0.0, device=DEVICE)
 
         # Combined LPIPS (TF + AR upweighted)
         loss_lpips_total = loss_lpips_tf + AR_LOSS_WEIGHT * loss_lpips_ar
@@ -575,7 +657,8 @@ while global_step < MAX_STEPS:
 
         total_loss = (SEMANTIC_WEIGHT * loss_sem_total) + \
                      (LPIPS_WEIGHT * loss_lpips_total) + \
-                     (IDM_LOSS_WEIGHT * loss_idm_total)
+                     (IDM_LOSS_WEIGHT * loss_idm_total) + \
+                     (entropy_bonus_weight * loss_entropy_total)
 
     t_forward_end = time.perf_counter()
 
@@ -647,6 +730,15 @@ while global_step < MAX_STEPS:
         gamma_magnitude = Gammas.abs().mean().item()
         beta_magnitude = Betas.abs().mean().item()
         action_sensitivity = (gamma_magnitude + beta_magnitude) / 2
+        prev_unique_codes = int(unique_codes)
+
+        # v6.2: Movement-active frame percentage (for LPIPS reweighting diagnostics)
+        if len(movement_active_counts) > 0:
+            total_frames_checked = len(movement_active_counts) * B
+            total_movement_active = sum(movement_active_counts)
+            movement_active_pct = (total_movement_active / total_frames_checked) * 100 if total_frames_checked > 0 else 0.0
+        else:
+            movement_active_pct = 0.0
 
     if global_step % LOG_STEPS == 0:
         throughput = 1.0 / timing_stats["step_total"] if timing_stats["step_total"] and timing_stats["step_total"] > 0 else 0.0
@@ -673,7 +765,12 @@ while global_step < MAX_STEPS:
                 "train/loss_lpips_tf": loss_lpips_tf.item(),
                 "train/loss_lpips_ar": loss_lpips_ar.item(),
                 "train/loss_idm": loss_idm_total.item(),
-                "train/gumbel_tau": max(0.1, 1.0 - (global_step / GUMBEL_TAU_STEPS) * 0.9),
+                "train/loss_entropy": loss_entropy_total.item(),
+                "train/gumbel_tau": compute_gumbel_tau(global_step),
+                "train/entropy_bonus_weight": float(ENTROPY_BONUS_WEIGHT if global_step < ENTROPY_BONUS_STEPS else 0.0),
+                "train/token_corrupt_p": float(token_corrupt_p),
+                "train/lpips_movement_boost": compute_lpips_movement_boost(global_step),
+                "train/movement_active_pct": movement_active_pct,
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "curriculum/ar_cutoff": ar_cutoff,

@@ -261,6 +261,9 @@ class WorldModelConvFiLM(nn.Module):
         action_dim: int = 15,
         idm_max_span: int = 5,
         temporal_context_len: int = 8,  # v6.1: New param
+        enable_camera_warp: bool = True,
+        max_yaw_warp: int = 2,
+        max_pitch_warp: int = 2,
         use_checkpointing: bool = False,
         use_residuals: bool = True,
         zero_init_head: bool = True,
@@ -292,6 +295,74 @@ class WorldModelConvFiLM(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.use_residuals = use_residuals
         self.temporal_context_len = temporal_context_len
+        self.enable_camera_warp = enable_camera_warp
+        self.max_yaw_warp = int(max_yaw_warp)
+        self.max_pitch_warp = int(max_pitch_warp)
+
+    def _action_to_pixel_shifts(self, a_t: torch.Tensor):
+        """
+        Convert discrete yaw/pitch bins to per-sample integer pixel shifts.
+
+        a_t: (B, 15) where yaw is one-hot over 5 bins and pitch is one-hot over 3 bins.
+        Returns:
+            dx: (B,) int64 horizontal wrap shift (yaw) in [-max_yaw_warp, +max_yaw_warp]
+            dy: (B,) int64 vertical padded shift (pitch) in [-max_pitch_warp, +max_pitch_warp]
+        """
+        if a_t.dim() != 2 or a_t.size(-1) < 8:
+            raise ValueError(f"Expected a_t (B,15), got {tuple(a_t.shape)}")
+
+        # Use expected-bin index (works for either one-hot or soft bins).
+        yaw_bins = a_t[:, 0:5]
+        pitch_bins = a_t[:, 5:8]
+        yaw_idx = (yaw_bins * torch.arange(5, device=a_t.device, dtype=a_t.dtype)).sum(dim=1)
+        pitch_idx = (pitch_bins * torch.arange(3, device=a_t.device, dtype=a_t.dtype)).sum(dim=1)
+
+        yaw_offset = yaw_idx - 2.0   # center bin at index 2
+        pitch_offset = pitch_idx - 1.0  # center bin at index 1
+
+        # Map offsets to pixel shifts.
+        # yaw_offset in [-2,2] -> dx in [-max_yaw_warp, max_yaw_warp]
+        dx = torch.round(yaw_offset * (self.max_yaw_warp / 2.0)).to(torch.long)
+        dy = torch.round(pitch_offset * float(self.max_pitch_warp)).to(torch.long)
+        dx = dx.clamp(-self.max_yaw_warp, self.max_yaw_warp)
+        dy = dy.clamp(-self.max_pitch_warp, self.max_pitch_warp)
+        return dx, dy
+
+    def _apply_yaw_roll(self, x: torch.Tensor, dx: torch.Tensor) -> torch.Tensor:
+        """
+        Per-sample horizontal wrap shift (yaw) for (B,C,H,W).
+        """
+        if self.max_yaw_warp <= 0:
+            return x
+        B, C, H, W = x.shape
+        if dx.abs().max().item() == 0:
+            return x
+
+        base = torch.arange(W, device=x.device)[None, None, None, :]  # (1,1,1,W)
+        # Turning right should move pixels left (negative x shift).
+        idx = (base - dx.view(B, 1, 1, 1)) % W
+        idx = idx.expand(B, C, H, W).to(torch.long)
+        return x.gather(dim=3, index=idx)
+
+    def _apply_pitch_shift(self, x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+        """
+        Per-sample vertical shift with zero padding (pitch) for (B,C,H,W).
+        """
+        if self.max_pitch_warp <= 0:
+            return x
+        B, C, H, W = x.shape
+        if dy.abs().max().item() == 0:
+            return x
+
+        y = torch.arange(H, device=x.device)[None, None, :, None]  # (1,1,H,1)
+        src_y = y - dy.view(B, 1, 1, 1)  # (B,1,H,1)
+        valid = (src_y >= 0) & (src_y < H)
+        src_y = src_y.clamp(0, H - 1).to(torch.long)
+
+        src_y_idx = src_y.expand(B, C, H, W)
+        out = x.gather(dim=2, index=src_y_idx)
+        out = out * valid.to(out.dtype).expand(B, 1, H, 1).expand(B, C, H, W)
+        return out
 
     def _embed_tokens(self, Z):
         x = self.embed(Z)              # (B,H,W,E)
@@ -337,6 +408,12 @@ class WorldModelConvFiLM(nn.Module):
             x = x_t
         else:
             x = self._embed_tokens(Z_t)
+
+        # v6.2: Explicit camera warp primitive (cheap spatial transport bias).
+        # This reduces the burden on ConvGRU kernels to learn large yaw/pitch spatial movement.
+        if self.enable_camera_warp and a_t is not None:
+            dx, dy = self._action_to_pixel_shifts(a_t)
+            x = self._apply_pitch_shift(self._apply_yaw_roll(x, dx), dy)
 
         # FiLM params
         if gammas_t is not None:
@@ -389,7 +466,7 @@ class WorldModelConvFiLM(nn.Module):
             # Note: checkpointing doesn't work well with list arguments,
             # so we use same path for both cases
             logits, h = self.step(
-                None, None, h,
+                None, A_seq[:, k], h,
                 x_t=X_seq[:, k],
                 gammas_t=Gammas_seq[:, :, k],
                 betas_t=Betas_seq[:, :, k],

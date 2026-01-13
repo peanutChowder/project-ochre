@@ -38,13 +38,74 @@ def load_vqvae(vqvae_ckpt: str, device: torch.device) -> VQVAE:
     return vqvae
 
 
-def try_load_state_dict(model: torch.nn.Module, path: str, device: torch.device):
+def _load_world_model_state_dict(path: str, device: torch.device) -> dict:
     data = torch.load(path, map_location=device)
     if isinstance(data, dict) and "model_state" in data:
-        model.load_state_dict(data["model_state"])
+        state = data["model_state"]
     else:
-        model.load_state_dict(data)
-    print(f"✅ Loaded world model from {path}")
+        state = data
+    if not isinstance(state, dict):
+        raise TypeError(f"Unexpected checkpoint type: {type(state)} (expected state_dict-like dict)")
+    return state
+
+
+def _infer_world_model_kwargs(state_dict: dict, latent_h: int, latent_w: int) -> dict:
+    """
+    Infer `WorldModelConvFiLM(...)` constructor kwargs from a checkpoint state_dict.
+    This avoids hard-coding architecture values (v5.0 vs v6.1) inside live inference.
+    """
+    if "embed.weight" not in state_dict or "in_proj.weight" not in state_dict:
+        raise KeyError("Checkpoint does not look like a WorldModelConvFiLM state_dict (missing embed/in_proj).")
+
+    codebook_size, embed_dim = state_dict["embed.weight"].shape
+    hidden_dim = state_dict["in_proj.weight"].shape[0]
+
+    # n_layers: count GRU blocks by index.
+    gru_indices = set()
+    for k in state_dict.keys():
+        if k.startswith("grus."):
+            parts = k.split(".")
+            if len(parts) > 1 and parts[1].isdigit():
+                gru_indices.add(int(parts[1]))
+    n_layers = (max(gru_indices) + 1) if gru_indices else 0
+    if n_layers <= 0:
+        raise ValueError("Failed to infer n_layers from checkpoint (no grus.* keys found).")
+
+    # Detect whether checkpoint matches v6.1 (SeparateActionFiLM) vs older ActionFiLM.
+    has_separate_film = any(k.startswith("film.camera_mlps.") for k in state_dict.keys())
+    has_legacy_film = any(k.startswith("film.mlps.") for k in state_dict.keys())
+    if has_legacy_film and not has_separate_film:
+        raise RuntimeError(
+            "This checkpoint appears to use the legacy ActionFiLM (film.mlps.*), "
+            "but the current WorldModelConvFiLM implementation expects SeparateActionFiLM (film.camera_mlps/film.movement_mlps). "
+            "Use a v6.1 checkpoint or restore the older model definition."
+        )
+
+    # IDM max span from dt embedding table.
+    idm_dt_key = "idm.dt_embed.weight"
+    idm_max_span = int(state_dict[idm_dt_key].shape[0] - 1) if idm_dt_key in state_dict else 5
+
+    # Temporal context length from attention position parameters (v6.1 supports rel_pos_bias; older used pos_emb).
+    temporal_context_len = 0
+    if "temporal_attn.rel_pos_bias.weight" in state_dict:
+        sz = int(state_dict["temporal_attn.rel_pos_bias.weight"].shape[0])
+        temporal_context_len = max(0, (sz - 1) // 2)
+    elif "temporal_attn.pos_emb.weight" in state_dict:
+        # pos_emb has shape (context_len + 1, hidden_dim)
+        temporal_context_len = int(state_dict["temporal_attn.pos_emb.weight"].shape[0] - 1)
+
+    return dict(
+        codebook_size=codebook_size,
+        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        n_layers=n_layers,
+        action_dim=ACTION_DIM,
+        idm_max_span=idm_max_span,
+        temporal_context_len=temporal_context_len,
+        H=latent_h,
+        W=latent_w,
+        use_residuals=True,
+    )
 
 
 def clamp(x, lo, hi):
@@ -104,18 +165,23 @@ def main():
 
     # --- Load models ---
     vqvae = load_vqvae(args.vqvae_ckpt, device)
-    # v5.0: Instantiate with scaled capacity
-    model = WorldModelConvFiLM(
-        codebook_size=1024,
-        embed_dim=320,
-        hidden_dim=640,
-        n_layers=6,
-        action_dim=ACTION_DIM,  # 15D discrete actions
-        H=LATENT_H,
-        W=LATENT_W,
-        use_residuals=True
-    ).to(device)
-    try_load_state_dict(model, args.checkpoint, device)
+
+    # Instantiate model to match the checkpoint (v5.0 vs v6.1) by inferring shapes.
+    state_dict = _load_world_model_state_dict(args.checkpoint, device)
+    model_kwargs = _infer_world_model_kwargs(state_dict, LATENT_H, LATENT_W)
+
+    # Sanity-check codebook size agreement with the VQ-VAE.
+    if hasattr(vqvae, "vq_vae") and hasattr(vqvae.vq_vae, "embedding"):
+        vq_codebook = int(vqvae.vq_vae.embedding.shape[1])
+        if int(model_kwargs["codebook_size"]) != vq_codebook:
+            raise RuntimeError(
+                f"Checkpoint codebook_size={model_kwargs['codebook_size']} does not match VQ-VAE codebook_size={vq_codebook}. "
+                "Use a matching world model checkpoint and VQ-VAE checkpoint."
+            )
+
+    model = WorldModelConvFiLM(**model_kwargs).to(device)
+    model.load_state_dict(state_dict, strict=True)
+    print(f"✅ Loaded world model from {args.checkpoint} (embed_dim={model_kwargs['embed_dim']}, hidden_dim={model_kwargs['hidden_dim']}, layers={model_kwargs['n_layers']}, temporal_ctx={model_kwargs['temporal_context_len']})")
     model.eval()
 
     # --- Initialize state ---

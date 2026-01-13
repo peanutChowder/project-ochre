@@ -753,3 +753,15 @@ train.py
 
 live_inference.py
 - Maintain/pass pooled temporal buffer during warmup + rollout so temporal attention is active at inference (train/inference parity).
+
+### v6.2
+
+Motivation: v6.1 still shows weak/unclear controllability and rapid “2D blob / texture field” collapse under heavy camera input, with early signs of token diversity collapse/plateaus. Dataset diagnostics also show extreme camera+movement co-occurrence (~87%), making movement learning easy to mask.
+
+model_convGru.py
+- Add explicit camera warp primitive (discrete yaw/pitch bins → small pixel shifts) applied on the embedding input path: yaw uses horizontal wrap shift; pitch uses vertical shift with zero padding. Intended as a cheap spatial transport bias to reduce “camera mush”.
+
+train.py
+- Teacher-forcing token corruption (random token replacement) with a ramp schedule to weaken the “copy z_t” shortcut and improve robustness to action injection.
+- Anti-collapse guardrails: slower Gumbel hardening with higher tau floor + temporary entropy bonus early in training; gate AR growth using `unique_codes` to avoid pushing AR while in a collapsed regime.
+- Action-conditional LPIPS reweighting: ramp a boost multiplier for movement-active frames (WASD/jump/sprint/sneak) to amplify weak movement gradients under co-occurrence; log `train/lpips_movement_boost` and `train/movement_active_pct`.
