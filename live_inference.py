@@ -293,7 +293,20 @@ def main():
             sneak=(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]),
         )
 
-        return action.tolist()
+        return action.tolist(), float(yaw_raw), float(pitch_raw)
+
+    def decode_action_v5_for_hud(action_15):
+        """
+        Convert a 15D discrete action vector into approximate continuous values for HUD/UI only.
+        """
+        # Representative values aligned with action bin thresholds in action_encoding.py.
+        yaw_vals = [-1.0, -0.3, 0.0, 0.3, 1.0]
+        pitch_vals = [-1.0, 0.0, 1.0]
+        yaw_idx = int(np.argmax(action_15[0:5]))
+        pitch_idx = int(np.argmax(action_15[5:8]))
+        yaw_raw = yaw_vals[yaw_idx]
+        pitch_raw = pitch_vals[pitch_idx]
+        return yaw_raw, pitch_raw
 
     if args.use_context_actions:
         print("🎬 Replaying GT actions from context (no user input)")
@@ -353,15 +366,17 @@ def main():
             # Use GT actions from context file
             if frame_idx < actions_ctx.shape[0]:
                 current_a = actions_ctx[frame_idx:frame_idx+1]  # (1, ACTION_DIM)
-                act = current_a[0].cpu().tolist()  # For HUD display
+                action_vec = current_a[0].cpu().tolist()
+                yaw, pitch = decode_action_v5_for_hud(action_vec)
             else:
                 # Ran out of context actions, use zeros
-                act = [0.0, 0.0, 0.0, 0.0, 0.0]
-                current_a = torch.tensor([act], dtype=torch.float32, device=device)
+                action_vec = [0.0] * ACTION_DIM
+                yaw, pitch = 0.0, 0.0
+                current_a = torch.tensor([action_vec], dtype=torch.float32, device=device)
         else:
             # Use keyboard input
-            act = get_action_vec()
-            current_a = torch.tensor([act], dtype=torch.float32, device=device) # (1, 5)
+            action_vec, yaw, pitch = get_action_vec()
+            current_a = torch.tensor([action_vec], dtype=torch.float32, device=device)  # (1, 15)
 
         # 2. Step Model
         with torch.no_grad():
@@ -399,19 +414,18 @@ def main():
         screen.blit(surf, (0, 0))
 
         # Draw HUD
-        hud = f"Y:{act[0]:+.2f} P:{act[1]:+.2f} X:{act[2]:.0f} Z:{act[3]:.0f} J:{act[4]:.0f}"
+        hud = f"Y:{yaw:+.2f} P:{pitch:+.2f}"
         screen.blit(hud_font.render(hud, True, (255, 255, 255)), (10, 10))
 
         # --- Draw WASD+Jump key visualizations ---
         # When using context actions, visualize the context actions instead of keyboard
         if args.use_context_actions:
-            # Extract action components: [yaw, pitch, move_x, move_z, jump]
-            move_x, move_z, jump = act[2], act[3], act[4]
-            w_pressed = move_z > 0.5
-            s_pressed = move_z < -0.5
-            a_pressed = move_x < -0.5
-            d_pressed = move_x > 0.5
-            space_pressed = jump > 0.5
+            # v5.0 discrete layout: [yaw(5), pitch(3), W, A, S, D, jump, sprint, sneak]
+            w_pressed = bool(action_vec[8] > 0.5)
+            a_pressed = bool(action_vec[9] > 0.5)
+            s_pressed = bool(action_vec[10] > 0.5)
+            d_pressed = bool(action_vec[11] > 0.5)
+            space_pressed = bool(action_vec[12] > 0.5)
         else:
             keys = pygame.key.get_pressed()
             w_pressed = keys[pygame.K_w]
@@ -451,7 +465,6 @@ def main():
         # --- Draw camera direction arrows ---
         # Yaw (horizontal camera movement) -> left/right arrows
         # Pitch (vertical camera movement) -> up/down arrows
-        yaw, pitch = act[0], act[1]
         threshold = 0.05  # Small threshold to avoid flickering on tiny movements
 
         # Left arrow (left edge, middle)

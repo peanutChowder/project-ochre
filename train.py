@@ -23,8 +23,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", DEVICE)
 
 # --- PATHS ---
-DATA_DIR = "../preprocessedv5"
-VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt" 
+DATA_DIR = "./preprocessedv5"
+VQVAE_PATH = "./vq_vae/checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- HYPERPARAMETERS ---
@@ -62,7 +62,7 @@ MAX_IDM_SPAN = 5
 ACTION_DIM = 15
 
 # v6.2: Teacher forcing token corruption to break the "identity map" shortcut.
-TOKEN_CORRUPT_MAX_P = 0.05
+TOKEN_CORRUPT_MAX_P = 0.01  # v6.3: Reduced from 0.05 to prevent over-reliance on priors
 TOKEN_CORRUPT_RAMP_STEPS = 50_000
 
 # v6.2: Temporary entropy bonus (anti-collapse) applied only when LPIPS is computed.
@@ -72,7 +72,7 @@ ENTROPY_BONUS_STEPS = 50_000
 # v6.2: Action-conditional LPIPS reweighting to address 87% signal masking.
 # Diagnostic finding: 87% of frames have camera+movement co-occurring, camera gradients dominate.
 # Solution: Boost LPIPS weight on movement-active frames to amplify weak movement signal.
-LPIPS_MOVEMENT_BOOST = 4.0  # Boost LPIPS weight when any WASD/jump/sprint/sneak active
+LPIPS_MOVEMENT_BOOST = 8.0  # v6.3: Boost LPIPS weight when any WASD/jump/sprint/sneak active (was 4.0)
 LPIPS_MOVEMENT_BOOST_RAMP_STEPS = 30_000  # Ramp from 1.0 → LPIPS_MOVEMENT_BOOST
 
 # Per-dimension weights for 15D discrete action vector
@@ -89,8 +89,8 @@ FILM_LR_MULT = 10.0             # Lowered for smaller internal dim
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v6.2-step0"
-MODEL_OUT_PREFIX = "ochre-v6.2"
+RUN_NAME = "v6.3-step0"
+MODEL_OUT_PREFIX = "ochre-v6.3"
 RESUME_PATH = "" 
 
 LOG_STEPS = 10
@@ -147,7 +147,7 @@ class ARCurriculum:
             and step >= AR_DIVERSITY_GATE_START
             and unique_codes < MIN_UNIQUE_CODES_FOR_AR_GROWTH
         ):
-            self.ar_len = max(AR_MIN_LEN, self.ar_len - 2)
+            self.ar_len = max(AR_MIN_LEN, self.ar_len - 1)  # v6.3: Gentler decrement (was 2)
             return self.ar_len
 
         # Only apply brake once AR LPIPS is available; otherwise keep minimum exposure.
@@ -167,11 +167,11 @@ class ARCurriculum:
 
         prev_ar_len = self.ar_len
         if ratio > self.brake_ratio_upper + 0.05:
-            self.ar_len = max(AR_MIN_LEN, self.ar_len - 2)
+            self.ar_len = max(AR_MIN_LEN, self.ar_len - 1)  # v6.3: Gentler decrement (was 2)
             if self.ar_len != prev_ar_len:
                 print(f"[Curriculum] Brake ENGAGED: Ratio {ratio:.2f} -> Reducing AR to {self.ar_len}")
         elif ratio < self.brake_ratio_lower - 0.05:
-            self.ar_len = min(AR_MAX_LEN, self.ar_len + 2)
+            self.ar_len = min(AR_MAX_LEN, self.ar_len + 1)  # v6.3: Gentler increment (was 2)
             if self.ar_len != prev_ar_len:
                 print(f"[Curriculum] Brake RELEASED: Ratio {ratio:.2f} -> Increasing AR to {self.ar_len}")
             
@@ -216,7 +216,9 @@ def compute_multistep_action_response(model, vqvae, z_start, action_vec, num_ste
         frames = []
         for _ in range(num_steps):
             gammas, betas = model.film(action_vec)  # (L, 1, C, 1, 1)
-            logits, h_state = model.step(None, None, h_state, x_t=x_t, gammas_t=gammas, betas_t=betas, temporal_buffer=temporal_buffer)
+            # Pass action_vec even when FiLM is precomputed so any action-dependent logic
+            # (e.g., camera warp) stays consistent with training/live inference.
+            logits, h_state = model.step(None, action_vec, h_state, x_t=x_t, gammas_t=gammas, betas_t=betas, temporal_buffer=temporal_buffer)
             pred_tokens = logits.argmax(dim=1)  # (1, H, W)
             pred_rgb = vqvae.decode_code(pred_tokens)[0]  # (3, IMG_H, IMG_W)
             frames.append(pred_rgb.cpu())
@@ -421,7 +423,7 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                     num_workers=4, pin_memory=True, persistent_workers=True)
 loader_iter = iter(loader)
 
-print(f"Training Start: v6.2 (camera warp + token corruption + anti-collapse), LPIPS freq={LPIPS_FREQ}")
+print(f"Training Start: v6.3 (hidden-state warp + tail-weighted AR + stronger movement boost), LPIPS freq={LPIPS_FREQ}")
 
 model.train()
 prev_lpips_tf = 0.0
@@ -524,6 +526,9 @@ while global_step < MAX_STEPS:
         loss_idm_time_total = 0.0
         entropy_bonus_weight = ENTROPY_BONUS_WEIGHT if global_step < ENTROPY_BONUS_STEPS else 0.0
 
+        # v6.3: Track hidden state drift during AR for diagnostics
+        h_at_ar_start = None
+
         for t in range(K):
             # Teacher Forcing vs AR
             is_ar_step = (t >= ar_cutoff and t > 0)
@@ -549,6 +554,10 @@ while global_step < MAX_STEPS:
             )
             model_step_time_total += (time.perf_counter() - t_model_step_start)
             logits_last = logits_t
+
+            # v6.3: Track h state at start of AR for drift diagnostic
+            if t == ar_cutoff and ar_len > 0:
+                h_at_ar_start = h[-1].detach().clone()
 
             # Store State for IDM (Detached)
             h_buffer.append(h[-1].detach())
@@ -642,7 +651,16 @@ while global_step < MAX_STEPS:
         # Aggregate
         loss_sem_total = torch.stack(loss_sem_list).mean()
         loss_lpips_tf = torch.stack(loss_lpips_tf_list).mean() if loss_lpips_tf_list else torch.tensor(0.0, device=DEVICE)
-        loss_lpips_ar = torch.stack(loss_lpips_ar_list).mean() if loss_lpips_ar_list else torch.tensor(0.0, device=DEVICE)
+
+        # v6.3: Position-weighted AR loss - later frames weighted higher to encourage quality throughout rollout
+        # Linear ramp from 1.0 (first AR frame) to 2.0 (last AR frame)
+        if loss_lpips_ar_list:
+            num_ar = len(loss_lpips_ar_list)
+            ar_weights = 1.0 + torch.arange(num_ar, device=DEVICE, dtype=torch.float32) / max(num_ar - 1, 1)
+            loss_lpips_ar = (torch.stack(loss_lpips_ar_list) * ar_weights).sum() / ar_weights.sum()
+        else:
+            loss_lpips_ar = torch.tensor(0.0, device=DEVICE)
+
         loss_idm_total = torch.stack(loss_idm_list).mean() if loss_idm_list else torch.tensor(0.0, device=DEVICE)
         loss_entropy_total = torch.stack(loss_entropy_list).mean() if loss_entropy_list else torch.tensor(0.0, device=DEVICE)
 
@@ -791,6 +809,18 @@ while global_step < MAX_STEPS:
                 "timing/loss_lpips_call_ms": (timing_stats["loss_lpips_call"] or 0.0) * 1000,
                 "timing/throughput_steps_per_sec": throughput,
             }, step=global_step)
+
+            # v6.3: Log per-frame AR quality and h_drift diagnostics
+            if loss_lpips_ar_list:
+                ar_quality_metrics = {}
+                for i, lpips_val in enumerate(loss_lpips_ar_list):
+                    ar_quality_metrics[f"ar_quality/frame_{i}"] = lpips_val.item()
+                # Compute h_drift: how much hidden state changed during AR rollout
+                if h_at_ar_start is not None:
+                    h_at_ar_end = h[-1].detach()
+                    h_drift = F.mse_loss(h_at_ar_start, h_at_ar_end).item()
+                    ar_quality_metrics["diagnostics/h_drift_during_ar"] = h_drift
+                wandb.log(ar_quality_metrics, step=global_step)
             
     if global_step % IMAGE_LOG_STEPS == 0:
         log_images_to_wandb(vqvae_model, Z_target, logits_last, global_step)

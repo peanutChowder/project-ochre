@@ -771,4 +771,20 @@ Results, step 100k:
 - AR curriculum reached ~15 steps but did not hit max; `lpips_ratio` ~1.5–2.0 and AR LPIPS worsened over training.
 - Live inference regressed: strong zero-input drift to a memorized stone texture field within seconds, long-rollout degradation persists.
 - Camera controllability worse than prior best: yaw/pitch cause sudden snaps rather than progressive motion (camera warp likely shortcut/instability).
-- Movement still non-functional: WASD/jump show no observable effect despite 4× LPIPS movement reweighting; IDM low loss suggests “action-echo” shortcut (actions encoded in h, not used for visual causality).
+- Movement still non-functional: WASD/jump show no observable effect despite 4× LPIPS movement reweighting; IDM low loss suggests "action-echo" shortcut (actions encoded in h, not used for visual causality).
+
+### v6.3
+
+model_convGru.py
+- **Hidden state warping**: Move camera warp from input embeddings to hidden state (h_prev). Instead of `x = warp(x, action); h_new = GRU(x, h_prev)`, now do `h_aligned = warp(h_prev, action); h_new = GRU(x, h_aligned)`. This transforms the problem from "predict whole frame" to "predict residual (inpainting + dynamics)".
+- Increased warp magnitudes: `max_yaw_warp=8` (was 2), `max_pitch_warp=6` (was 2) - appropriate for h_prev resolution (18×32).
+- Added `_warp_hidden_state()` method to warp all layers of hidden state.
+
+train.py
+- **AR frame position weighting**: Replace equal `.mean()` with linear ramp (1.0 → 2.0) so later AR frames get higher loss weight. Forces model to maintain quality throughout rollout.
+- Increased `LPIPS_MOVEMENT_BOOST = 8.0` (was 4.0) to overcome 2.75× camera/movement signal ratio.
+- Reduced `TOKEN_CORRUPT_MAX_P = 0.01` (was 0.05) to prevent over-reliance on learned priors.
+- Gentler AR curriculum: increment/decrement by 1 (was 2) to allow LPIPS ratio to stabilize at each ar_len.
+- New diagnostics: `ar_quality/frame_{i}` for per-frame AR LPIPS, `diagnostics/h_drift_during_ar` to track hidden state change during AR rollout.
+
+Key insight: By warping h_prev, the GRU only needs to learn inpainting (filling edges exposed by camera rotation) and dynamics (water, mobs), NOT geometry (the rotation itself). This is fundamentally easier.

@@ -262,8 +262,8 @@ class WorldModelConvFiLM(nn.Module):
         idm_max_span: int = 5,
         temporal_context_len: int = 8,  # v6.1: New param
         enable_camera_warp: bool = True,
-        max_yaw_warp: int = 2,
-        max_pitch_warp: int = 2,
+        max_yaw_warp: int = 8,    # v6.3: Increased for h_prev warping (was 2 for x warping)
+        max_pitch_warp: int = 6,  # v6.3: Increased for h_prev warping (was 2 for x warping)
         use_checkpointing: bool = False,
         use_residuals: bool = True,
         zero_init_head: bool = True,
@@ -328,9 +328,12 @@ class WorldModelConvFiLM(nn.Module):
         dy = dy.clamp(-self.max_pitch_warp, self.max_pitch_warp)
         return dx, dy
 
-    def _apply_yaw_roll(self, x: torch.Tensor, dx: torch.Tensor) -> torch.Tensor:
+    def _apply_yaw_shift(self, x: torch.Tensor, dx: torch.Tensor) -> torch.Tensor:
         """
-        Per-sample horizontal wrap shift (yaw) for (B,C,H,W).
+        Per-sample horizontal shift (yaw) for (B,C,H,W) with zero padding at revealed edges.
+
+        Note: This intentionally does NOT wrap around. Unlike panoramic video, Minecraft camera
+        turns reveal previously unseen content; the model should learn to inpaint new columns.
         """
         if self.max_yaw_warp <= 0:
             return x
@@ -339,10 +342,17 @@ class WorldModelConvFiLM(nn.Module):
             return x
 
         base = torch.arange(W, device=x.device)[None, None, None, :]  # (1,1,1,W)
-        # Turning right should move pixels left (negative x shift).
-        idx = (base - dx.view(B, 1, 1, 1)) % W
+        # dx > 0 (turn right) should move visible content left, so output[j] samples input[j + dx].
+        idx = base + dx.view(B, 1, 1, 1)
+        valid = (idx >= 0) & (idx < W)
+        idx = idx.clamp(0, W - 1)  # Clamp to avoid out-of-bounds error before masking
+        
         idx = idx.expand(B, C, H, W).to(torch.long)
-        return x.gather(dim=3, index=idx)
+        out = x.gather(dim=3, index=idx)
+        
+        # Mask out invalid (wrapped) pixels with zeros
+        mask = valid.expand(B, C, H, W)
+        return out * mask.to(out.dtype)
 
     def _apply_pitch_shift(self, x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
         """
@@ -363,6 +373,35 @@ class WorldModelConvFiLM(nn.Module):
         out = x.gather(dim=2, index=src_y_idx)
         out = out * valid.to(out.dtype).expand(B, 1, H, 1).expand(B, C, H, W)
         return out
+
+    def _warp_hidden_state(self, h_prev: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+        """
+        v6.3: Warp all layers of hidden state by camera rotation.
+
+        Instead of warping the input embeddings (v6.2), we warp the hidden state.
+        This transforms the problem from "predict whole next frame" to "predict residual change".
+        The GRU only needs to learn inpainting (filling edges) and dynamics (water, mobs),
+        not geometry (camera rotation).
+
+        h_prev: (L, B, C, H, W) - previous hidden states
+        dx: (B,) - horizontal shift (yaw), positive = camera turning right
+        dy: (B,) - vertical shift (pitch), positive = camera looking up
+
+        Returns: (L, B, C, H, W) - warped hidden states
+        """
+        L, B, C, H, W = h_prev.shape
+
+        # Reshape for batch processing: (L*B, C, H, W)
+        h_flat = h_prev.view(L * B, C, H, W)
+
+        # Replicate dx, dy for each layer
+        dx_rep = dx.repeat(L)  # (L*B,)
+        dy_rep = dy.repeat(L)  # (L*B,)
+
+        # Apply yaw (horizontal shift with zero padding) and pitch (vertical shift with zero padding)
+        h_warped = self._apply_pitch_shift(self._apply_yaw_shift(h_flat, dx_rep), dy_rep)
+
+        return h_warped.view(L, B, C, H, W)
 
     def _embed_tokens(self, Z):
         x = self.embed(Z)              # (B,H,W,E)
@@ -409,17 +448,19 @@ class WorldModelConvFiLM(nn.Module):
         else:
             x = self._embed_tokens(Z_t)
 
-        # v6.2: Explicit camera warp primitive (cheap spatial transport bias).
-        # This reduces the burden on ConvGRU kernels to learn large yaw/pitch spatial movement.
-        if self.enable_camera_warp and a_t is not None:
-            dx, dy = self._action_to_pixel_shifts(a_t)
-            x = self._apply_pitch_shift(self._apply_yaw_roll(x, dx), dy)
-
         # FiLM params
         if gammas_t is not None:
             g_all, b_all = gammas_t, betas_t
         else:
             g_all, b_all = self.film(a_t)
+
+        # v6.3: Warp HIDDEN STATE by camera action (instead of warping input as in v6.2).
+        # This transforms the problem from "predict whole next frame" to "predict residual".
+        # GRU only needs to learn inpainting (filling edges) and dynamics (water, mobs),
+        # not geometry (camera rotation).
+        if self.enable_camera_warp and a_t is not None:
+            dx, dy = self._action_to_pixel_shifts(a_t)
+            h_prev = self._warp_hidden_state(h_prev, dx, dy)
 
         new_h_list = []
         curr = x
