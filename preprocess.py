@@ -14,7 +14,7 @@ Pipeline:
 - Encode frames to discrete codes using the trained VQ‑VAE.
 - Save one .npz per video with:
     tokens: [K, H, W] uint16
-    actions: [K−1, 5] float32 = [yaw, pitch, move_x, move_z, jump]
+    actions: [K−1, 15] float32 = [yaw(5), pitch(3), WASD(4), jump, sprint, sneak]
 - Maintain manifest.json with per‑trajectory lengths.
 
 This avoids mid‑training VQ‑VAE encodes. For n‑step autoregressive loss, sample within a single
@@ -224,7 +224,20 @@ def main(parent_dir: str,
          fps_target: int = 16,
          vqvae_ckpt: str = "vq_vae/checkpoints/vqvae_epoch_10.pt",
          encode_batch: int = 64,
-         angle_scale: float = 0.3):
+         angle_scale: float = 0.3,
+         limit: int | None = None,
+         sample_rate: float = 1.0,
+         sample_seed: int = 0,
+         shuffle: bool = False,
+         include_glob: list[str] | None = None,
+         exclude_glob: list[str] | None = None,
+         biome: list[str] | None = None,
+         weather: list[str] | None = None,
+         start_time: list[str] | None = None,
+         min_steps: int | None = None,
+         max_steps: int | None = None,
+         dry_run: bool = False,
+         dry_run_stats: bool = False):
     """
     parent_dir: GameFactory data_2003 directory containing metadata/ and video/.
     fps_target: target FPS after downsampling in step space (default 16).
@@ -233,9 +246,6 @@ def main(parent_dir: str,
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder, quantizer = load_vqvae(vqvae_ckpt, device)
-
     progress_path = out / PROGRESS_FILENAME
     progress = _load_progress(progress_path)
     processed_set = set(progress.get("processed", []))
@@ -243,8 +253,136 @@ def main(parent_dir: str,
     meta_dir = parent / "metadata"
     video_dir = parent / "video"
     meta_files = sorted(meta_dir.glob("*.json"))
+
+    # ----------------------------
+    # Optional dataset filtering / sampling
+    # ----------------------------
+    def _norm_set(xs: list[str] | None) -> set[str] | None:
+        if not xs:
+            return None
+        out_set: set[str] = set()
+        for x in xs:
+            for part in str(x).split(","):
+                part = part.strip()
+                if part:
+                    out_set.add(part)
+        return out_set if out_set else None
+
+    include_globs = include_glob or []
+    exclude_globs = exclude_glob or []
+    biome_set = _norm_set(biome)
+    weather_set = _norm_set(weather)
+    start_time_set = _norm_set(start_time)
+
+    rng = np.random.default_rng(sample_seed)
+
+    # Pre-filter candidates by filename glob and existence of paired video.
+    candidates: list[Path] = []
+    for meta_path in meta_files:
+        stem = meta_path.stem
+        if include_globs and not any(Path(stem).match(g) for g in include_globs):
+            continue
+        if exclude_globs and any(Path(stem).match(g) for g in exclude_globs):
+            continue
+        if not (video_dir / (stem + ".mp4")).exists():
+            continue
+        candidates.append(meta_path)
+
+    # Apply metadata-based filters (biome/weather/time/length).
+    filtered: list[Path] = []
+    stats_biome: dict[str, int] = {}
+    stats_weather: dict[str, int] = {}
+    stats_time: dict[str, int] = {}
+
+    need_meta = any([
+        biome_set is not None,
+        weather_set is not None,
+        start_time_set is not None,
+        min_steps is not None,
+        max_steps is not None,
+    ])
+
+    if need_meta:
+        for meta_path in candidates:
+            try:
+                with meta_path.open("r") as f:
+                    meta = json.load(f)
+            except Exception:
+                continue
+
+            b = str(meta.get("biome", "")).strip()
+            w = str(meta.get("initial_weather", "")).strip()
+            t0 = str(meta.get("start_time", "")).strip()
+            if dry_run_stats:
+                stats_biome[b] = stats_biome.get(b, 0) + 1
+                stats_weather[w] = stats_weather.get(w, 0) + 1
+                stats_time[t0] = stats_time.get(t0, 0) + 1
+
+            if biome_set is not None and b not in biome_set:
+                continue
+            if weather_set is not None and w not in weather_set:
+                continue
+            if start_time_set is not None and t0 not in start_time_set:
+                continue
+
+            actions_dict = meta.get("actions", {})
+            if not actions_dict:
+                continue
+            T = len(actions_dict)
+            if min_steps is not None and T < int(min_steps):
+                continue
+            if max_steps is not None and T > int(max_steps):
+                continue
+
+            filtered.append(meta_path)
+
+            # Fast path: if we're taking the first N matches deterministically,
+            # don't scan the entire metadata set.
+            if (
+                limit is not None
+                and not shuffle
+                and float(sample_rate) >= 1.0
+                and not dry_run_stats
+                and len(filtered) >= int(limit)
+            ):
+                break
+    else:
+        filtered = candidates
+
+    # Sampling + ordering.
+    if shuffle:
+        order = rng.permutation(len(filtered)).tolist()
+        filtered = [filtered[i] for i in order]
+    if sample_rate < 1.0:
+        n = max(1, int(round(len(filtered) * float(sample_rate))))
+        idx = rng.choice(len(filtered), size=n, replace=False)
+        filtered = [filtered[i] for i in sorted(idx)]
+    if limit is not None:
+        filtered = filtered[: int(limit)]
+
+    if dry_run:
+        print("\n--- Selection summary (dry run) ---")
+        print(f"Parent: {parent}")
+        print(f"Total metadata files: {len(meta_files)}")
+        print(f"Paired meta+video candidates: {len(candidates)}")
+        print(f"Selected after filters/sampling: {len(filtered)}")
+        if need_meta and dry_run_stats:
+            def _topk(d: dict[str, int], k: int = 10):
+                items = sorted(d.items(), key=lambda kv: kv[1], reverse=True)
+                return items[:k]
+            print("\nTop biomes:", _topk(stats_biome))
+            print("Top weathers:", _topk(stats_weather))
+            print("Top start_times:", _topk(stats_time))
+        if filtered:
+            print("\nFirst 10 selected stems:")
+            for pth in filtered[:10]:
+                print(" ", pth.stem)
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder, quantizer = load_vqvae(vqvae_ckpt, device)
     total = 0
-    for meta_path in tqdm(meta_files, desc="Processing GameFactory videos"):
+    for meta_path in tqdm(filtered, desc="Processing GameFactory videos"):
         stem = meta_path.stem
         if stem in processed_set:
             continue
@@ -295,7 +433,7 @@ def main(parent_dir: str,
             s0, s1 = kept_states[i], kept_states[i + 1]
             window = per_step_actions[s0:s1]
             if window.shape[0] == 0:
-                agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(5, dtype=np.float32))
+                agg_actions.append(agg_actions[-1] if len(agg_actions) else np.zeros(15, dtype=np.float32))
                 continue
             pooled = np.mean(window, axis=0)
             agg_actions.append(pooled.astype(np.float32))
@@ -349,5 +487,31 @@ if __name__ == "__main__":
                    help="Batch size for VQ-VAE encoding")
     p.add_argument("--angle_scale", type=float, default=1.0,
                    help="Scale factor for GameFactory yaw/pitch deltas before clipping to [-1,1]")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Maximum number of videos to process after filtering/sampling")
+    p.add_argument("--sample_rate", type=float, default=1.0,
+                   help="Randomly sample this fraction of eligible videos (default 1.0)")
+    p.add_argument("--sample_seed", type=int, default=0,
+                   help="RNG seed for sampling/shuffling")
+    p.add_argument("--shuffle", action="store_true",
+                   help="Shuffle eligible videos before applying --limit/--sample_rate")
+    p.add_argument("--include_glob", action="append", default=None,
+                   help="Only include stems matching this glob (repeatable), e.g. 'seed_1*_part_*'")
+    p.add_argument("--exclude_glob", action="append", default=None,
+                   help="Exclude stems matching this glob (repeatable)")
+    p.add_argument("--biome", action="append", default=None,
+                   help="Filter by biome (repeatable or comma-separated), e.g. --biome plains")
+    p.add_argument("--weather", action="append", default=None,
+                   help="Filter by initial_weather (repeatable or comma-separated), e.g. --weather clear")
+    p.add_argument("--start_time", action="append", default=None,
+                   help="Filter by start_time (repeatable or comma-separated), e.g. --start_time Sunset")
+    p.add_argument("--min_steps", type=int, default=None,
+                   help="Filter out videos with fewer than this many action steps (metadata actions length)")
+    p.add_argument("--max_steps", type=int, default=None,
+                   help="Filter out videos with more than this many action steps (metadata actions length)")
+    p.add_argument("--dry_run", action="store_true",
+                   help="Print selection summary and exit without processing")
+    p.add_argument("--dry_run_stats", action="store_true",
+                   help="When used with --dry_run, also compute and print top biome/weather/time counts (slower)")
     args = p.parse_args()
     main(**vars(args))
