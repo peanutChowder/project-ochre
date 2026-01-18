@@ -38,7 +38,7 @@ if [[ $(basename "$PWD") == "project-ochre" ]]; then
         cd ..
         gdown 1sqxDK2jHQu--pWH343l9gTzGnJozJLRX
         tar -xvf preprocessedv5_plains_clear.tar
-        echo "✅ Dataset extracted to $(pwd)/preprocessedv5"
+        echo "✅ Dataset extracted to $(pwd)/preprocessedv5_plains_clear"
         ls preprocessedv5_plains_clear | head -5
         cd project-ochre
     fi
