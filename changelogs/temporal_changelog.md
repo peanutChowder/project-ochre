@@ -765,3 +765,10 @@ train.py
 - Teacher-forcing token corruption (random token replacement) with a ramp schedule to weaken the “copy z_t” shortcut and improve robustness to action injection.
 - Anti-collapse guardrails: slower Gumbel hardening with higher tau floor + temporary entropy bonus early in training; gate AR growth using `unique_codes` to avoid pushing AR while in a collapsed regime.
 - Action-conditional LPIPS reweighting: ramp a boost multiplier for movement-active frames (WASD/jump/sprint/sneak) to amplify weak movement gradients under co-occurrence; log `train/lpips_movement_boost` and `train/movement_active_pct`.
+
+Results, step 100k:
+- Anti-collapse succeeded: `unique_codes` stabilized ~40–42; entropy/confidence trends healthy (no v6.1-style collapse).
+- AR curriculum reached ~15 steps but did not hit max; `lpips_ratio` ~1.5–2.0 and AR LPIPS worsened over training.
+- Live inference regressed: strong zero-input drift to a memorized stone texture field within seconds, long-rollout degradation persists.
+- Camera controllability worse than prior best: yaw/pitch cause sudden snaps rather than progressive motion (camera warp likely shortcut/instability).
+- Movement still non-functional: WASD/jump show no observable effect despite 4× LPIPS movement reweighting; IDM low loss suggests “action-echo” shortcut (actions encoded in h, not used for visual causality).
