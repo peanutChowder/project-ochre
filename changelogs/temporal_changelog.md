@@ -788,3 +788,13 @@ train.py
 - New diagnostics: `ar_quality/frame_{i}` for per-frame AR LPIPS, `diagnostics/h_drift_during_ar` to track hidden state change during AR rollout.
 
 Key insight: By warping h_prev, the GRU only needs to learn inpainting (filling edges exposed by camera rotation) and dynamics (water, mobs), NOT geometry (the rotation itself). This is fundamentally easier.
+
+### v7.0
+
+model_transformer.py
+- Architecture changed to ConvTransformer: Conv stem + efficient spatial attention (windowed + axial) + AdaLN-Zero action conditioning (separate camera/movement pathways) + temporal cross-attention over compressed past frames.
+- Make IDM supervise the *actual dynamics core state*: `step(..., return_spatial_features=True)` returns post-block + post-temporal spatial features (`x_spatial`) for IDM/diagnostics.
+
+train.py
+- Reset to minimal loss set: Semantic(codebook) + LPIPS + IDM; remove token corruption / entropy bonus / movement-conditional LPIPS / extra auxiliaries to reduce interactions and speed iteration.
+- Keep v6.3 AR curriculum + diversity gating (`unique_codes`) to avoid pushing AR while collapsed.
