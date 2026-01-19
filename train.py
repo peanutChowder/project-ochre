@@ -39,15 +39,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
 
 # --- PATHS ---
-DATA_DIR = "./preprocessedv5_plains_clear"
-VQVAE_PATH = "./vq_vae/checkpoints/vqvae_v2.1.6__epoch100.pt"
+DATA_DIR = "../preprocessedv5_plains_clear"
+VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
 # --- MODEL CONFIG ---
 HIDDEN_DIM = 384
 NUM_LAYERS = 4
 NUM_HEADS = 6
-TEMPORAL_CONTEXT_LEN = 4
+TEMPORAL_CONTEXT_LEN = 8
 WINDOW_SIZE = 4
 
 # --- TRAINING HYPERPARAMETERS ---
