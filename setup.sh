@@ -130,18 +130,33 @@ else
         set -e
     fi
 
-    # Blackwell (RTX 50-series) support:
-    # - Use CUDA 12.8 nightly wheels (sm_120 support), which resolves the RTX 5090 warning:
-    #   pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+    # CUDA 12.8 / Blackwell (RTX 50-series) support:
+    # - PyTorch 2.7+ ships official CUDA 12.8 (cu128) wheels and includes Blackwell support.
+    #   See PyTorch 2.7 release notes/blog for the recommended install command.
+    # - Nightly cu128 can be used as a fallback if the stable wheel set is temporarily missing for your Python/ABI.
     if [[ "$GPU_IS_BLACKWELL" == "true" ]]; then
-        echo "📦 Installing PyTorch nightly for Blackwell (cu128)..."
-        $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        echo "📦 Installing PyTorch for Blackwell (stable cu128)..."
+        set +e
+        $PIP_CMD install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+        INSTALL_RC=$?
+        set -e
+        if [[ $INSTALL_RC -ne 0 ]]; then
+            echo "⚠️  Stable cu128 wheel install failed; falling back to nightly cu128 (can happen if today's nightly wheels are incomplete)."
+            $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        fi
     elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
         echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
         $PIP_CMD install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
     elif [[ "$CUDA_VERSION" == "12.8"* ]]; then
-        echo "📦 Installing PyTorch nightly for CUDA 12.8 (cu128)..."
-        $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        echo "📦 Installing PyTorch for CUDA 12.8 (stable cu128)..."
+        set +e
+        $PIP_CMD install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+        INSTALL_RC=$?
+        set -e
+        if [[ $INSTALL_RC -ne 0 ]]; then
+            echo "⚠️  Stable cu128 wheel install failed; falling back to nightly cu128."
+            $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+        fi
     elif [[ "$CUDA_VERSION" == "12."* ]]; then
         echo "📦 Installing PyTorch for CUDA 12.x..."
         # Prefer cu126 stable for pre-Blackwell GPUs.
