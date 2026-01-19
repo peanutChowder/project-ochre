@@ -5,10 +5,14 @@ set -e  # Exit on error
 
 echo "🚀 Starting setup..."
 
+# Prefer python3/pip3 in these environments, and use module form for consistency.
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+PIP_CMD="${PIP_CMD:-$PYTHON_BIN -m pip}"
+
 # Install gdown if needed
 if ! command -v gdown &> /dev/null; then
     echo "📦 Installing gdown..."
-    pip install gdown
+    $PIP_CMD install gdown
 else
     echo "✅ gdown already installed"
 fi
@@ -59,8 +63,8 @@ echo "🚀 Installing dependencies"
 
 # Check if PyTorch is already installed
 PYTORCH_INSTALLED=false
-if python -c "import torch" 2>/dev/null; then
-    PYTORCH_VERSION=$(python -c "import torch; print(torch.__version__)" 2>/dev/null)
+if $PYTHON_BIN -c "import torch" 2>/dev/null; then
+    PYTORCH_VERSION=$($PYTHON_BIN -c "import torch; print(torch.__version__)" 2>/dev/null)
     echo "✅ PyTorch $PYTORCH_VERSION already installed"
     PYTORCH_INSTALLED=true
 fi
@@ -83,42 +87,64 @@ if command -v nvidia-smi &> /dev/null; then
     fi
 fi
 
+# If torch is installed, detect whether this build supports the GPU (e.g., Blackwell sm_120 requires cu128+ wheels).
+PYTORCH_NEEDS_REINSTALL=false
+if [[ "$PYTORCH_INSTALLED" == "true" ]] && command -v nvidia-smi &> /dev/null; then
+    # This check is best-effort; it will still work even if torch emits a warning during import.
+    read -r TORCH_CUDA_VERSION GPU_CC_MAJOR GPU_CC_MINOR <<< "$($PYTHON_BIN - <<'PY' 2>/dev/null || true
+import torch
+cuda_ver = torch.version.cuda or "none"
+cc = None
+try:
+    if torch.cuda.is_available():
+        cc = torch.cuda.get_device_capability(0)
+except Exception:
+    cc = None
+if cc is None:
+    print(cuda_ver, -1, -1)
+else:
+    print(cuda_ver, cc[0], cc[1])
+PY
+)"
+    if [[ "$GPU_CC_MAJOR" -ge 12 ]]; then
+        if [[ "$TORCH_CUDA_VERSION" != 12.8* ]]; then
+            echo "⚠️  Installed PyTorch CUDA build ($TORCH_CUDA_VERSION) likely does not support compute capability ${GPU_CC_MAJOR}.${GPU_CC_MINOR}."
+            PYTORCH_NEEDS_REINSTALL=true
+        fi
+    fi
+fi
+
 # Install PyTorch based on CUDA version and GPU architecture (skip if already installed)
-if [[ "$PYTORCH_INSTALLED" == "true" ]]; then
+if [[ "$PYTORCH_INSTALLED" == "true" ]] && [[ "$PYTORCH_NEEDS_REINSTALL" != "true" ]]; then
     echo "⏭️  Skipping PyTorch installation (already installed: $PYTORCH_VERSION)"
     echo "   To reinstall, run: pip uninstall torch torchvision torchaudio && bash setup.sh"
 else
-    # Blackwell (RTX 50-series) support:
-    # - Prefer stable CUDA 12.6 wheels from the official PyTorch index.
-    # - If that fails (temporary packaging gaps), fall back to nightly.
-    if [[ "$GPU_IS_BLACKWELL" == "true" ]]; then
-        echo "📦 Installing PyTorch for Blackwell (prefer stable cu126 wheels; fallback to nightly if needed)..."
+    if [[ "$PYTORCH_INSTALLED" == "true" ]] && [[ "$PYTORCH_NEEDS_REINSTALL" == "true" ]]; then
+        echo "🧹 Uninstalling incompatible PyTorch build..."
         set +e
-        pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-        status=$?
-        if [[ $status -ne 0 ]]; then
-            echo "⚠️  Stable cu126 install failed; retrying with nightly cu126..."
-            pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
-            status=$?
-        fi
+        $PIP_CMD uninstall -y torch torchvision torchaudio
         set -e
-        if [[ $status -ne 0 ]]; then
-            echo "❌ Failed to install PyTorch for Blackwell GPU."
-            echo "   Try running manually:"
-            echo "   pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126"
-            echo "   or nightly:"
-            echo "   pip install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126"
-            exit 1
-        fi
+    fi
+
+    # Blackwell (RTX 50-series) support:
+    # - Use CUDA 12.8 nightly wheels (sm_120 support), which resolves the RTX 5090 warning:
+    #   pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+    if [[ "$GPU_IS_BLACKWELL" == "true" ]]; then
+        echo "📦 Installing PyTorch nightly for Blackwell (cu128)..."
+        $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
     elif [[ "$CUDA_VERSION" == "11.8"* ]]; then
         echo "📦 Installing PyTorch 2.1.0 for CUDA 11.8..."
-        pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+        $PIP_CMD install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+    elif [[ "$CUDA_VERSION" == "12.8"* ]]; then
+        echo "📦 Installing PyTorch nightly for CUDA 12.8 (cu128)..."
+        $PIP_CMD install --upgrade --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
     elif [[ "$CUDA_VERSION" == "12."* ]]; then
-        echo "📦 Installing PyTorch 2.7.0+ for CUDA 12.x (compatible with $CUDA_VERSION)..."
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+        echo "📦 Installing PyTorch for CUDA 12.x..."
+        # Prefer cu126 stable for pre-Blackwell GPUs.
+        $PIP_CMD install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
     else
         echo "📦 Installing PyTorch 2.7.0+ (auto-detect CUDA)..."
-        pip install torch torchvision torchaudio
+        $PIP_CMD install --upgrade torch torchvision torchaudio
     fi
 fi
 
@@ -137,7 +163,7 @@ if [ ${#MISSING_DEPS[@]} -eq 0 ]; then
     echo "✅ All core dependencies already installed"
 else
     echo "📦 Installing missing dependencies: ${MISSING_DEPS[*]}"
-    pip install "${MISSING_DEPS[@]}"
+    $PIP_CMD install "${MISSING_DEPS[@]}"
 fi
 
 # Check wandb
@@ -146,7 +172,7 @@ if python -c "import wandb" 2>/dev/null; then
     echo "✅ wandb already installed (version $WANDB_VERSION)"
 else
     echo "📦 Installing wandb..."
-    pip install wandb==0.22.3
+    $PIP_CMD install wandb==0.22.3
 fi
 
 # Verify installation
