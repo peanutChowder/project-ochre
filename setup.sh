@@ -53,7 +53,7 @@ else
     else
         echo "📦 Downloading dataset..."
         gdown 1sqxDK2jHQu--pWH343l9gTzGnJozJLRX
-        unzip -q preprocessedv5_plains_clear.zip
+        tar -xvf preprocessedv5_plains_clear.tar
         echo "✅ Dataset extracted to $(pwd)/preprocessedv5_plains_clear"
         ls preprocessedv5_plains_clear | head -5
     fi
