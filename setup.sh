@@ -21,7 +21,7 @@ fi
 mkdir -p checkpoints
 
 # Download VQ-VAE checkpoint if not present
-VQVAE_CHECKPOINT="checkpoints/vqvae_v2.1.6.pt"
+VQVAE_CHECKPOINT="checkpoints/vqvae_v2.1.6__epoch100.pt"
 if [[ -f "$VQVAE_CHECKPOINT" ]] || [[ -f "checkpoints/vqvae.pt" ]]; then
     echo "✅ VQ-VAE checkpoint already exists, skipping download"
 else
