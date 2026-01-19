@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import torch.utils.checkpoint
 from typing import Optional, List, Tuple
 
 
@@ -551,12 +552,14 @@ class MinecraftConvTransformer(nn.Module):
         window_size: int = 4,
         idm_max_span: int = 5,
         mlp_ratio: float = 2.0,
+        use_checkpointing: bool = False,
     ):
         super().__init__()
         self.codebook_size = codebook_size
         self.H, self.W = H, W
         self.hidden_dim = hidden_dim
         self.temporal_context_len = temporal_context_len
+        self.use_checkpointing = use_checkpointing
 
         # Token embedding
         self.embed = nn.Embedding(codebook_size, embed_dim)
@@ -655,7 +658,10 @@ class MinecraftConvTransformer(nn.Module):
 
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x, action, self.H, self.W)
+            if self.use_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, action, self.H, self.W, use_reentrant=False)
+            else:
+                x = block(x, action, self.H, self.W)
 
         # Temporal cross-attention
         x = self.temporal_attn(x, temporal_buffer)

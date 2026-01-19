@@ -51,7 +51,7 @@ TEMPORAL_CONTEXT_LEN = 8
 WINDOW_SIZE = 4
 
 # --- TRAINING HYPERPARAMETERS ---
-BATCH_SIZE = 16           # Slightly reduced for transformer memory
+BATCH_SIZE = 8            # Reduced to prevent OOM
 MAX_STEPS = 300_000
 LR = 1e-4                 # Higher than ConvGRU - transformers tolerate more
 WARMUP_STEPS = 2000       # Longer warmup for transformer stability
@@ -358,6 +358,7 @@ model = MinecraftConvTransformer(
     temporal_context_len=TEMPORAL_CONTEXT_LEN,
     window_size=WINDOW_SIZE,
     idm_max_span=MAX_IDM_SPAN,
+    use_checkpointing=True,  # Enable gradient checkpointing to save VRAM
 ).to(DEVICE)
 
 param_counts = model.count_parameters()
@@ -463,7 +464,7 @@ while global_step < MAX_STEPS:
             logits_last = logits_t
 
             # Store for IDM (detach past states to prevent backprop through time)
-            h_buffer.append(x_spatial_t.detach())
+            h_buffer.append(x_spatial_t)
 
             # Update temporal buffer
             temporal_buffer.append(new_state.detach())
@@ -506,7 +507,7 @@ while global_step < MAX_STEPS:
                 # Average targets over span.
                 # Feature at loop index t is a post-action state for A_seq[:, t] (predicting Z_{t+1}),
                 # so the k actions "between" h_start (t-k) and h_end (t) are A[t-k+1 .. t].
-                action_segment = A_seq[:, t-k+1:t+1]
+                action_segment = A_seq[:, t-k:t]
                 yaw_target = action_segment[:, :, 0:5].mean(dim=1)
                 pitch_target = action_segment[:, :, 5:8].mean(dim=1)
                 bin_target = action_segment[:, :, 8:15].mean(dim=1)
