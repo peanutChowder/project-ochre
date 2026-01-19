@@ -78,16 +78,19 @@ else
     CUDA_VERSION="auto"
 fi
 
-# Detect if RTX 50-series (Blackwell) GPUs present
+# Detect NVIDIA Blackwell (typically GeForce RTX 50-series). Best-effort based on GPU name.
 GPU_IS_BLACKWELL=false
 if command -v nvidia-smi &> /dev/null; then
-    if nvidia-smi --query-gpu=name --format=csv,noheader | grep -qi "50[0-9][0-9]"; then
-        echo "✅ Detected RTX 50-series GPU (Blackwell architecture)"
+    GPU_NAMES=$(nvidia-smi --query-gpu=name --format=csv,noheader | tr '\n' ';')
+    # Match common naming patterns without accidentally matching older workstation parts (e.g., RTX A5000).
+    if echo "$GPU_NAMES" | grep -Eqi "(GeForce[[:space:]]+RTX[[:space:]]+50|RTX[[:space:]]+50[0-9]{2}|RTX[[:space:]]+5090|RTX[[:space:]]+5080|RTX[[:space:]]+5070|Blackwell)"; then
+        echo "✅ Detected Blackwell-class GPU (likely RTX 50-series): $GPU_NAMES"
         GPU_IS_BLACKWELL=true
     fi
 fi
 
-# If torch is installed, detect whether this build supports the GPU (e.g., Blackwell sm_120 requires cu128+ wheels).
+# If torch is installed, detect whether this build supports the GPU.
+# Blackwell GPUs (compute capability 12.x / sm_120) typically require recent CUDA 12.8+ nightly wheels today.
 PYTORCH_NEEDS_REINSTALL=false
 if [[ "$PYTORCH_INSTALLED" == "true" ]] && command -v nvidia-smi &> /dev/null; then
     # This check is best-effort; it will still work even if torch emits a warning during import.
@@ -107,8 +110,9 @@ else:
 PY
 )"
     if [[ "$GPU_CC_MAJOR" -ge 12 ]]; then
+        # Best-effort: if torch reports CUDA build not matching 12.8*, it may lack sm_120 kernels.
         if [[ "$TORCH_CUDA_VERSION" != 12.8* ]]; then
-            echo "⚠️  Installed PyTorch CUDA build ($TORCH_CUDA_VERSION) likely does not support compute capability ${GPU_CC_MAJOR}.${GPU_CC_MINOR}."
+            echo "⚠️  Installed PyTorch CUDA build ($TORCH_CUDA_VERSION) likely does not support compute capability ${GPU_CC_MAJOR}.${GPU_CC_MINOR} (Blackwell sm_120)."
             PYTORCH_NEEDS_REINSTALL=true
         fi
     fi
@@ -153,11 +157,11 @@ echo "📦 Checking core dependencies..."
 MISSING_DEPS=()
 
 # Check each dependency
-python -c "import numpy" 2>/dev/null || MISSING_DEPS+=("numpy<2.0")
-python -c "import webdataset" 2>/dev/null || MISSING_DEPS+=("webdataset")
-python -c "import tqdm" 2>/dev/null || MISSING_DEPS+=("tqdm")
-python -c "import PIL" 2>/dev/null || MISSING_DEPS+=("pillow")
-python -c "import lpips" 2>/dev/null || MISSING_DEPS+=("lpips")
+$PYTHON_BIN -c "import numpy" 2>/dev/null || MISSING_DEPS+=("numpy<2.0")
+$PYTHON_BIN -c "import webdataset" 2>/dev/null || MISSING_DEPS+=("webdataset")
+$PYTHON_BIN -c "import tqdm" 2>/dev/null || MISSING_DEPS+=("tqdm")
+$PYTHON_BIN -c "import PIL" 2>/dev/null || MISSING_DEPS+=("pillow")
+$PYTHON_BIN -c "import lpips" 2>/dev/null || MISSING_DEPS+=("lpips")
 
 if [ ${#MISSING_DEPS[@]} -eq 0 ]; then
     echo "✅ All core dependencies already installed"
@@ -167,8 +171,8 @@ else
 fi
 
 # Check wandb
-if python -c "import wandb" 2>/dev/null; then
-    WANDB_VERSION=$(python -c "import wandb; print(wandb.__version__)" 2>/dev/null)
+if $PYTHON_BIN -c "import wandb" 2>/dev/null; then
+    WANDB_VERSION=$($PYTHON_BIN -c "import wandb; print(wandb.__version__)" 2>/dev/null)
     echo "✅ wandb already installed (version $WANDB_VERSION)"
 else
     echo "📦 Installing wandb..."
@@ -178,7 +182,7 @@ fi
 # Verify installation
 echo ""
 echo "🔍 Verifying installation..."
-python -c "
+$PYTHON_BIN -c "
 import torch
 print(f'✅ PyTorch: {torch.__version__}')
 print(f'✅ CUDA available: {torch.cuda.is_available()}')
@@ -191,7 +195,7 @@ else:
     print('⚠️  No GPU available!')
 "
 
-python -c "import wandb, lpips, webdataset, tqdm, numpy, PIL; print('✅ All packages imported successfully')"
+$PYTHON_BIN -c "import wandb, lpips, webdataset, tqdm, numpy, PIL; print('✅ All packages imported successfully')"
 
 echo ""
 echo "✅ Installation complete!"
