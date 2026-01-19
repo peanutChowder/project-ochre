@@ -12,8 +12,12 @@ Supports:
 import torch
 import time
 import argparse
-from model_convGru import WorldModelConvFiLM
 from model_transformer import MinecraftConvTransformer
+
+try:
+    from model_convGru import WorldModelConvFiLM  # legacy v6.x
+except ModuleNotFoundError:
+    WorldModelConvFiLM = None
 
 def benchmark_inference(
     device: str = "cpu",
@@ -36,6 +40,9 @@ def benchmark_inference(
     print(f"Benchmark: {device.upper()}")
     print(f"Config: hidden_dim={hidden_dim}, n_layers={n_layers}, temporal_ctx={temporal_context_len}")
     print(f"{'='*60}")
+
+    if WorldModelConvFiLM is None:
+        raise RuntimeError("WorldModelConvFiLM not available (missing model_convGru.py). Use --model transformer.")
 
     # Initialize model
     model = WorldModelConvFiLM(
@@ -275,6 +282,9 @@ def benchmark_comparison():
 
 def benchmark_no_temporal(device: str, hidden_dim: int):
     """Benchmark without temporal attention (for comparison)."""
+
+    if WorldModelConvFiLM is None:
+        raise RuntimeError("WorldModelConvFiLM not available (missing model_convGru.py). Use --model transformer.")
 
     model = WorldModelConvFiLM(
         codebook_size=2048,
