@@ -90,10 +90,9 @@ if command -v nvidia-smi &> /dev/null; then
 fi
 
 # If torch is installed, detect whether this build supports the GPU.
-# Blackwell GPUs (compute capability 12.x / sm_120) typically require recent CUDA 12.8+ nightly wheels today.
+# For Blackwell (sm_120), any CUDA build >= 12.8 is acceptable (e.g. cu128, cu130).
 PYTORCH_NEEDS_REINSTALL=false
 if [[ "$PYTORCH_INSTALLED" == "true" ]] && command -v nvidia-smi &> /dev/null; then
-    # This check is best-effort; it will still work even if torch emits a warning during import.
     read -r TORCH_CUDA_VERSION GPU_CC_MAJOR GPU_CC_MINOR <<< "$($PYTHON_BIN - <<'PY' 2>/dev/null || true
 import torch
 cuda_ver = torch.version.cuda or "none"
@@ -109,11 +108,20 @@ else:
     print(cuda_ver, cc[0], cc[1])
 PY
 )"
+
+    # Blackwell GPUs: accept any CUDA >= 12.8 (including future cu130 builds)
     if [[ "$GPU_CC_MAJOR" -ge 12 ]]; then
-        # Best-effort: if torch reports CUDA build not matching 12.8*, it may lack sm_120 kernels.
-        if [[ "$TORCH_CUDA_VERSION" != 12.8* ]]; then
-            echo "⚠️  Installed PyTorch CUDA build ($TORCH_CUDA_VERSION) likely does not support compute capability ${GPU_CC_MAJOR}.${GPU_CC_MINOR} (Blackwell sm_120)."
+        if [[ "$TORCH_CUDA_VERSION" == "none" ]]; then
+            echo "⚠️  PyTorch is installed but CUDA support is missing."
             PYTORCH_NEEDS_REINSTALL=true
+        else
+            # Compare major.minor numerically (e.g. 12.8, 13.0)
+            TORCH_CUDA_NUM=$(echo "$TORCH_CUDA_VERSION" | awk -F. '{printf "%d.%d", $1, $2}')
+            REQ_CUDA_NUM=12.8
+            awk "BEGIN {exit !($TORCH_CUDA_NUM >= $REQ_CUDA_NUM)}" || {
+                echo "⚠️  Installed PyTorch CUDA build ($TORCH_CUDA_VERSION) is too old for Blackwell (requires >= 12.8)."
+                PYTORCH_NEEDS_REINSTALL=true
+            }
         fi
     fi
 fi
