@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 """
-v7.0 ConvTransformer Training Script
--------------------------------------
-Minimal training with high-impact losses only:
-- LPIPS (visual quality)
-- Semantic/CE (codebook diversity)
-- IDM (action supervision)
-
-Keeps v6.3 AR curriculum (proven to work).
-Removes: action ranking, entropy bonus, token corruption, movement boost.
+v7.0.1 ConvTransformer Training Script
 """
 
 import os
@@ -57,14 +49,14 @@ LR = 1e-4                 # Higher than ConvGRU - transformers tolerate more
 WARMUP_STEPS = 2000       # Longer warmup for transformer stability
 MIN_LR = 1e-6
 
-# --- LOSS WEIGHTS (Evidence-backed minimal set) ---
-SEMANTIC_WEIGHT = 1.0     # v4.10.1: Essential for codebook diversity
-LPIPS_WEIGHT = 3.0        # v4.10.1: Primary visual quality signal
+# --- LOSS WEIGHTS (v7.0.1 rebalance) ---
+SEMANTIC_WEIGHT = 0.5     # Reduced - was dominating gradients over visual quality
+LPIPS_WEIGHT = 5.0        # Increased - must be primary signal for good reconstructions
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 
 # Gumbel temperature (fixed, no schedule - simpler)
-GUMBEL_TAU = 0.5
+GUMBEL_TAU = 0.2  # Reduced from 0.5 - sharper soft embeddings for better reconstruction
 
 # --- AR CURRICULUM (v6.3 config) ---
 BASE_SEQ_LEN = 16
@@ -88,8 +80,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.0-transformer-step0"
-MODEL_OUT_PREFIX = "ochre-v7.0"
+RUN_NAME = "v7.0.1-step10k"
+MODEL_OUT_PREFIX = "ochre-v7.0.1"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -480,7 +472,7 @@ while global_step < MAX_STEPS:
             loss_sem_list.append(loss_sem)
 
             # B. LPIPS Loss
-            probs = F.gumbel_softmax(logits_flat, tau=GUMBEL_TAU, hard=False, dim=-1)
+            probs = F.gumbel_softmax(logits_flat, tau=GUMBEL_TAU, hard=True, dim=-1)
             probs = probs.reshape(B, H, W, -1)
             soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
             pred_rgb = vqvae_model.decoder(soft_emb)

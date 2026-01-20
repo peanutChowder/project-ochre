@@ -798,3 +798,20 @@ model_transformer.py
 train.py
 - Reset to minimal loss set: Semantic(codebook) + LPIPS + IDM; remove token corruption / entropy bonus / movement-conditional LPIPS / extra auxiliaries to reduce interactions and speed iteration.
 - Keep v6.3 AR curriculum + diversity gating (`unique_codes`) to avoid pushing AR while collapsed.
+
+Results, step 16-17k:
+- Metrics healthy: loss decreased 10→2.5, IDM converged 15→1-2, unique_codes climbing 22→26, confidence rising 0.4→0.9
+- Critical failure: LPIPS losses flat at 0.2, not learning visual quality despite model learning tokens (semantic loss working)
+- Visual evidence: Reconstructions severely degraded - dark, gray, lacking detail vs GT
+- Action response weak: camera/movement differentiation ~0.01-0.02 (target >0.05)
+- Diagnosis: Gumbel soft embeddings (tau=0.5, hard=False) create invalid "averaged" codebook vectors → VQ-VAE decoder receives OOD inputs → poor reconstructions despite correct token predictions
+- Suspected cause: Train-inference distribution mismatch + semantic loss dominance over LPIPS
+
+### v7.0.1
+
+train.py
+- Critical Gumbel fixes: `hard=False → hard=True` (straight-through estimator eliminates train-inference mismatch), `tau=0.5 → 0.2` (sharper distributions)
+  - Forward pass now uses discrete codebook embeddings matching VQ-VAE decoder training distribution
+  - Backward pass maintains smooth Gumbel gradients for learning
+- Loss rebalancing: `SEMANTIC_WEIGHT=1.0 → 0.5`, `LPIPS_WEIGHT=3.0 → 5.0` (LPIPS becomes dominant perceptual signal)
+- Expected impact: Fix dark/blurry reconstructions within 1-2k steps, LPIPS convergence to 0.3-0.5 range, better color/brightness matching
