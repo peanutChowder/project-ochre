@@ -85,7 +85,7 @@ MODEL_OUT_PREFIX = "ochre-v7.0.1"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
-MILESTONE_SAVE_STEPS = 20000
+MILESTONE_SAVE_STEPS = 5000
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -584,6 +584,11 @@ while global_step < MAX_STEPS:
             wandb.log(action_metrics, step=global_step)
 
     if global_step % MILESTONE_SAVE_STEPS == 0 and global_step > 0:
+        # Remove old checkpoint if it exists
+        old_checkpoint = f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step - MILESTONE_SAVE_STEPS}.pt"
+        if os.path.exists(old_checkpoint):
+            os.remove(old_checkpoint)
+
         torch.save({
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
@@ -594,8 +599,8 @@ while global_step < MAX_STEPS:
                 'num_heads': NUM_HEADS,
                 'temporal_context_len': TEMPORAL_CONTEXT_LEN,
             }
-        }, f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step}.pt")
-        print(f"Saved checkpoint: {MODEL_OUT_PREFIX}-step{global_step}.pt")
+        }, f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step//1000}k.pt")
+        print(f"Saved checkpoint: {MODEL_OUT_PREFIX}-step{global_step//1000}k.pt")
 
     global_step += 1
 
