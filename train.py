@@ -379,7 +379,7 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                     num_workers=4, pin_memory=True, persistent_workers=True)
 loader_iter = iter(loader)
 
-print(f"Training Start: v7.0 ConvTransformer")
+print(f"Training Start")
 print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
 print(f"  - AR curriculum: {AR_MIN_LEN}-{AR_MAX_LEN}, diversity gate at {MIN_UNIQUE_CODES_FOR_AR_GROWTH}")
 
