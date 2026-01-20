@@ -388,8 +388,23 @@ prev_lpips_tf = 0.0
 prev_lpips_ar = 0.0
 prev_unique_codes = None
 
+# Timing EMA for smooth metrics (alpha=0.1 gives ~10 step window)
+timing_ema = {
+    'data_load': 0.0,
+    'forward': 0.0,
+    'semantic': 0.0,
+    'lpips': 0.0,
+    'idm': 0.0,
+    'backward': 0.0,
+    'optimizer': 0.0,
+    'diagnostics': 0.0,
+    'total': 0.0,
+}
+timing_alpha = 0.1
+
 while global_step < MAX_STEPS:
     t_step_start = time.perf_counter()
+    t_last = t_step_start
 
     # 1. Update Curriculum
     ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
@@ -414,6 +429,10 @@ while global_step < MAX_STEPS:
     Z_seq, A_seq, Z_target = Z_seq.to(DEVICE), A_seq.to(DEVICE), Z_target.to(DEVICE)
     B, K, H, W = Z_seq.shape
 
+    t_now = time.perf_counter()
+    t_data_load = (t_now - t_last) * 1000  # ms
+    t_last = t_now
+
     # 3. Warmup LR
     if global_step <= WARMUP_STEPS:
         curr_lr = MIN_LR + (global_step / WARMUP_STEPS) * (LR - MIN_LR)
@@ -423,6 +442,11 @@ while global_step < MAX_STEPS:
     optimizer.zero_grad()
 
     # 4. Forward Pass
+    t_forward_start = time.perf_counter()
+    t_sem_total = 0.0
+    t_lpips_total = 0.0
+    t_idm_total = 0.0
+
     with autocast(enabled=(DEVICE == "cuda")):
         loss_sem_list = []
         loss_lpips_tf_list = []
@@ -466,12 +490,15 @@ while global_step < MAX_STEPS:
             # --- Losses ---
 
             # A. Semantic Loss
+            t_sem_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
             loss_sem = semantic_criterion(logits_flat, target_flat)
             loss_sem_list.append(loss_sem)
+            t_sem_total += (time.perf_counter() - t_sem_start)
 
             # B. LPIPS Loss
+            t_lpips_start = time.perf_counter()
             probs = F.gumbel_softmax(logits_flat, tau=GUMBEL_TAU, hard=True, dim=-1)
             probs = probs.reshape(B, H, W, -1)
             soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
@@ -486,9 +513,11 @@ while global_step < MAX_STEPS:
                 loss_lpips_ar_list.append(lpips_val)
             else:
                 loss_lpips_tf_list.append(lpips_val)
+            t_lpips_total += (time.perf_counter() - t_lpips_start)
 
             # C. IDM Loss
             if t >= 1:
+                t_idm_start = time.perf_counter()
                 k = random.randint(1, min(t, MAX_IDM_SPAN))
                 h_start = h_buffer[-1-k]  # detached
                 h_end = x_spatial_t       # attached (current step only)
@@ -511,6 +540,7 @@ while global_step < MAX_STEPS:
                 ) * ACTION_WEIGHTS[8:15]).mean()
 
                 loss_idm_list.append(ly + lp + lb)
+                t_idm_total += (time.perf_counter() - t_idm_start)
 
         # Aggregate losses
         loss_sem_total = torch.stack(loss_sem_list).mean()
@@ -530,31 +560,55 @@ while global_step < MAX_STEPS:
                      LPIPS_WEIGHT * loss_lpips_total +
                      IDM_LOSS_WEIGHT * loss_idm_total)
 
+    t_forward = (time.perf_counter() - t_forward_start) * 1000  # ms
+
     # 5. Backward
+    t_backward_start = time.perf_counter()
     scaler.scale(total_loss).backward()
     scaler.unscale_(optimizer)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    t_backward = (time.perf_counter() - t_backward_start) * 1000  # ms
+
+    t_optimizer_start = time.perf_counter()
     scaler.step(optimizer)
     scaler.update()
+    t_optimizer = (time.perf_counter() - t_optimizer_start) * 1000  # ms
 
     # 6. Diagnostics
+    t_diagnostics_start = time.perf_counter()
     with torch.no_grad():
         probs_last = F.softmax(logits_last.float(), dim=1)
         entropy = -(probs_last * torch.log(probs_last + 1e-9)).sum(dim=1).mean()
         confidence = probs_last.max(dim=1)[0].mean()
         unique_codes = logits_last.argmax(dim=1).unique().numel()
         prev_unique_codes = int(unique_codes)
+    t_diagnostics = (time.perf_counter() - t_diagnostics_start) * 1000  # ms
 
     step_time = time.perf_counter() - t_step_start
 
+    # Update timing EMA
+    timing_ema['data_load'] = timing_alpha * t_data_load + (1 - timing_alpha) * timing_ema['data_load']
+    timing_ema['forward'] = timing_alpha * t_forward + (1 - timing_alpha) * timing_ema['forward']
+    timing_ema['semantic'] = timing_alpha * (t_sem_total * 1000) + (1 - timing_alpha) * timing_ema['semantic']
+    timing_ema['lpips'] = timing_alpha * (t_lpips_total * 1000) + (1 - timing_alpha) * timing_ema['lpips']
+    timing_ema['idm'] = timing_alpha * (t_idm_total * 1000) + (1 - timing_alpha) * timing_ema['idm']
+    timing_ema['backward'] = timing_alpha * t_backward + (1 - timing_alpha) * timing_ema['backward']
+    timing_ema['optimizer'] = timing_alpha * t_optimizer + (1 - timing_alpha) * timing_ema['optimizer']
+    timing_ema['diagnostics'] = timing_alpha * t_diagnostics + (1 - timing_alpha) * timing_ema['diagnostics']
+    timing_ema['total'] = timing_alpha * (step_time * 1000) + (1 - timing_alpha) * timing_ema['total']
+
     # 7. Logging
     if global_step % LOG_STEPS == 0:
+        throughput = 1 / step_time
         print(
             f"[Step {global_step}] Loss: {total_loss.item():.4f} | "
             f"Sem: {loss_sem_total.item():.4f} | LPIPS: {loss_lpips_total.item():.4f} | "
             f"IDM: {loss_idm_total.item():.4f} | "
             f"AR: {ar_len} | Unique: {unique_codes} | "
-            f"{1/step_time:.1f} steps/s"
+            f"{throughput:.2f} steps/s\n"
+            f"  Timing: Data={timing_ema['data_load']:.0f}ms | Fwd={timing_ema['forward']:.0f}ms "
+            f"(Sem={timing_ema['semantic']:.0f}ms, LPIPS={timing_ema['lpips']:.0f}ms, IDM={timing_ema['idm']:.0f}ms) | "
+            f"Bwd={timing_ema['backward']:.0f}ms | Opt={timing_ema['optimizer']:.0f}ms"
         )
 
         if wandb:
@@ -575,6 +629,14 @@ while global_step < MAX_STEPS:
                 "diagnostics/unique_codes": unique_codes,
                 "timing/step_ms": step_time * 1000,
                 "timing/throughput": 1 / step_time,
+                "timing/data_load_ms": timing_ema['data_load'],
+                "timing/forward_ms": timing_ema['forward'],
+                "timing/semantic_ms": timing_ema['semantic'],
+                "timing/lpips_ms": timing_ema['lpips'],
+                "timing/idm_ms": timing_ema['idm'],
+                "timing/backward_ms": timing_ema['backward'],
+                "timing/optimizer_ms": timing_ema['optimizer'],
+                "timing/diagnostics_ms": timing_ema['diagnostics'],
             }, step=global_step)
 
     if global_step % IMAGE_LOG_STEPS == 0:
