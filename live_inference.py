@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Live interactive inference for the Ochre world model (VQ‑VAE + WorldModelConvFiLM).
+Live interactive inference for the Ochre world model (VQ‑VAE + MinecraftConvTransformer).
 
 Controls:
   - W/A/S/D: movement (binary)
@@ -11,7 +11,7 @@ Controls:
 
 import argparse, os, time, numpy as np, torch, pygame
 from vq_vae.vq_vae import VQVAE, IMAGE_HEIGHT, IMAGE_WIDTH
-from model_convGru import WorldModelConvFiLM
+from model_transformer import MinecraftConvTransformer
 from action_encoding import encode_action_v5_np
 
 # ---------------------- Constants ----------------------
@@ -38,73 +38,68 @@ def load_vqvae(vqvae_ckpt: str, device: torch.device) -> VQVAE:
     return vqvae
 
 
-def _load_world_model_state_dict(path: str, device: torch.device) -> dict:
-    data = torch.load(path, map_location=device)
-    if isinstance(data, dict) and "model_state" in data:
-        state = data["model_state"]
-    else:
-        state = data
-    if not isinstance(state, dict):
-        raise TypeError(f"Unexpected checkpoint type: {type(state)} (expected state_dict-like dict)")
-    return state
-
-
-def _infer_world_model_kwargs(state_dict: dict, latent_h: int, latent_w: int) -> dict:
+def _infer_conv_transformer_kwargs(checkpoint: dict, state_dict: dict, latent_h: int, latent_w: int) -> dict:
     """
-    Infer `WorldModelConvFiLM(...)` constructor kwargs from a checkpoint state_dict.
-    This avoids hard-coding architecture values (v5.0 vs v6.1) inside live inference.
+    Infer `MinecraftConvTransformer(...)` kwargs from checkpoint metadata + state_dict.
+    Prefers checkpoint["config"] (saved by train.py), with state_dict fallbacks.
     """
-    if "embed.weight" not in state_dict or "in_proj.weight" not in state_dict:
-        raise KeyError("Checkpoint does not look like a WorldModelConvFiLM state_dict (missing embed/in_proj).")
+    if "embed.weight" not in state_dict:
+        raise KeyError("Checkpoint does not look like a MinecraftConvTransformer state_dict (missing embed.weight).")
 
     codebook_size, embed_dim = state_dict["embed.weight"].shape
-    hidden_dim = state_dict["in_proj.weight"].shape[0]
+    hidden_dim = int(state_dict.get("stem.0.weight", torch.empty((0,))).shape[0]) or None
 
-    # n_layers: count GRU blocks by index.
-    gru_indices = set()
+    # Count transformer blocks.
+    block_indices = set()
     for k in state_dict.keys():
-        if k.startswith("grus."):
+        if k.startswith("blocks."):
             parts = k.split(".")
             if len(parts) > 1 and parts[1].isdigit():
-                gru_indices.add(int(parts[1]))
-    n_layers = (max(gru_indices) + 1) if gru_indices else 0
-    if n_layers <= 0:
-        raise ValueError("Failed to infer n_layers from checkpoint (no grus.* keys found).")
+                block_indices.add(int(parts[1]))
+    num_layers = (max(block_indices) + 1) if block_indices else None
 
-    # Detect whether checkpoint matches v6.1 (SeparateActionFiLM) vs older ActionFiLM.
-    has_separate_film = any(k.startswith("film.camera_mlps.") for k in state_dict.keys())
-    has_legacy_film = any(k.startswith("film.mlps.") for k in state_dict.keys())
-    if has_legacy_film and not has_separate_film:
-        raise RuntimeError(
-            "This checkpoint appears to use the legacy ActionFiLM (film.mlps.*), "
-            "but the current WorldModelConvFiLM implementation expects SeparateActionFiLM (film.camera_mlps/film.movement_mlps). "
-            "Use a v6.1 checkpoint or restore the older model definition."
-        )
+    # Infer window_size + num_heads from relative position bias table if needed.
+    window_size = None
+    num_heads = None
+    for k, v in state_dict.items():
+        if k.endswith("attn.relative_position_bias_table") and isinstance(v, torch.Tensor):
+            num_heads = int(v.shape[1])
+            n = int(v.shape[0])
+            # n = (2w-1)^2  => w = (sqrt(n)+1)/2
+            root = int(round(n ** 0.5))
+            if root * root == n:
+                window_size = int((root + 1) // 2)
+            break
 
-    # IDM max span from dt embedding table.
-    idm_dt_key = "idm.dt_embed.weight"
-    idm_max_span = int(state_dict[idm_dt_key].shape[0] - 1) if idm_dt_key in state_dict else 5
+    # IDM span from dt embedding table.
+    idm_max_span = 5
+    if "idm.dt_embed.weight" in state_dict:
+        idm_max_span = int(state_dict["idm.dt_embed.weight"].shape[0] - 1)
 
-    # Temporal context length from attention position parameters (v6.1 supports rel_pos_bias; older used pos_emb).
-    temporal_context_len = 0
-    if "temporal_attn.rel_pos_bias.weight" in state_dict:
-        sz = int(state_dict["temporal_attn.rel_pos_bias.weight"].shape[0])
-        temporal_context_len = max(0, (sz - 1) // 2)
-    elif "temporal_attn.pos_emb.weight" in state_dict:
-        # pos_emb has shape (context_len + 1, hidden_dim)
-        temporal_context_len = int(state_dict["temporal_attn.pos_emb.weight"].shape[0] - 1)
+    cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+
+    # Prefer explicit config values saved by train.py.
+    hidden_dim = int(cfg.get("hidden_dim", hidden_dim or 384))
+    num_layers = int(cfg.get("num_layers", num_layers or 4))
+    num_heads = int(cfg.get("num_heads", num_heads or 6))
+    temporal_context_len = int(cfg.get("temporal_context_len", cfg.get("temporal_context", 4)))
+
+    # window_size isn't currently saved in train.py checkpoint; infer or default.
+    window_size = int(cfg.get("window_size", window_size or 4))
 
     return dict(
-        codebook_size=codebook_size,
-        embed_dim=embed_dim,
+        codebook_size=int(codebook_size),
+        embed_dim=int(embed_dim),
         hidden_dim=hidden_dim,
-        n_layers=n_layers,
-        action_dim=ACTION_DIM,
-        idm_max_span=idm_max_span,
-        temporal_context_len=temporal_context_len,
+        num_layers=num_layers,
+        num_heads=num_heads,
         H=latent_h,
         W=latent_w,
-        use_residuals=True,
+        action_dim=ACTION_DIM,
+        temporal_context_len=temporal_context_len,
+        window_size=window_size,
+        idm_max_span=idm_max_span,
+        use_checkpointing=False,
     )
 
 
@@ -146,7 +141,7 @@ def sample_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int | N
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", required=True, help="WorldModelConvFiLM checkpoint (.pt)")
+    p.add_argument("--checkpoint", required=True, help="MinecraftConvTransformer checkpoint (.pt)")
     p.add_argument("--vqvae_ckpt", required=True, help="Trained VQ‑VAE checkpoint (.pt)")
     p.add_argument("--context_npz", help="Optional preprocessed .npz providing initial tokens/actions")
     p.add_argument("--fps", type=int, default=8)
@@ -159,34 +154,44 @@ def main():
     p.add_argument("--use_context_actions", action="store_true", help="Use GT actions from context file instead of keyboard input")
     args = p.parse_args()
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Live inference on {device} @ {args.fps} FPS")
     print(f"Resolution: {FRAME_W}x{FRAME_H} (Latent: {LATENT_W}x{LATENT_H})")
 
     # --- Load models ---
     vqvae = load_vqvae(args.vqvae_ckpt, device)
 
-    # Instantiate model to match the checkpoint (v5.0 vs v6.1) by inferring shapes.
-    state_dict = _load_world_model_state_dict(args.checkpoint, device)
-    model_kwargs = _infer_world_model_kwargs(state_dict, LATENT_H, LATENT_W)
+    # Load ConvTransformer checkpoint + infer constructor kwargs.
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state_dict = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Unexpected checkpoint type: {type(state_dict)} (expected dict/state_dict)")
+    model_kwargs = _infer_conv_transformer_kwargs(ckpt if isinstance(ckpt, dict) else {}, state_dict, LATENT_H, LATENT_W)
 
     # Sanity-check codebook size agreement with the VQ-VAE.
-    if hasattr(vqvae, "vq_vae") and hasattr(vqvae.vq_vae, "embedding"):
-        vq_codebook = int(vqvae.vq_vae.embedding.shape[1])
-        if int(model_kwargs["codebook_size"]) != vq_codebook:
-            raise RuntimeError(
-                f"Checkpoint codebook_size={model_kwargs['codebook_size']} does not match VQ-VAE codebook_size={vq_codebook}. "
-                "Use a matching world model checkpoint and VQ-VAE checkpoint."
-            )
+    vq_codebook = int(vqvae.vq_vae.embedding.shape[1]) if hasattr(vqvae, "vq_vae") and hasattr(vqvae.vq_vae, "embedding") else None
+    if vq_codebook is not None and int(model_kwargs["codebook_size"]) != vq_codebook:
+        raise RuntimeError(
+            f"Checkpoint codebook_size={model_kwargs['codebook_size']} does not match VQ-VAE codebook_size={vq_codebook}. "
+            "Use a matching world model checkpoint and VQ-VAE checkpoint."
+        )
 
-    model = WorldModelConvFiLM(**model_kwargs).to(device)
+    model = MinecraftConvTransformer(**model_kwargs).to(device)
     model.load_state_dict(state_dict, strict=True)
-    print(f"✅ Loaded world model from {args.checkpoint} (embed_dim={model_kwargs['embed_dim']}, hidden_dim={model_kwargs['hidden_dim']}, layers={model_kwargs['n_layers']}, temporal_ctx={model_kwargs['temporal_context_len']})")
+    print(
+        "✅ Loaded world model from "
+        f"{args.checkpoint} (embed_dim={model_kwargs['embed_dim']}, hidden_dim={model_kwargs['hidden_dim']}, "
+        f"layers={model_kwargs['num_layers']}, temporal_ctx={model_kwargs['temporal_context_len']}, window={model_kwargs['window_size']})"
+    )
     model.eval()
 
     # --- Initialize state ---
-    h_state = model.init_state(1, device=device)
-    temporal_buffer = [] if getattr(model, "temporal_attn", None) is not None else None
+    temporal_buffer = []
 
     # Store context actions for --use_context_actions flag
     actions_ctx = None
@@ -221,21 +226,14 @@ def main():
         
         if warmup > 0:
             with torch.no_grad():
-                # model.forward returns logits, but we need the hidden state.
-                # model.forward unrolls but discards intermediate states unless we change it.
-                # Actually, model.forward calls model.init_state internally.
-                # We need to modify how we get the state out, or just loop step() manually.
-                # Looping step manually is safer to ensure we have the final h_state.
-
-                print(f"Priming hidden state with {warmup} frames...")
+                print(f"Priming temporal buffer with {warmup} frames...")
                 for i in range(warmup):
                     z_t = z_warmup[:, i] # (1, H, W)
                     a_t = a_warmup[:, i] # (1, A)
-                    _, h_state = model.step(z_t, a_t, h_state, temporal_buffer=temporal_buffer)
-                    if temporal_buffer is not None:
-                        temporal_buffer.append(model.temporal_attn.pool_state(h_state[-1].detach()))
-                        if len(temporal_buffer) > model.temporal_context_len:
-                            temporal_buffer.pop(0)
+                    _, new_state = model.step(z_t, a_t, temporal_buffer)
+                    temporal_buffer.append(new_state.detach())
+                    if len(temporal_buffer) > model.temporal_context_len:
+                        temporal_buffer.pop(0)
 
             # Set current token to the last one from context
             current_z = z_warmup[:, -1]
@@ -247,8 +245,8 @@ def main():
 
     else:
         print("⚠️ No context provided — starting from random state")
-        current_z = torch.randint(0, 2048, (1, LATENT_H, LATENT_W), device=device)
-        # h_state is already zeros
+        codebook_size = vq_codebook if vq_codebook is not None else int(model_kwargs["codebook_size"])
+        current_z = torch.randint(0, codebook_size, (1, LATENT_H, LATENT_W), device=device)
 
     # Validate --use_context_actions flag
     if args.use_context_actions:
@@ -380,12 +378,10 @@ def main():
 
         # 2. Step Model
         with torch.no_grad():
-            # z_t: (1, H, W), a_t: (1, A), h_prev: (...)
-            logits, h_state = model.step(current_z, current_a, h_state, temporal_buffer=temporal_buffer)
-            if temporal_buffer is not None:
-                temporal_buffer.append(model.temporal_attn.pool_state(h_state[-1].detach()))
-                if len(temporal_buffer) > model.temporal_context_len:
-                    temporal_buffer.pop(0)
+            logits, new_state = model.step(current_z, current_a, temporal_buffer)
+            temporal_buffer.append(new_state.detach())
+            if len(temporal_buffer) > model.temporal_context_len:
+                temporal_buffer.pop(0)
 
             # 3. Choose next tokens
             if args.greedy:
