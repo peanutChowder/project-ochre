@@ -815,3 +815,17 @@ train.py
   - Backward pass maintains smooth Gumbel gradients for learning
 - Loss rebalancing: `SEMANTIC_WEIGHT=1.0 → 0.5`, `LPIPS_WEIGHT=3.0 → 5.0` (LPIPS becomes dominant perceptual signal)
 - Expected impact: Fix dark/blurry reconstructions within 1-2k steps, LPIPS convergence to 0.3-0.5 range, better color/brightness matching
+
+### v7.0.2
+
+Motivation: fix the v7.0.1 "sludge" collapse (unique codes poor at ~18 after 55k steps + lpips loss doubling at AR start)
+
+Root causes:
+- `tau=0.2` from step 0 forced premature hard decisions → early codebook lock-in.
+- `AR_MIN_LEN=10` caused an abrupt 10-step AR cliff at step 5k while the model was still collapsed.
+- `SEMANTIC_WEIGHT` too low vs `LPIPS_WEIGHT` encouraged blurry averaging over learning correct scene structure.
+
+train.py (restorative changes):
+- Restore Gumbel annealing: `tau` schedule `1.0 → 0.1` over `20k` steps (hot start for exploration, cool later for commitment).
+- Make AR transition safe: `AR_MIN_LEN: 10 → 1` so post-warmup starts at 1-step AR and grows only when stable.
+- Rebalance losses toward structure: `SEMANTIC_WEIGHT: 0.5 → 1.0`, `LPIPS_WEIGHT: 5.0 → 1.0`.

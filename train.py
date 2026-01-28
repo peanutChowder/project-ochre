@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-v7.0.1 ConvTransformer Training Script
-"""
 
 import os
 import time
@@ -49,20 +46,27 @@ LR = 1e-4                 # Higher than ConvGRU - transformers tolerate more
 WARMUP_STEPS = 2000       # Longer warmup for transformer stability
 MIN_LR = 1e-6
 
-# --- LOSS WEIGHTS (v7.0.1 rebalance) ---
-SEMANTIC_WEIGHT = 0.5     # Reduced - was dominating gradients over visual quality
-LPIPS_WEIGHT = 5.0        # Increased - must be primary signal for good reconstructions
+# --- LOSS WEIGHTS (v7.0.2 rebalance) ---
+SEMANTIC_WEIGHT = 1.0     # v7.0.2: Restored - essential to prevent mode collapse
+LPIPS_WEIGHT = 1.0        # v7.0.2: Reduced - let semantic loss guide structure first
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 
-# Gumbel temperature (fixed, no schedule - simpler)
-GUMBEL_TAU = 0.2  # Reduced from 0.5 - sharper soft embeddings for better reconstruction
+# Gumbel temperature schedule (v7.0.2: Annealing restored)
+GUMBEL_START = 1.0
+GUMBEL_END = 0.1
+GUMBEL_DECAY_STEPS = 20000
+
+# LPIPS decode should start "soft" (mixture of codebook vectors) to match the v7.0.2 intent:
+# encourage early exploration + smoother gradients, then optionally become "hard" later.
+LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
+LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
 # --- AR CURRICULUM (v6.3 config) ---
 BASE_SEQ_LEN = 16
 CURRICULUM_AR = True
 AR_WARMUP_STEPS = 5000
-AR_MIN_LEN = 10
+AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
 AR_MAX_LEN = 20
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
@@ -80,8 +84,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.0.1-step10k"
-MODEL_OUT_PREFIX = "ochre-v7.0.1"
+RUN_NAME = "v7.0.2-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.0.2"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -95,6 +99,18 @@ ACTION_VISUAL_ROLLOUT_LEN = 30
 # ==========================================
 # HELPERS
 # ==========================================
+
+class GumbelScheduler:
+    def __init__(self, start=1.0, end=0.1, decay_steps=20000):
+        self.start = start
+        self.end = end
+        self.decay_steps = decay_steps
+
+    def get_tau(self, step):
+        if step >= self.decay_steps:
+            return self.end
+        return self.start - (self.start - self.end) * (step / self.decay_steps)
+
 
 class ARCurriculum:
     """v6.3 AR Curriculum with diversity gating."""
@@ -144,8 +160,8 @@ class SemanticCodebookLoss(nn.Module):
         super().__init__()
         self.register_buffer('codebook', codebook_tensor.clone().detach())
 
-    def forward(self, logits, target_indices):
-        probs = F.gumbel_softmax(logits, tau=GUMBEL_TAU, hard=True, dim=-1)
+    def forward(self, logits, target_indices, tau):
+        probs = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
         pred_vectors = torch.matmul(probs, self.codebook)
         target_vectors = F.embedding(target_indices, self.codebook)
         return F.mse_loss(pred_vectors, target_vectors)
@@ -367,6 +383,7 @@ lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE).eval().requires_grad_(False
 
 # Curriculum
 curriculum = ARCurriculum()
+tau_scheduler = GumbelScheduler(GUMBEL_START, GUMBEL_END, GUMBEL_DECAY_STEPS)
 
 # ==========================================
 # TRAINING LOOP
@@ -409,6 +426,7 @@ while global_step < MAX_STEPS:
     # 1. Update Curriculum
     ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
+    current_tau = tau_scheduler.get_tau(global_step)
 
     if seq_len != prev_seq_len:
         print(f"[Curriculum] Resizing: seq_len {prev_seq_len} -> {seq_len}")
@@ -493,13 +511,14 @@ while global_step < MAX_STEPS:
             t_sem_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
-            loss_sem = semantic_criterion(logits_flat, target_flat)
+            loss_sem = semantic_criterion(logits_flat, target_flat, current_tau)
             loss_sem_list.append(loss_sem)
             t_sem_total += (time.perf_counter() - t_sem_start)
 
             # B. LPIPS Loss
             t_lpips_start = time.perf_counter()
-            probs = F.gumbel_softmax(logits_flat, tau=GUMBEL_TAU, hard=True, dim=-1)
+            lpips_use_soft = (current_tau > LPIPS_SOFT_TAU_THRESHOLD) and (not (LPIPS_SOFT_TF_ONLY and is_ar_step))
+            probs = F.gumbel_softmax(logits_flat, tau=current_tau, hard=not lpips_use_soft, dim=-1)
             probs = probs.reshape(B, H, W, -1)
             soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
             pred_rgb = vqvae_model.decoder(soft_emb)
@@ -606,6 +625,7 @@ while global_step < MAX_STEPS:
             f"IDM: {loss_idm_total.item():.4f} | "
             f"AR: {ar_len} | Unique: {unique_codes} | "
             f"{throughput:.2f} steps/s\n"
+            f"  Tau: {current_tau:.3f} | "
             f"  Timing: Data={timing_ema['data_load']:.0f}ms | Fwd={timing_ema['forward']:.0f}ms "
             f"(Sem={timing_ema['semantic']:.0f}ms, LPIPS={timing_ema['lpips']:.0f}ms, IDM={timing_ema['idm']:.0f}ms) | "
             f"Bwd={timing_ema['backward']:.0f}ms | Opt={timing_ema['optimizer']:.0f}ms"
@@ -621,6 +641,7 @@ while global_step < MAX_STEPS:
                 "train/loss_idm": loss_idm_total.item(),
                 "train/grad_norm": float(grad_norm),
                 "train/lr": optimizer.param_groups[0]['lr'],
+                "train/gumbel_tau": current_tau,
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "curriculum/lpips_ratio": prev_lpips_ar / (prev_lpips_tf + 1e-6),
