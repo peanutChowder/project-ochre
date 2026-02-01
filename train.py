@@ -82,6 +82,12 @@ AR_MAX_LEN = 20
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
+# v7.0.3: Run-local AR resize freeze.
+# When resuming from a checkpoint, relying only on GLOBAL step means the AR curriculum can immediately start
+# resizing (often increasing) based on fresh/empty EMA state. Freeze resizing for the first N steps of the
+# CURRENT run to avoid sudden ar_len jumps after each resume.
+RUN_LOCAL_AR_RESIZE_FREEZE_STEPS = 5000
+
 # --- IDM CONFIG ---
 MAX_IDM_SPAN = 5
 ACTION_DIM = 15
@@ -492,6 +498,7 @@ if isinstance(resume_checkpoint, dict):
 # ==========================================
 
 global_step = int(resume_checkpoint.get("global_step", 0)) if isinstance(resume_checkpoint, dict) else 0
+run_start_global_step = global_step
 prev_seq_len = BASE_SEQ_LEN
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -526,7 +533,11 @@ while global_step < MAX_STEPS:
     t_last = t_step_start
 
     # 1. Update Curriculum
-    ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
+    run_local_step = global_step - run_start_global_step
+    if run_local_step < RUN_LOCAL_AR_RESIZE_FREEZE_STEPS:
+        ar_len = curriculum.ar_len
+    else:
+        ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
     current_tau = tau_scheduler.get_tau(global_step)
     current_corrupt_p = corrupt_scheduler.get_p(global_step)

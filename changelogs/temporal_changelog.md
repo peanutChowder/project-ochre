@@ -862,9 +862,11 @@ Expected impact:
 - Teach explicit error recovery from slightly-wrong inputs (the missing skill for long-horizon AR), aiming to reduce TF→AR gap and allow AR rollout growth without loosening the brake into pure noise.
 
 ### v7.0.4
-Motivation: Stop corruption from immediately jumping to max due to training from v7.0.2's 85k checkpoint.
-- Increased max corruption 0.2 -> 0.3
-- Increased corruption steps from 20k -> 300k
+Motivation: Prevent run-wise instability when resuming from checkpoint due to relying on global step for corruption schedule + ar_len.
+- Lengthened corruption schedule:
+  - Increased max corruption 0.2 -> 0.3
+  - Increased corruption steps from 20k -> 300k
+- Prevent early `ar_len` changes: Added measure to prevent sudden ar_len changes at start of each training run until 5K steps have elapsed.
 
 Expected impact:
 - Better metrics indicating a break through plateau vs current stagnation at ~2.0 lpips ratio and 20 `ar_len`
