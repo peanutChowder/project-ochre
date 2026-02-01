@@ -846,3 +846,17 @@ Results, step 85k live inference:
   - L/R camera begins to turn the scene to a darkened mush of all of the colors in the biome
     - Initially begins as scene features begin leaving behind a ghost trail
     - Extended L/R camera input eventually causes everything to leave behind a trail, to the point where A/D eventually cause no shift in the scene. Like the scene converged into if every ghost trail had been applied to each part of the screen.
+
+### v7.0.3
+
+Motivation: address the v7.0.2 structural plateau where `lpips_ratio` stays ~flat (AR ~1.7× TF), which keeps the AR brake engaged (training stuck at short rollouts) while live inference runs unbounded and degrades via ghost trails / drift.
+
+train.py (recovery-signal update):
+- Add corruption recovery / denoising training: during training, corrupt the input token grid and still predict the clean next-frame target.
+  - Linear schedule: `CORRUPT_START_P → CORRUPT_END_P` over `CORRUPT_RAMP_STEPS` (more aggressive corruption in current config).
+  - Corruption types:
+    - Per-token random replacement at probability `p` (independent Bernoulli per token).
+    - Occasional per-sample spatial block corruption (simulates localized smear/ghost patches).
+
+Expected impact:
+- Teach explicit error recovery from slightly-wrong inputs (the missing skill for long-horizon AR), aiming to reduce TF→AR gap and allow AR rollout growth without loosening the brake into pure noise.

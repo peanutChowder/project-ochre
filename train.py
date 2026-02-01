@@ -57,6 +57,17 @@ GUMBEL_START = 1.0
 GUMBEL_END = 0.1
 GUMBEL_DECAY_STEPS = 20000
 
+# v7.0.3: Corruption recovery training (denoising objective).
+# Train the model to predict the correct next frame even when its input tokens are slightly wrong.
+CORRUPT_TF_ONLY = True           # recommended: keep AR inputs unmodified early to avoid runaway noise
+CORRUPT_START_P = 0.00
+CORRUPT_END_P = 0.20
+CORRUPT_RAMP_STEPS = 20000       # ramp corruption up over the same horizon as Gumbel anneal (v7.0.3)
+CORRUPT_TOKEN_REPLACE_FRAC = 1.0 # fraction of corrupted tokens replaced with random indices (rest reserved for future modes)
+CORRUPT_BLOCK_PROB = 0.15        # per-sample chance to corrupt a spatial block (in addition to per-token corruption)
+CORRUPT_BLOCK_MIN_FRAC = 0.10    # min block side length as fraction of H/W
+CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
+
 # LPIPS decode should start "soft" (mixture of codebook vectors) to match the v7.0.2 intent:
 # encourage early exploration + smoother gradients, then optionally become "hard" later.
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
@@ -84,12 +95,14 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.0.2-step0k"
+RUN_NAME = "v7.0.3-step0k"
 MODEL_OUT_PREFIX = "ochre-v7.0.2"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 5000
+
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.0.2-step85k.pt"
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -110,6 +123,64 @@ class GumbelScheduler:
         if step >= self.decay_steps:
             return self.end
         return self.start - (self.start - self.end) * (step / self.decay_steps)
+
+
+class CorruptionScheduler:
+    """v7.0.3: Linearly ramp input token corruption probability."""
+    def __init__(self, start_p: float, end_p: float, ramp_steps: int):
+        self.start_p = float(start_p)
+        self.end_p = float(end_p)
+        self.ramp_steps = int(ramp_steps)
+
+    def get_p(self, step: int) -> float:
+        if self.ramp_steps <= 0:
+            return self.end_p
+        if step >= self.ramp_steps:
+            return self.end_p
+        return self.start_p + (self.end_p - self.start_p) * (step / self.ramp_steps)
+
+
+def corrupt_tokens(
+    z_in: torch.Tensor,
+    *,
+    codebook_size: int,
+    p: float,
+) -> torch.Tensor:
+    """
+    v7.0.3: Corrupt discrete token grid to create a denoising/recovery training signal.
+
+    z_in: (B, H, W) long
+    Returns: (B, H, W) long
+    """
+    if p <= 0:
+        return z_in
+
+    z = z_in
+    B, H, W = z.shape
+    device = z.device
+
+    # 1) Per-token random replacement.
+    mask = (torch.rand((B, H, W), device=device) < p)
+    if mask.any():
+        rand_idx = torch.randint(0, int(codebook_size), (B, H, W), device=device, dtype=z.dtype)
+        # Reserved for future corruption modes; currently always replace.
+        z = torch.where(mask, rand_idx, z)
+
+    # 2) Spatial block corruption (simulates localized smear/ghost patches).
+    if CORRUPT_BLOCK_PROB > 0:
+        block_do = (torch.rand((B,), device=device) < CORRUPT_BLOCK_PROB)
+        if block_do.any():
+            z_out = z.clone()
+            for b in torch.nonzero(block_do, as_tuple=False).flatten().tolist():
+                bh = max(1, int(round(H * random.uniform(CORRUPT_BLOCK_MIN_FRAC, CORRUPT_BLOCK_MAX_FRAC))))
+                bw = max(1, int(round(W * random.uniform(CORRUPT_BLOCK_MIN_FRAC, CORRUPT_BLOCK_MAX_FRAC))))
+                y0 = random.randint(0, max(0, H - bh))
+                x0 = random.randint(0, max(0, W - bw))
+                block = torch.randint(0, int(codebook_size), (bh, bw), device=device, dtype=z.dtype)
+                z_out[b, y0:y0 + bh, x0:x0 + bw] = block
+            z = z_out
+
+    return z
 
 
 class ARCurriculum:
@@ -376,6 +447,28 @@ print(f"Model parameters: {param_counts['total']/1e6:.2f}M")
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 scaler = GradScaler(enabled=(DEVICE == "cuda"))
 
+# v7.0.3: Optional resume from checkpoint (e.g. continue from v7.0.2 weights).
+resume_checkpoint = None
+if RESUME_CHECKPOINT_PATH:
+    if not os.path.isfile(RESUME_CHECKPOINT_PATH):
+        raise FileNotFoundError(f"RESUME_CHECKPOINT_PATH not found: {RESUME_CHECKPOINT_PATH}")
+    print(f"Resuming from checkpoint: {RESUME_CHECKPOINT_PATH}")
+    resume_checkpoint = torch.load(RESUME_CHECKPOINT_PATH, map_location=DEVICE)
+
+    # Model state
+    resume_state = resume_checkpoint.get("model_state") if isinstance(resume_checkpoint, dict) else None
+    if not isinstance(resume_state, dict):
+        raise KeyError("Resume checkpoint missing 'model_state' dict.")
+    model.load_state_dict(resume_state, strict=True)
+
+    # Optimizer state (best-effort; allow continuing even if optimizer state is incompatible)
+    opt_state = resume_checkpoint.get("optimizer_state") if isinstance(resume_checkpoint, dict) else None
+    if isinstance(opt_state, dict):
+        try:
+            optimizer.load_state_dict(opt_state)
+        except Exception as e:
+            print(f"⚠️ Warning: could not load optimizer state ({type(e).__name__}: {e}); continuing with fresh optimizer.")
+
 # Losses
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
 import lpips
@@ -384,12 +477,21 @@ lpips_criterion = lpips.LPIPS(net='alex').to(DEVICE).eval().requires_grad_(False
 # Curriculum
 curriculum = ARCurriculum()
 tau_scheduler = GumbelScheduler(GUMBEL_START, GUMBEL_END, GUMBEL_DECAY_STEPS)
+corrupt_scheduler = CorruptionScheduler(CORRUPT_START_P, CORRUPT_END_P, CORRUPT_RAMP_STEPS)
+
+# v7.0.3: Restore curriculum state when available (new checkpoints will include this).
+if isinstance(resume_checkpoint, dict):
+    cur_state = resume_checkpoint.get("curriculum_state")
+    if isinstance(cur_state, dict):
+        curriculum.ar_len = int(cur_state.get("ar_len", curriculum.ar_len))
+        curriculum.tf_ema = cur_state.get("tf_ema", curriculum.tf_ema)
+        curriculum.ar_ema = cur_state.get("ar_ema", curriculum.ar_ema)
 
 # ==========================================
 # TRAINING LOOP
 # ==========================================
 
-global_step = 0
+global_step = int(resume_checkpoint.get("global_step", 0)) if isinstance(resume_checkpoint, dict) else 0
 prev_seq_len = BASE_SEQ_LEN
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -427,6 +529,7 @@ while global_step < MAX_STEPS:
     ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
     current_tau = tau_scheduler.get_tau(global_step)
+    current_corrupt_p = corrupt_scheduler.get_p(global_step)
 
     if seq_len != prev_seq_len:
         print(f"[Curriculum] Resizing: seq_len {prev_seq_len} -> {seq_len}")
@@ -487,6 +590,10 @@ while global_step < MAX_STEPS:
                     z_in = logits_last.argmax(dim=1)
             else:
                 z_in = Z_seq[:, t]
+
+            # v7.0.3: corruption recovery training.
+            if (not is_ar_step) or (not CORRUPT_TF_ONLY):
+                z_in = corrupt_tokens(z_in, codebook_size=codebook_size, p=current_corrupt_p)
 
             # Model step (return post-temporal spatial features for IDM supervision)
             logits_t, new_state, x_spatial_t = model.step(
@@ -625,7 +732,7 @@ while global_step < MAX_STEPS:
             f"IDM: {loss_idm_total.item():.4f} | "
             f"AR: {ar_len} | Unique: {unique_codes} | "
             f"{throughput:.2f} steps/s\n"
-            f"  Tau: {current_tau:.3f} | "
+            f"  Tau: {current_tau:.3f} | CorruptP: {current_corrupt_p:.3f} | "
             f"  Timing: Data={timing_ema['data_load']:.0f}ms | Fwd={timing_ema['forward']:.0f}ms "
             f"(Sem={timing_ema['semantic']:.0f}ms, LPIPS={timing_ema['lpips']:.0f}ms, IDM={timing_ema['idm']:.0f}ms) | "
             f"Bwd={timing_ema['backward']:.0f}ms | Opt={timing_ema['optimizer']:.0f}ms"
@@ -642,6 +749,7 @@ while global_step < MAX_STEPS:
                 "train/grad_norm": float(grad_norm),
                 "train/lr": optimizer.param_groups[0]['lr'],
                 "train/gumbel_tau": current_tau,
+                "train/corrupt_p": current_corrupt_p,
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "curriculum/lpips_ratio": prev_lpips_ar / (prev_lpips_tf + 1e-6),
@@ -676,6 +784,12 @@ while global_step < MAX_STEPS:
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'global_step': global_step,
+            # v7.0.3: Save curriculum state to enable accurate resume behavior.
+            'curriculum_state': {
+                'ar_len': int(curriculum.ar_len),
+                'tf_ema': float(curriculum.tf_ema) if curriculum.tf_ema is not None else None,
+                'ar_ema': float(curriculum.ar_ema) if curriculum.ar_ema is not None else None,
+            },
             'config': {
                 'hidden_dim': HIDDEN_DIM,
                 'num_layers': NUM_LAYERS,
