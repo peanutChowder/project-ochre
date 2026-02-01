@@ -102,7 +102,7 @@ ACTION_WEIGHTS = torch.tensor([
 # --- LOGGING ---
 PROJECT = "project-ochre"
 RUN_NAME = "v7.0.4-step85k"
-MODEL_OUT_PREFIX = "ochre-v7.0.2"
+MODEL_OUT_PREFIX = "ochre-v7.0.4"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
