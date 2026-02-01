@@ -860,3 +860,11 @@ train.py (recovery-signal update):
 
 Expected impact:
 - Teach explicit error recovery from slightly-wrong inputs (the missing skill for long-horizon AR), aiming to reduce TF→AR gap and allow AR rollout growth without loosening the brake into pure noise.
+
+### v7.0.4
+Motivation: Stop corruption from immediately jumping to max due to training from v7.0.2's 85k checkpoint.
+- Increased max corruption 0.2 -> 0.3
+- Increased corruption steps from 20k -> 300k
+
+Expected impact:
+- Better metrics indicating a break through plateau vs current stagnation at ~2.0 lpips ratio and 20 `ar_len`
