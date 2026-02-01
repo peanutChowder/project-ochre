@@ -829,3 +829,20 @@ train.py (restorative changes):
 - Restore Gumbel annealing: `tau` schedule `1.0 → 0.1` over `20k` steps (hot start for exploration, cool later for commitment).
 - Make AR transition safe: `AR_MIN_LEN: 10 → 1` so post-warmup starts at 1-step AR and grows only when stable.
 - Rebalance losses toward structure: `SEMANTIC_WEIGHT: 0.5 → 1.0`, `LPIPS_WEIGHT: 5.0 → 1.0`.
+
+Results, step 85k live inference:
+- Restored colors: No more greyed out pink tinted sludge. E.g. Forest biome has vibrant green trees, river is blue.
+    - Due to restored colors block type boundaries now look sharper. E.g. blue river and green grass have a clear divide.
+- 7/10 first frame quality: Generally decent visuals, can make out major structures such as close up trees, rivers.
+    - Maintains stillness when no movements are inputted
+    - Lacks enough definition for block-wise separation. Only grouped block features like rivers/hills can be identified, individual blocks are blurred together.
+- 6/10 first few seconds of movement: L/R camera shows promise. Others need work.
+    - Camera L/R for a few seconds of presses maintains quality. Beginning to show signs of scene shifting, looking left shifts the entire landscape right.
+    - Scene degrades beyond combined >4s of camera L/R input.
+    - Camera U/D somehow does nothing? Unlike previous iterations where U/D was the strongest conditioning.
+    - WASD has litle to no impact. A/D repeated pressing/holding does show a few localized pixel groups changing, but manifests more like flashes vs the scene shifting. W/S has no impact at all.
+- 2/10 >5s action input
+  - WASD + camera U/D still do nothing in extended live inference runs
+  - L/R camera begins to turn the scene to a darkened mush of all of the colors in the biome
+    - Initially begins as scene features begin leaving behind a ghost trail
+    - Extended L/R camera input eventually causes everything to leave behind a trail, to the point where A/D eventually cause no shift in the scene. Like the scene converged into if every ghost trail had been applied to each part of the screen.
