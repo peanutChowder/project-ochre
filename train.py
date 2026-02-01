@@ -61,8 +61,8 @@ GUMBEL_DECAY_STEPS = 20000
 # Train the model to predict the correct next frame even when its input tokens are slightly wrong.
 CORRUPT_TF_ONLY = True           # recommended: keep AR inputs unmodified early to avoid runaway noise
 CORRUPT_START_P = 0.00
-CORRUPT_END_P = 0.20
-CORRUPT_RAMP_STEPS = 20000       # ramp corruption up over the same horizon as Gumbel anneal (v7.0.3)
+CORRUPT_END_P = 0.30 # v7.0.4: Increased to 30% corruption max
+CORRUPT_RAMP_STEPS = 300_000       # v7.0.4: Increased ramp duration from 20k -> 300k steps to support training from 85k checkpoint
 CORRUPT_TOKEN_REPLACE_FRAC = 1.0 # fraction of corrupted tokens replaced with random indices (rest reserved for future modes)
 CORRUPT_BLOCK_PROB = 0.15        # per-sample chance to corrupt a spatial block (in addition to per-token corruption)
 CORRUPT_BLOCK_MIN_FRAC = 0.10    # min block side length as fraction of H/W
