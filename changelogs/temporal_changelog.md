@@ -870,3 +870,9 @@ Motivation: Prevent run-wise instability when resuming from checkpoint due to re
 
 Expected impact:
 - Better metrics indicating a break through plateau vs current stagnation at ~2.0 lpips ratio and 20 `ar_len`
+
+Results, step 115k resumed from v7.0.2 step 85k:
+- Quality decline: Initial frame prediction without movement input became worse
+  - Suspect AR + corruption may have been too challenging
+  - AR suddenly jumps to 20 when resuming from checkpoints, difficult recovery
+
