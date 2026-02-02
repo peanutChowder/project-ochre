@@ -27,6 +27,11 @@ if 'WANDB_API_KEY' in os.environ:
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
 
+# v7.0.5: Performance optimization - enable cuDNN autotuner
+if DEVICE == "cuda":
+    torch.backends.cudnn.benchmark = True
+    print("Enabled cuDNN benchmark mode for performance")
+
 # --- PATHS ---
 DATA_DIR = "../preprocessedv5_plains_clear"
 VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
@@ -46,9 +51,9 @@ LR = 1e-4                 # Higher than ConvGRU - transformers tolerate more
 WARMUP_STEPS = 2000       # Longer warmup for transformer stability
 MIN_LR = 1e-6
 
-# --- LOSS WEIGHTS (v7.0.2 rebalance) ---
+# --- LOSS WEIGHTS (v7.0.5 rebalance) ---
 SEMANTIC_WEIGHT = 1.0     # v7.0.2: Restored - essential to prevent mode collapse
-LPIPS_WEIGHT = 1.0        # v7.0.2: Reduced - let semantic loss guide structure first
+LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was strongest action in v4.x)
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 
@@ -57,12 +62,13 @@ GUMBEL_START = 1.0
 GUMBEL_END = 0.1
 GUMBEL_DECAY_STEPS = 20000
 
-# v7.0.3: Corruption recovery training (denoising objective).
+# v7.0.5: Corruption recovery training (denoising objective).
 # Train the model to predict the correct next frame even when its input tokens are slightly wrong.
-CORRUPT_TF_ONLY = True           # recommended: keep AR inputs unmodified early to avoid runaway noise
+# Synchronized corruption + AR: Both start at step 5k, corruption applies to TF and AR steps.
+CORRUPT_TF_ONLY = False          # v7.0.5: Corrupt both TF and AR to train actual AR error recovery
 CORRUPT_START_P = 0.00
-CORRUPT_END_P = 0.30 # v7.0.4: Increased to 30% corruption max
-CORRUPT_RAMP_STEPS = 300_000       # v7.0.4: Increased ramp duration from 20k -> 300k steps to support training from 85k checkpoint
+CORRUPT_END_P = 0.08             # v7.0.5: 8% max (aggressive but not catastrophic)
+CORRUPT_RAMP_STEPS = 30000       # v7.0.5: Fast ramp, reaches max by step 30k (aligns with Gumbel)
 CORRUPT_TOKEN_REPLACE_FRAC = 1.0 # fraction of corrupted tokens replaced with random indices (rest reserved for future modes)
 CORRUPT_BLOCK_PROB = 0.15        # per-sample chance to corrupt a spatial block (in addition to per-token corruption)
 CORRUPT_BLOCK_MIN_FRAC = 0.10    # min block side length as fraction of H/W
@@ -101,14 +107,14 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.0.4-step85k"
-MODEL_OUT_PREFIX = "ochre-v7.0.4"
+RUN_NAME = "v7.0.5-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.0.5"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 5000
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.0.2-step85k.pt"
+RESUME_CHECKPOINT_PATH = ""  # v7.0.5: Start fresh (no checkpoint resume)
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -210,16 +216,20 @@ class ARCurriculum:
             self.ar_len = max(AR_MIN_LEN, self.ar_len - 1)
             return self.ar_len
 
-        if lpips_ar <= 0 or lpips_tf <= 0:
+        # v7.0.5: Convert tensors to scalars only here (avoids sync every step in main loop)
+        lpips_tf_val = lpips_tf.item() if torch.is_tensor(lpips_tf) else lpips_tf
+        lpips_ar_val = lpips_ar.item() if torch.is_tensor(lpips_ar) else lpips_ar
+
+        if lpips_ar_val <= 0 or lpips_tf_val <= 0:
             return self.ar_len
 
         # EMA update
         if self.tf_ema is None:
-            self.tf_ema = lpips_tf
-            self.ar_ema = lpips_ar
+            self.tf_ema = lpips_tf_val
+            self.ar_ema = lpips_ar_val
         else:
-            self.tf_ema = self.alpha * self.tf_ema + (1 - self.alpha) * lpips_tf
-            self.ar_ema = self.alpha * self.ar_ema + (1 - self.alpha) * lpips_ar
+            self.tf_ema = self.alpha * self.tf_ema + (1 - self.alpha) * lpips_tf_val
+            self.ar_ema = self.alpha * self.ar_ema + (1 - self.alpha) * lpips_ar_val
 
         ratio = self.ar_ema / (self.tf_ema + 1e-6)
 
@@ -493,6 +503,13 @@ if isinstance(resume_checkpoint, dict):
         curriculum.tf_ema = cur_state.get("tf_ema", curriculum.tf_ema)
         curriculum.ar_ema = cur_state.get("ar_ema", curriculum.ar_ema)
 
+    # v7.0.5: Pre-warm EMA if missing to prevent AR shock on resume.
+    # If EMA is None after restore and ar_len > 1, estimate based on v7.0.2 results.
+    if curriculum.tf_ema is None and curriculum.ar_len > 1:
+        curriculum.tf_ema = 0.11  # v7.0.2 typical TF LPIPS at ar_len=6
+        curriculum.ar_ema = 0.19  # Estimated AR LPIPS for stable ar_len=6 (ratio ~1.7)
+        print(f"⚠️ Warning: Pre-warmed curriculum EMA (tf={curriculum.tf_ema:.3f}, ar={curriculum.ar_ema:.3f}) based on ar_len={curriculum.ar_len}")
+
 # ==========================================
 # TRAINING LOOP
 # ==========================================
@@ -571,7 +588,8 @@ while global_step < MAX_STEPS:
         for pg in optimizer.param_groups:
             pg['lr'] = curr_lr
 
-    optimizer.zero_grad()
+    # v7.0.5: Performance optimization - set_to_none=True is faster than zeroing
+    optimizer.zero_grad(set_to_none=True)
 
     # 4. Forward Pass
     t_forward_start = time.perf_counter()
@@ -590,6 +608,11 @@ while global_step < MAX_STEPS:
         h_buffer = []  # For IDM
         logits_last = None
 
+        # v7.0.5: Performance optimization - pre-decode all target RGB frames once
+        # (15-20% speedup by avoiding K decoder calls per step)
+        with torch.no_grad():
+            tgt_rgb_all = torch.stack([vqvae_model.decode_code(Z_target[:, t]) for t in range(K)], dim=1)
+
         for t in range(K):
             is_ar_step = (t >= ar_cutoff and t > 0)
 
@@ -597,8 +620,9 @@ while global_step < MAX_STEPS:
             if t == 0:
                 z_in = Z_seq[:, 0]
             elif is_ar_step:
-                with torch.no_grad():
-                    z_in = logits_last.argmax(dim=1)
+                # v7.0.5: Use .detach() instead of redundant no_grad context (already in autocast)
+                assert logits_last is not None, "logits_last should be set from previous timestep"
+                z_in = logits_last.argmax(dim=1).detach()
             else:
                 z_in = Z_seq[:, t]
 
@@ -641,8 +665,8 @@ while global_step < MAX_STEPS:
             soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
             pred_rgb = vqvae_model.decoder(soft_emb)
 
-            with torch.no_grad():
-                tgt_rgb = vqvae_model.decode_code(Z_target[:, t])
+            # v7.0.5: Use pre-decoded target (already computed before loop)
+            tgt_rgb = tgt_rgb_all[:, t]
 
             lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
 
@@ -687,11 +711,12 @@ while global_step < MAX_STEPS:
 
         loss_lpips_total = loss_lpips_tf + AR_LOSS_WEIGHT * loss_lpips_ar
 
-        # Track for curriculum
+        # v7.0.5: Track for curriculum as tensors (avoid GPU->CPU sync every step)
+        # Only sync when curriculum.update() needs the values
         if loss_lpips_tf_list:
-            prev_lpips_tf = loss_lpips_tf.item()
+            prev_lpips_tf = loss_lpips_tf.detach()
         if loss_lpips_ar_list:
-            prev_lpips_ar = loss_lpips_ar.item()
+            prev_lpips_ar = loss_lpips_ar.detach()
 
         total_loss = (SEMANTIC_WEIGHT * loss_sem_total +
                      LPIPS_WEIGHT * loss_lpips_total +

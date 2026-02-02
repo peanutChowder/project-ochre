@@ -876,3 +876,22 @@ Results, step 115k resumed from v7.0.2 step 85k:
   - Suspect AR + corruption may have been too challenging
   - AR suddenly jumps to 20 when resuming from checkpoints, difficult recovery
 
+### v7.0.5
+
+Motivation: Fix v7.0.4's AR shock bug and enable actual AR error recovery training.
+
+train.py (comprehensive fix):
+- AR corruption enabled: `CORRUPT_TF_ONLY = False` (corrupt both TF and AR steps)
+- Synchronized schedule: AR starts at 5k with ar_len=1, corruption ramps 0→8% over 30k steps
+  - `CORRUPT_END_P: 0.30 → 0.08`, `CORRUPT_RAMP_STEPS: 300k → 30k`
+- LPIPS boost: `LPIPS_WEIGHT: 1.0 → 2.0` (restore camera U/D gradient signal)
+- EMA pre-warming: Initialize curriculum EMA if None on resume (prevent AR shock)
+- Performance optimizations: Pre-decode target frames, defer GPU sync, cuDNN benchmark, faster gradient zeroing (20% speedup?)
+
+Expected impact:
+- Model learns to recover from its own AR prediction errors (the missing skill from v7.0.2)
+- lpips_ratio decreases from ~1.7 toward ~1.3 (closing TF-AR gap)
+- ar_len can grow to 10-15 without quality collapse
+- Camera U/D restoration (LPIPS perceptual signal for pitch learning)
+- No AR shock if resuming from future checkpoints
+- Faster training enables more experiments within GPU budget
