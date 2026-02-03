@@ -204,8 +204,14 @@ class ARCurriculum:
         self.alpha = 0.98
         self.brake_ratio_upper = 2.5
         self.brake_ratio_lower = 1.6
+        # v7.0.5: Throttle curriculum changes to prevent file descriptor exhaustion
+        self.last_resize_time = 0
+        self.min_resize_interval = 10.0  # seconds
 
     def update(self, step, lpips_tf, lpips_ar, unique_codes=None):
+        import time
+        current_time = time.time()
+
         if step < AR_WARMUP_STEPS:
             return 0
 
@@ -233,10 +239,19 @@ class ARCurriculum:
 
         ratio = self.ar_ema / (self.tf_ema + 1e-6)
 
+        # v7.0.5: Throttle resize to prevent file descriptor exhaustion
+        # Only allow ar_len changes if enough time has passed since last change
+        time_since_last = current_time - self.last_resize_time
+        old_ar_len = self.ar_len
+
         if ratio > self.brake_ratio_upper + 0.05:
             self.ar_len = max(AR_MIN_LEN, self.ar_len - 1)
-        elif ratio < self.brake_ratio_lower - 0.05:
+        elif ratio < self.brake_ratio_lower - 0.05 and time_since_last >= self.min_resize_interval:
             self.ar_len = min(AR_MAX_LEN, self.ar_len + 1)
+
+        # Update last resize time if ar_len actually changed
+        if self.ar_len != old_ar_len:
+            self.last_resize_time = current_time
 
         return self.ar_len
 
@@ -562,6 +577,14 @@ while global_step < MAX_STEPS:
     if seq_len != prev_seq_len:
         print(f"[Curriculum] Resizing: seq_len {prev_seq_len} -> {seq_len}")
         prev_seq_len = seq_len
+
+        # v7.0.5: Clean up old dataloader to prevent file descriptor leaks
+        if 'loader' in locals():
+            del loader_iter
+            del loader
+            import gc
+            gc.collect()  # Force cleanup of worker processes
+
         dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
         loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
                            num_workers=4, pin_memory=True, persistent_workers=True)
