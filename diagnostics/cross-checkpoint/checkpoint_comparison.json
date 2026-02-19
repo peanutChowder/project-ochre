@@ -1,0 +1,163 @@
+{
+  "summaries": [
+    {
+      "checkpoint": "ochre-v7.0.1-step55k.pt",
+      "config": {
+        "codebook_size": 1024,
+        "embed_dim": 256,
+        "hidden_dim": 384,
+        "num_layers": 4,
+        "temporal_context_len": 8
+      },
+      "first_step_collapse": {
+        "frame_0_codes": 450,
+        "frame_1_codes": 18,
+        "frame_10_codes": 17,
+        "frame_19_codes": 17,
+        "first_step_drop_pct": 96.0,
+        "ten_step_drop_pct": 96.22222222222221
+      },
+      "action_conditioning": {
+        "wasd_effect_magnitude": 0.060608002729713915,
+        "camera_effect_magnitude": 0.09204289354383946,
+        "wasd_to_camera_ratio": 0.6584756273700921
+      },
+      "film_gates": {
+        "camera_gate_l2_start": 0.19310670252889395,
+        "movement_gate_l2_start": 0.05549097899347544,
+        "camera_to_movement_ratio": 3.479965618765414
+      },
+      "temporal_attention": {
+        "entropy_start": 0.0,
+        "entropy_end": 5.882834434509277,
+        "entropy_change_pct": 0.0
+      }
+    },
+    {
+      "checkpoint": "ochre-v7.0.2-step85k.pt",
+      "config": {
+        "codebook_size": 1024,
+        "embed_dim": 256,
+        "hidden_dim": 384,
+        "num_layers": 4,
+        "temporal_context_len": 8
+      },
+      "first_step_collapse": {
+        "frame_0_codes": 431,
+        "frame_1_codes": 45,
+        "frame_10_codes": 39,
+        "frame_19_codes": 39,
+        "first_step_drop_pct": 89.55916473317865,
+        "ten_step_drop_pct": 90.95127610208816
+      },
+      "action_conditioning": {
+        "wasd_effect_magnitude": 0.11926814690232276,
+        "camera_effect_magnitude": 0.10009942725300788,
+        "wasd_to_camera_ratio": 1.191496784585669
+      },
+      "film_gates": {
+        "camera_gate_l2_start": 0.3018199224025011,
+        "movement_gate_l2_start": 0.1059819171205163,
+        "camera_to_movement_ratio": 2.8478435544003795
+      },
+      "temporal_attention": {
+        "entropy_start": 0.0,
+        "entropy_end": 5.597713947296143,
+        "entropy_change_pct": 0.0
+      }
+    },
+    {
+      "checkpoint": "ochre-v7.0.4-step110k.pt",
+      "config": {
+        "codebook_size": 1024,
+        "embed_dim": 256,
+        "hidden_dim": 384,
+        "num_layers": 4,
+        "temporal_context_len": 8
+      },
+      "first_step_collapse": {
+        "frame_0_codes": 441,
+        "frame_1_codes": 39,
+        "frame_10_codes": 33,
+        "frame_19_codes": 32,
+        "first_step_drop_pct": 91.15646258503402,
+        "ten_step_drop_pct": 92.51700680272108
+      },
+      "action_conditioning": {
+        "wasd_effect_magnitude": 0.11066595539450645,
+        "camera_effect_magnitude": 0.06480070352554321,
+        "wasd_to_camera_ratio": 1.7077893860071234
+      },
+      "film_gates": {
+        "camera_gate_l2_start": 0.4628842929378152,
+        "movement_gate_l2_start": 0.17131695710122585,
+        "camera_to_movement_ratio": 2.7019175338398855
+      },
+      "temporal_attention": {
+        "entropy_start": 0.0,
+        "entropy_end": 5.491796016693115,
+        "entropy_change_pct": 0.0
+      }
+    },
+    {
+      "checkpoint": "ochre-v7.0.5-step95k.pt",
+      "config": {
+        "codebook_size": 1024,
+        "embed_dim": 256,
+        "hidden_dim": 384,
+        "num_layers": 4,
+        "temporal_context_len": 8
+      },
+      "first_step_collapse": {
+        "frame_0_codes": 448,
+        "frame_1_codes": 35,
+        "frame_10_codes": 30,
+        "frame_19_codes": 30,
+        "first_step_drop_pct": 92.1875,
+        "ten_step_drop_pct": 93.30357142857143
+      },
+      "action_conditioning": {
+        "wasd_effect_magnitude": 0.08225946575403213,
+        "camera_effect_magnitude": 0.06672797352075577,
+        "wasd_to_camera_ratio": 1.2327583198025183
+      },
+      "film_gates": {
+        "camera_gate_l2_start": 0.4386075586080551,
+        "movement_gate_l2_start": 0.12315564905293286,
+        "camera_to_movement_ratio": 3.561408335058437
+      },
+      "temporal_attention": {
+        "entropy_start": 0.0,
+        "entropy_end": 5.616761207580566,
+        "entropy_change_pct": 0.0
+      }
+    },
+    {
+      "checkpoint": "ochre-v6.2-step100000.pt",
+      "error": "'blocks.0.adaln_attn.norm.weight'"
+    },
+    {
+      "checkpoint": "ochre-v6.1-step20000.pt",
+      "error": "'blocks.0.adaln_attn.norm.weight'"
+    },
+    {
+      "checkpoint": "ochre-v5.0-step30000.pt",
+      "error": "'blocks.0.adaln_attn.norm.weight'"
+    },
+    {
+      "checkpoint": "ochre-v4.11.0-step70000.pt",
+      "error": "'blocks.0.adaln_attn.norm.weight'"
+    },
+    {
+      "checkpoint": "ochre-v4.10.1-step80000.pt",
+      "error": "'blocks.0.adaln_attn.norm.weight'"
+    }
+  ],
+  "metadata": {
+    "vqvae_path": "./vq_vae/checkpoints/vqvae_v2.1.6__epoch100.pt",
+    "device": "mps",
+    "num_checkpoints": 9,
+    "successful": 4,
+    "failed": 5
+  }
+}

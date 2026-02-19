@@ -1,0 +1,13 @@
+{
+  "total_sequences": 2003,
+  "qualified_sequences": 0,
+  "qualification_rate": 0.0,
+  "total_frames": 4008003,
+  "qualified_frames": 0,
+  "frame_retention_rate": 0.0,
+  "thresholds": {
+    "camera_static": 0.8,
+    "movement_active": 0.3,
+    "min_length": 100
+  }
+}
