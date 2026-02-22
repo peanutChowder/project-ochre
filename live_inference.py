@@ -151,6 +151,7 @@ def main():
     p.add_argument("--greedy", action="store_true", help="Use argmax decoding (no sampling)")
     p.add_argument("--temperature", type=float, default=1.05, help="Sampling temperature (>0); 1.0 ≈ unbiased")
     p.add_argument("--topk", type=int, default=32, help="Top‑k sampling cutoff (0 = disable)")
+    p.add_argument("--recency_decay", type=float, default=1.0, help="Temporal attention recency decay (1.0=no decay, 0.9=prefer recent frames)")
     p.add_argument("--use_context_actions", action="store_true", help="Use GT actions from context file instead of keyboard input")
     args = p.parse_args()
 
@@ -172,6 +173,9 @@ def main():
     if not isinstance(state_dict, dict):
         raise TypeError(f"Unexpected checkpoint type: {type(state_dict)} (expected dict/state_dict)")
     model_kwargs = _infer_conv_transformer_kwargs(ckpt if isinstance(ckpt, dict) else {}, state_dict, LATENT_H, LATENT_W)
+
+    # Add runtime recency_decay parameter
+    model_kwargs["recency_decay"] = args.recency_decay
 
     # Sanity-check codebook size agreement with the VQ-VAE.
     vq_codebook = int(vqvae.vq_vae.embedding.shape[1]) if hasattr(vqvae, "vq_vae") and hasattr(vqvae.vq_vae, "embedding") else None
