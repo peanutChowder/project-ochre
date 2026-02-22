@@ -895,3 +895,29 @@ Expected impact:
 - Camera U/D restoration (LPIPS perceptual signal for pitch learning)
 - No AR shock if resuming from future checkpoints
 - Faster training enables more experiments within GPU budget
+
+Results, step 95k
+- Similar to previous issues: Dark tint, ghosting trails with camera input
+- Camera input degredation: >3s rollouts with camera movement input causes ghosting trails that eventually converges to a dark brown-green mush for forest biomes
+- Diagnostics
+  - AR rollout is much worse than expected: 454 unique codes to 32 unique codes from live inference frame 0 -> 1
+  - AR rollout issue persists across all 7.x models
+
+### v7.1.0
+
+Motivation: v7.0.5 failure is logit-level collapse during AR rollout (extremely peaked distributions + narrow code usage), so inference-time top‑k cannot restore diversity.
+
+train.py (objective anti-collapse update):
+- Stochastic AR feedback during training: replace detached `argmax` feedback with detached top‑k sampling behind `AR_FEEDBACK_MODE` (default `topk`, k=50, temp=1.0) to better match inference conditioning and avoid deterministic lock-in.
+- Differentiable diversity regularizer: add marginal code-distribution penalty on AR logits via `KL(p_bar || Uniform)` with warm start (`DIV_REG_START_STEP`) and small weight (`DIV_REG_WEIGHT`; AR-only by default).
+- Optional differentiable anti-repetition prior (default off): penalize expected adjacent-code agreement using probabilities (`REP_REG_WEIGHT=0` initially; AR-only).
+- Reduce confounds: disable corruption by default (`CORRUPT_END_P=0.00`) for the first v7.1.0 run; reintroduce only if objective metrics improve.
+
+Objective logging (TF vs AR split; must-have):
+- Log per-segment calibration + diversity: `diagnostics/tf/mean_entropy`, `diagnostics/ar/mean_entropy`, `diagnostics/*/mean_max_prob`, `diagnostics/*/argmax_unique_codes`.
+- Log AR marginal distribution concentration: `diagnostics/ar/pbar_entropy`, `diagnostics/ar/pbar_top1_mass`.
+- Log regularizers: `train/loss_div_reg`, `train/loss_rep_reg`.
+
+Fixed-context eval snapshots (reproducibility):
+- Periodically run inference-style diagnostics on a small fixed set of `preprocessedv5/*.npz` contexts and write JSON artifacts under `diagnostics/runs/v7.1.0/<step>/...`.
+- `diagnostics/inference_diagnostics.py` supports a lighter profile (override step/sample counts via config) to keep snapshot overhead manageable during training.

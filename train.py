@@ -4,6 +4,7 @@ import os
 import time
 import json
 import random
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -57,6 +58,23 @@ LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was stronge
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 
+# --- v7.1.0 ANTI-COLLAPSE TRAINING ---
+# Objective: prevent AR rollouts from collapsing to a tiny, overconfident code subset.
+#
+# Change 1: Stochastic AR feedback during training (sampling instead of argmax).
+AR_FEEDBACK_MODE = "topk"   # "argmax" | "topk"
+AR_SAMPLE_TOPK = 50
+AR_SAMPLE_TEMP = 1.0
+#
+# Change 2: Differentiable marginal code-distribution regularizer (AR-only by default).
+DIV_REG_WEIGHT = 1e-4
+DIV_REG_START_STEP = 5_000
+DIV_REG_APPLY_TO = "ar"     # "ar" | "tf+ar"
+#
+# Change 3 (optional): Differentiable anti-repetition prior (AR-only; default off).
+REP_REG_WEIGHT = 0.0
+REP_REG_APPLY_TO = "ar"     # "ar"
+
 # Gumbel temperature schedule (v7.0.2: Annealing restored)
 GUMBEL_START = 1.0
 GUMBEL_END = 0.1
@@ -67,7 +85,8 @@ GUMBEL_DECAY_STEPS = 20000
 # Synchronized corruption + AR: Both start at step 5k, corruption applies to TF and AR steps.
 CORRUPT_TF_ONLY = False          # v7.0.5: Corrupt both TF and AR to train actual AR error recovery
 CORRUPT_START_P = 0.00
-CORRUPT_END_P = 0.08             # v7.0.5: 8% max (aggressive but not catastrophic)
+# v7.1.0: Disable corruption by default to reduce confounds; re-enable only if objective metrics improve.
+CORRUPT_END_P = 0.00
 CORRUPT_RAMP_STEPS = 30000       # v7.0.5: Fast ramp, reaches max by step 30k (aligns with Gumbel)
 CORRUPT_TOKEN_REPLACE_FRAC = 1.0 # fraction of corrupted tokens replaced with random indices (rest reserved for future modes)
 CORRUPT_BLOCK_PROB = 0.15        # per-sample chance to corrupt a spatial block (in addition to per-token corruption)
@@ -107,8 +126,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.0.5-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.0.5"
+RUN_NAME = "v7.1.0-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.1.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -119,6 +138,27 @@ RESUME_CHECKPOINT_PATH = ""  # v7.0.5: Start fresh (no checkpoint resume)
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
 ACTION_VISUAL_ROLLOUT_LEN = 30
+
+# --- DIAGNOSTIC LOGGING ---
+# Goal: make failure modes legible (action pathways dead? temporal attn over-sticky? token motion not shifting?).
+DIAGNOSTIC_LOG_STEPS = 1000
+DIAG_ROLLOUT_LEN = 30
+DIAG_MAX_SHIFT_X = 10
+DIAG_MAX_SHIFT_Y = 6
+DIAG_ATTENTION_QUERY_TOKENS = 64
+DIAG_LOG_PER_BLOCK = False
+
+# --- FIXED-CONTEXT EVAL SNAPSHOTS (v7.1.0; strongly recommended) ---
+# Periodically write inference-style diagnostic JSONs on fixed contexts to prevent "it looked better once" drift.
+EVAL_SNAPSHOT_STEPS = 5000
+EVAL_SNAPSHOT_CONTEXT_DIR = "./preprocessedv5"
+EVAL_SNAPSHOT_NUM_CONTEXTS = 3
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.1.0"
+EVAL_SNAPSHOT_TOPK = 50
+EVAL_SNAPSHOT_TEMP = 1.0
+EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
+# Keep snapshots reasonably light to avoid stalling training.
+EVAL_PROFILE = "light"  # "light" | "full"
 
 
 # ==========================================
@@ -193,6 +233,161 @@ def corrupt_tokens(
             z = z_out
 
     return z
+
+
+def sample_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
+    """
+    Sample discrete token indices from logits (for stochastic AR feedback).
+
+    logits: (B, C, H, W)
+    returns: (B, H, W) long
+    """
+    B, C, H, W = logits.shape
+    temperature = max(float(temperature), 1e-3)
+    logits = logits.float() / temperature
+
+    logits_flat = logits.view(B, C, H * W).permute(0, 2, 1)  # (B, HW, C)
+
+    if top_k is not None and 0 < int(top_k) < C:
+        k = int(top_k)
+        topk_vals, topk_idx = torch.topk(logits_flat, k, dim=-1)  # (B, HW, k)
+        probs = torch.softmax(topk_vals, dim=-1)
+        sampled_rel = torch.multinomial(probs.reshape(-1, k), num_samples=1).view(B, -1)  # (B, HW)
+        chosen = topk_idx.gather(-1, sampled_rel.unsqueeze(-1)).squeeze(-1)
+    else:
+        probs = torch.softmax(logits_flat, dim=-1)  # (B, HW, C)
+        chosen = torch.multinomial(probs.reshape(-1, C), num_samples=1).view(B, -1)  # (B, HW)
+
+    return chosen.view(B, H, W).long()
+
+
+def marginal_kl_to_uniform_from_logits(logits: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    """
+    Differentiable anti-collapse regularizer: KL(p_bar || Uniform).
+
+    logits: (B, C, H, W)
+    """
+    p = torch.softmax(logits.float(), dim=1)  # (B, C, H, W)
+    p_bar = p.mean(dim=(0, 2, 3))            # (C,)
+    p_bar = p_bar / (p_bar.sum() + eps)
+    C = int(p_bar.numel())
+    log_u = -math.log(C)
+    return (p_bar * (torch.log(p_bar + eps) - log_u)).sum()
+
+
+def expected_neighbor_agreement_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable anti-repetition prior: expected equality of adjacent codes.
+
+    logits: (B, C, H, W)
+    """
+    p = torch.softmax(logits.float(), dim=1)
+    eq_h = (p[:, :, :, :-1] * p[:, :, :, 1:]).sum(dim=1).mean()
+    eq_v = (p[:, :, :-1, :] * p[:, :, 1:, :]).sum(dim=1).mean()
+    return 0.5 * (eq_h + eq_v)
+
+
+@torch.no_grad()
+def logits_calibration_stats(logits: torch.Tensor, *, codebook_size: int, eps: float = 1e-9) -> dict:
+    """
+    Calibration + diversity stats from logits (no gradients).
+    """
+    probs = torch.softmax(logits.float(), dim=1)
+    entropy = -(probs * torch.log(probs + eps)).sum(dim=1).mean()
+    max_prob = probs.max(dim=1).values.mean()
+    argmax = logits.argmax(dim=1)
+    present = torch.bincount(argmax.reshape(-1), minlength=int(codebook_size)) > 0
+    unique_codes = present.sum().float()
+    return {"mean_entropy": entropy, "mean_max_prob": max_prob, "argmax_unique_codes": unique_codes}
+
+
+def _select_fixed_eval_contexts() -> list[str]:
+    if EVAL_SNAPSHOT_STEPS <= 0 or EVAL_SNAPSHOT_NUM_CONTEXTS <= 0:
+        return []
+    if not os.path.isdir(EVAL_SNAPSHOT_CONTEXT_DIR):
+        return []
+    import glob
+    paths = sorted(glob.glob(os.path.join(EVAL_SNAPSHOT_CONTEXT_DIR, "*.npz")))
+    return paths[: int(EVAL_SNAPSHOT_NUM_CONTEXTS)]
+
+
+def _serialize_inference_diagnostics(results: dict) -> dict:
+    """
+    Convert numpy arrays to lists (matches diagnostics/inference_diagnostics.py JSON format).
+    """
+    import numpy as _np
+
+    results_serializable: dict = {}
+    for key, value in results.items():
+        if isinstance(value, dict):
+            results_serializable[key] = {}
+            for k, v in value.items():
+                if isinstance(v, _np.ndarray):
+                    results_serializable[key][k] = v.tolist()
+                else:
+                    results_serializable[key][k] = v
+        else:
+            results_serializable[key] = value
+    return results_serializable
+
+
+@torch.no_grad()
+def save_fixed_context_eval_snapshots(model, vqvae, context_paths: list[str], *, global_step: int, device: str) -> None:
+    if not context_paths:
+        return
+
+    import io
+    import contextlib
+    from pathlib import Path
+    from diagnostics.inference_diagnostics import run_all_diagnostics
+    from diagnostics.analyze_checkpoint import get_test_actions
+
+    out_dir = os.path.join(EVAL_SNAPSHOT_OUT_ROOT, str(global_step))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Configure diagnostics workload.
+    config = {
+        "topk": int(EVAL_SNAPSHOT_TOPK),
+        "temperature": float(EVAL_SNAPSHOT_TEMP),
+        "recency_decay": float(EVAL_SNAPSHOT_RECENCY_DECAY),
+    }
+    if EVAL_PROFILE == "light":
+        config.update({
+            "entropy_steps": 20,
+            "code_dist_steps": 20,
+            "consistency_samples": 3,
+            "consistency_steps": 8,
+            "action_sensitivity_steps": 8,
+            "quality_steps": 20,
+        })
+
+    # Temporarily set recency_decay if supported.
+    old_rd = None
+    if hasattr(model, "temporal_attn") and hasattr(model.temporal_attn, "recency_decay"):
+        old_rd = float(getattr(model.temporal_attn, "recency_decay"))
+        model.temporal_attn.recency_decay = float(config["recency_decay"])
+
+    test_actions = get_test_actions(torch.device(device))
+
+    try:
+        for ctx_path in context_paths:
+            data = np.load(ctx_path)
+            z0 = torch.from_numpy(data["tokens"][0]).long().to(device).unsqueeze(0)
+
+            # Inference diagnostics are chatty; keep training logs clean.
+            with contextlib.redirect_stdout(io.StringIO()):
+                results = run_all_diagnostics(model, vqvae, z0, test_actions, config)
+
+            payload = {"config": config, "results": _serialize_inference_diagnostics(results)}
+            out_path = os.path.join(
+                out_dir,
+                f"{Path(ctx_path).stem}_inference_diagnostics_k{config['topk']}_t{config['temperature']}_rd{config['recency_decay']}.json",
+            )
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+    finally:
+        if old_rd is not None:
+            model.temporal_attn.recency_decay = old_rd
 
 
 class ARCurriculum:
@@ -351,6 +546,243 @@ def compute_rollout(model, vqvae, z_start, action_vec, num_steps, device):
         return frames
 
 
+@torch.no_grad()
+def compute_rollout_tokens(model, z_start, action_vec, num_steps):
+    """Multi-step AR rollout returning predicted token grids."""
+    temporal_buffer = []
+    tokens = []
+    z_t = z_start
+    for _ in range(num_steps):
+        logits, new_state = model.step(z_t, action_vec, temporal_buffer)
+        z_t = logits.argmax(dim=1)
+        tokens.append(z_t.detach())
+        temporal_buffer.append(new_state.detach())
+        if len(temporal_buffer) > TEMPORAL_CONTEXT_LEN:
+            temporal_buffer.pop(0)
+    return tokens
+
+
+@torch.no_grad()
+def best_shift_match(
+    z_prev: torch.Tensor,
+    z_curr: torch.Tensor,
+    *,
+    max_dx: int,
+    max_dy: int,
+) -> dict:
+    """
+    Estimate spatial shift between discrete token grids by maximizing exact-token match.
+
+    z_prev, z_curr: (H, W) long
+    Returns: dict(best_dx, best_dy, best_match)
+    """
+    assert z_prev.dim() == 2 and z_curr.dim() == 2
+    H, W = z_prev.shape
+
+    best = {"best_dx": 0, "best_dy": 0, "best_match": -1.0}
+
+    # Use a sentinel that should never appear in tokens.
+    sentinel = torch.iinfo(z_prev.dtype).min if not torch.is_floating_point(z_prev) else -1.0
+
+    for dy in range(-max_dy, max_dy + 1):
+        if dy == 0:
+            y_shifted = z_prev
+        elif dy > 0:
+            pad = torch.full((dy, W), sentinel, device=z_prev.device, dtype=z_prev.dtype)
+            y_shifted = torch.cat([pad, z_prev[:H - dy, :]], dim=0)
+        else:
+            pad = torch.full((-dy, W), sentinel, device=z_prev.device, dtype=z_prev.dtype)
+            y_shifted = torch.cat([z_prev[-dy:, :], pad], dim=0)
+
+        for dx in range(-max_dx, max_dx + 1):
+            x_shifted = torch.roll(y_shifted, shifts=dx, dims=1)
+            match = (x_shifted == z_curr).float().mean().item()
+            if match > best["best_match"]:
+                best = {"best_dx": int(dx), "best_dy": int(dy), "best_match": float(match)}
+
+    return best
+
+
+@torch.no_grad()
+def diagnostic_action_path_stats(model, action_vec: torch.Tensor) -> dict:
+    """
+    Summarize per-block AdaLN camera vs movement pathway magnitudes for a given action.
+    """
+    stats = {}
+    cam_l2 = {"attn": [], "ffn": []}
+    mov_l2 = {"attn": [], "ffn": []}
+    gate_mean = {"attn": [], "ffn": []}
+
+    for i, block in enumerate(model.blocks):
+        p_attn = block.adaln_attn.action_to_params(action_vec, split_paths=True)
+        cam_l2["attn"].append(p_attn["camera"]["gate_raw"].pow(2).mean().sqrt().item())
+        mov_l2["attn"].append(p_attn["movement"]["gate_raw"].pow(2).mean().sqrt().item())
+        gate_mean["attn"].append(p_attn["combined"]["gate"].mean().item())
+
+        p_ffn = block.adaln_ffn.action_to_params(action_vec, split_paths=True)
+        cam_l2["ffn"].append(p_ffn["camera"]["gate_raw"].pow(2).mean().sqrt().item())
+        mov_l2["ffn"].append(p_ffn["movement"]["gate_raw"].pow(2).mean().sqrt().item())
+        gate_mean["ffn"].append(p_ffn["combined"]["gate"].mean().item())
+
+        if DIAG_LOG_PER_BLOCK:
+            stats[f"adaln/block{i:02d}/attn_cam_gate_raw_l2"] = cam_l2["attn"][-1]
+            stats[f"adaln/block{i:02d}/attn_mov_gate_raw_l2"] = mov_l2["attn"][-1]
+            stats[f"adaln/block{i:02d}/attn_gate_mean"] = gate_mean["attn"][-1]
+            stats[f"adaln/block{i:02d}/ffn_cam_gate_raw_l2"] = cam_l2["ffn"][-1]
+            stats[f"adaln/block{i:02d}/ffn_mov_gate_raw_l2"] = mov_l2["ffn"][-1]
+            stats[f"adaln/block{i:02d}/ffn_gate_mean"] = gate_mean["ffn"][-1]
+
+    for which in ("attn", "ffn"):
+        stats[f"adaln/{which}_cam_gate_raw_l2_mean"] = float(np.mean(cam_l2[which])) if cam_l2[which] else 0.0
+        stats[f"adaln/{which}_mov_gate_raw_l2_mean"] = float(np.mean(mov_l2[which])) if mov_l2[which] else 0.0
+        stats[f"adaln/{which}_gate_mean_mean"] = float(np.mean(gate_mean[which])) if gate_mean[which] else 0.0
+        stats[f"adaln/{which}_cam_vs_mov_gate_raw_l2_ratio"] = (
+            stats[f"adaln/{which}_cam_gate_raw_l2_mean"] / (stats[f"adaln/{which}_mov_gate_raw_l2_mean"] + 1e-9)
+        )
+
+    return stats
+
+
+@torch.no_grad()
+def diagnostic_temporal_attention_stats(model, z_t: torch.Tensor, action_vec: torch.Tensor) -> dict:
+    """
+    Run a single forward to probe temporal attention distribution with a synthetic buffer.
+    Uses the model's own compress_frame outputs so stats reflect real tokenization of memory.
+    """
+    # Build a small temporal buffer by running a few static steps.
+    temporal_buffer = []
+    z = z_t
+    for _ in range(min(4, TEMPORAL_CONTEXT_LEN)):
+        logits, new_state = model.step(z, action_vec, temporal_buffer)
+        temporal_buffer.append(new_state.detach())
+        if len(temporal_buffer) > TEMPORAL_CONTEXT_LEN:
+            temporal_buffer.pop(0)
+        z = logits.argmax(dim=1)
+
+    # Recompute x (post-block) for the current z and query attention weights.
+    x = model.embed(z).permute(0, 3, 1, 2)
+    x = model.stem(x)
+    x = x.flatten(2).transpose(1, 2)
+    for block in model.blocks:
+        x = block(x, action_vec, model.H, model.W)
+
+    attn = model.temporal_attn.attention_stats(x, temporal_buffer, num_query_tokens=DIAG_ATTENTION_QUERY_TOKENS)
+    if attn is None:
+        return {}
+
+    out = {
+        "temporal_attn/entropy": float(attn["attn_entropy"].item()),
+        "temporal_attn/src_len": float(attn["src_len"]),
+        "temporal_attn/num_queries": float(attn["num_queries"]),
+        "temporal_attn/attn_max": float(attn["attn_mean_per_src"].max().item()),
+        "temporal_attn/attn_min": float(attn["attn_mean_per_src"].min().item()),
+        "temporal_attn/frames_in_buffer": float(attn.get("frames_in_buffer", 0)),
+        "temporal_attn/tokens_per_frame": float(attn.get("tokens_per_frame", 0)),
+    }
+
+    per_frame = attn.get("attn_mean_per_frame")
+    if per_frame is not None:
+        # Most recent frame is last in temporal_buffer; report how much mass goes to it vs oldest.
+        out["temporal_attn/frame_mass_max"] = float(per_frame.max().item())
+        out["temporal_attn/frame_mass_min"] = float(per_frame.min().item())
+        out["temporal_attn/frame_mass_last"] = float(per_frame[-1].item())
+        out["temporal_attn/frame_mass_first"] = float(per_frame[0].item())
+        out["temporal_attn/frame_mass_last_over_first"] = float(per_frame[-1].item() / (per_frame[0].item() + 1e-9))
+
+    return out
+
+
+def diagnostic_action_grad_stats(model) -> dict:
+    """
+    Gradient-flow diagnostic: do movement/camera action pathways get gradient signal?
+    Call after backward + unscale, before optimizer step.
+    """
+    def grad_l2(params):
+        total = 0.0
+        count = 0
+        for p in params:
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            total += float(g.pow(2).sum().item())
+            count += g.numel()
+        return (total / max(count, 1)) ** 0.5
+
+    cam_params = []
+    mov_params = []
+    for block in model.blocks:
+        cam_params += list(block.adaln_attn.camera_mlp.parameters())
+        mov_params += list(block.adaln_attn.movement_mlp.parameters())
+        cam_params += list(block.adaln_ffn.camera_mlp.parameters())
+        mov_params += list(block.adaln_ffn.movement_mlp.parameters())
+
+    return {
+        "grads/adaln_camera_l2": float(grad_l2(cam_params)),
+        "grads/adaln_movement_l2": float(grad_l2(mov_params)),
+        "grads/adaln_camera_over_movement": float(grad_l2(cam_params) / (grad_l2(mov_params) + 1e-12)),
+    }
+
+
+@torch.no_grad()
+def diagnostic_action_logit_sensitivity(model, z_t: torch.Tensor, actions: dict) -> dict:
+    """
+    Forward sensitivity (token-space): how much do logits change under different actions?
+    Uses empty temporal buffer to isolate action conditioning vs temporal memory.
+    """
+    device = z_t.device
+    temporal_buffer = []
+    logits_static, _ = model.step(z_t, actions["static"], temporal_buffer)
+    logits_static = logits_static.float()
+
+    out = {}
+    for name, a in actions.items():
+        if name == "static":
+            continue
+        logits, _ = model.step(z_t, a.to(device), temporal_buffer)
+        d = (logits.float() - logits_static).abs().mean().item()
+        out[f"logit_sensitivity/{name}_absmean"] = float(d)
+    return out
+
+
+@torch.no_grad()
+def diagnostic_rollout_shift_stats(model, z_start: torch.Tensor, action_vec: torch.Tensor, *, name: str) -> dict:
+    """
+    Token-space rollout diagnostics: does the model produce consistent spatial shifts or just churn/ghost?
+    """
+    tokens = compute_rollout_tokens(model, z_start, action_vec, DIAG_ROLLOUT_LEN)
+    if len(tokens) < 2:
+        return {}
+
+    dxs, dys, matches = [], [], []
+    churns = []
+
+    z_prev = tokens[0][0]
+    for z_next_b in tokens[1:]:
+        z_next = z_next_b[0]
+        s = best_shift_match(z_prev, z_next, max_dx=DIAG_MAX_SHIFT_X, max_dy=DIAG_MAX_SHIFT_Y)
+        dxs.append(s["best_dx"])
+        dys.append(s["best_dy"])
+        matches.append(s["best_match"])
+        churns.append(float((z_prev != z_next).float().mean().item()))
+        z_prev = z_next
+
+    dxs_np = np.array(dxs, dtype=np.float32)
+    dys_np = np.array(dys, dtype=np.float32)
+    matches_np = np.array(matches, dtype=np.float32)
+    churns_np = np.array(churns, dtype=np.float32)
+
+    return {
+        f"rollout/{name}/dx_mean": float(dxs_np.mean()),
+        f"rollout/{name}/dx_std": float(dxs_np.std()),
+        f"rollout/{name}/dy_mean": float(dys_np.mean()),
+        f"rollout/{name}/dy_std": float(dys_np.std()),
+        f"rollout/{name}/match_mean": float(matches_np.mean()),
+        f"rollout/{name}/match_min": float(matches_np.min()),
+        f"rollout/{name}/token_churn_mean": float(churns_np.mean()),
+        f"rollout/{name}/token_churn_max": float(churns_np.max()),
+    }
+
+
 def validate_action_conditioning(model, vqvae, Z_seq, global_step):
     """Multi-step action validation."""
     if wandb is None:
@@ -364,7 +796,10 @@ def validate_action_conditioning(model, vqvae, Z_seq, global_step):
             "static": torch.tensor(encode_action_v5_np(), device=device).unsqueeze(0),
             "camera_left": torch.tensor(encode_action_v5_np(yaw_raw=-0.5), device=device).unsqueeze(0),
             "camera_right": torch.tensor(encode_action_v5_np(yaw_raw=0.5), device=device).unsqueeze(0),
+            "camera_up": torch.tensor(encode_action_v5_np(pitch_raw=0.5), device=device).unsqueeze(0),
+            "camera_down": torch.tensor(encode_action_v5_np(pitch_raw=-0.5), device=device).unsqueeze(0),
             "move_forward": torch.tensor(encode_action_v5_np(w=1.0), device=device).unsqueeze(0),
+            "jump": torch.tensor(encode_action_v5_np(jump=1.0), device=device).unsqueeze(0),
         }
 
         metrics = {}
@@ -377,13 +812,19 @@ def validate_action_conditioning(model, vqvae, Z_seq, global_step):
             static_frame = rollouts["static"][-1].flatten()
             diff_cam_l = (static_frame - rollouts["camera_left"][-1].flatten()).pow(2).mean().sqrt().item()
             diff_cam_r = (static_frame - rollouts["camera_right"][-1].flatten()).pow(2).mean().sqrt().item()
+            diff_cam_u = (static_frame - rollouts["camera_up"][-1].flatten()).pow(2).mean().sqrt().item()
+            diff_cam_d = (static_frame - rollouts["camera_down"][-1].flatten()).pow(2).mean().sqrt().item()
             diff_move = (static_frame - rollouts["move_forward"][-1].flatten()).pow(2).mean().sqrt().item()
+            diff_jump = (static_frame - rollouts["jump"][-1].flatten()).pow(2).mean().sqrt().item()
 
             suffix = f"_{num_steps}step" if num_steps > 1 else ""
             metrics[f"action_response/camera_left_diff{suffix}"] = diff_cam_l
             metrics[f"action_response/camera_right_diff{suffix}"] = diff_cam_r
+            metrics[f"action_response/camera_up_diff{suffix}"] = diff_cam_u
+            metrics[f"action_response/camera_down_diff{suffix}"] = diff_cam_d
             metrics[f"action_response/move_forward_diff{suffix}"] = diff_move
-            metrics[f"action_response/average{suffix}"] = (diff_cam_l + diff_cam_r + diff_move) / 3
+            metrics[f"action_response/jump_diff{suffix}"] = diff_jump
+            metrics[f"action_response/average{suffix}"] = (diff_cam_l + diff_cam_r + diff_cam_u + diff_cam_d + diff_move + diff_jump) / 6
 
         # Visual rollout grid (30 frames)
         rollouts_30 = {name: compute_rollout(model, vqvae, z_start, action, ACTION_VISUAL_ROLLOUT_LEN, device)
@@ -391,7 +832,7 @@ def validate_action_conditioning(model, vqvae, Z_seq, global_step):
 
         num_vis = 6
         vis_frames = []
-        for name in ["static", "camera_left", "camera_right", "move_forward"]:
+        for name in ["static", "camera_left", "camera_right", "camera_up", "camera_down", "move_forward", "jump"]:
             frames = rollouts_30[name]
             indices = [int(i * (ACTION_VISUAL_ROLLOUT_LEN - 1) / (num_vis - 1)) for i in range(num_vis)]
             for idx in indices:
@@ -403,7 +844,7 @@ def validate_action_conditioning(model, vqvae, Z_seq, global_step):
         wandb.log({
             "visuals/action_rollout_30step": wandb.Image(
                 grid_np,
-                caption=f"30-Step Rollouts | Rows: Static, Cam-L, Cam-R, Move-Fwd | Step {global_step}"
+                caption=f"30-Step Rollouts | Rows: Static, Cam-L, Cam-R, Cam-U, Cam-D, Move-Fwd, Jump | Step {global_step}"
             )
         }, step=global_step)
 
@@ -546,6 +987,10 @@ prev_lpips_tf = 0.0
 prev_lpips_ar = 0.0
 prev_unique_codes = None
 
+fixed_eval_contexts = _select_fixed_eval_contexts()
+if fixed_eval_contexts:
+    print(f"  - Fixed-context eval snapshots: {len(fixed_eval_contexts)} contexts every {EVAL_SNAPSHOT_STEPS} steps")
+
 # Timing EMA for smooth metrics (alpha=0.1 gives ~10 step window)
 timing_ema = {
     'data_load': 0.0,
@@ -630,6 +1075,18 @@ while global_step < MAX_STEPS:
         temporal_buffer = []
         h_buffer = []  # For IDM
         logits_last = None
+        logits_tf_last = None
+        logits_ar_last = None
+
+        # --- Per-segment objective stats (TF vs AR) ---
+        tf_stats_sum = {"mean_entropy": torch.tensor(0.0, device=DEVICE),
+                        "mean_max_prob": torch.tensor(0.0, device=DEVICE),
+                        "argmax_unique_codes": torch.tensor(0.0, device=DEVICE)}
+        ar_stats_sum = {"mean_entropy": torch.tensor(0.0, device=DEVICE),
+                        "mean_max_prob": torch.tensor(0.0, device=DEVICE),
+                        "argmax_unique_codes": torch.tensor(0.0, device=DEVICE)}
+        tf_steps = 0
+        ar_steps = 0
 
         # v7.0.5: Performance optimization - pre-decode all target RGB frames once
         # (15-20% speedup by avoiding K decoder calls per step)
@@ -643,9 +1100,15 @@ while global_step < MAX_STEPS:
             if t == 0:
                 z_in = Z_seq[:, 0]
             elif is_ar_step:
-                # v7.0.5: Use .detach() instead of redundant no_grad context (already in autocast)
+                # v7.1.0: Stochastic AR feedback during training (match inference regime).
                 assert logits_last is not None, "logits_last should be set from previous timestep"
-                z_in = logits_last.argmax(dim=1).detach()
+                if AR_FEEDBACK_MODE == "argmax":
+                    z_in = logits_last.argmax(dim=1).detach()
+                elif AR_FEEDBACK_MODE == "topk":
+                    with torch.no_grad():
+                        z_in = sample_tokens(logits_last, temperature=AR_SAMPLE_TEMP, top_k=AR_SAMPLE_TOPK)
+                else:
+                    raise ValueError(f"Unknown AR_FEEDBACK_MODE={AR_FEEDBACK_MODE!r} (expected 'argmax' or 'topk').")
             else:
                 z_in = Z_seq[:, t]
 
@@ -661,6 +1124,10 @@ while global_step < MAX_STEPS:
                 return_spatial_features=True,
             )
             logits_last = logits_t
+            if is_ar_step:
+                logits_ar_last = logits_t
+            else:
+                logits_tf_last = logits_t
 
             # Store for IDM (detach past states to prevent backprop through time)
             h_buffer.append(x_spatial_t)
@@ -726,6 +1193,18 @@ while global_step < MAX_STEPS:
                 loss_idm_list.append(ly + lp + lb)
                 t_idm_total += (time.perf_counter() - t_idm_start)
 
+            # v7.1.0 objective logging: TF vs AR logit calibration + diversity.
+            with torch.no_grad():
+                s = logits_calibration_stats(logits_t, codebook_size=codebook_size)
+                if is_ar_step:
+                    for k_, v_ in s.items():
+                        ar_stats_sum[k_] = ar_stats_sum[k_] + v_
+                    ar_steps += 1
+                else:
+                    for k_, v_ in s.items():
+                        tf_stats_sum[k_] = tf_stats_sum[k_] + v_
+                    tf_steps += 1
+
         # Aggregate losses
         loss_sem_total = torch.stack(loss_sem_list).mean()
         loss_lpips_tf = torch.stack(loss_lpips_tf_list).mean() if loss_lpips_tf_list else torch.tensor(0.0, device=DEVICE)
@@ -741,9 +1220,56 @@ while global_step < MAX_STEPS:
         if loss_lpips_ar_list:
             prev_lpips_ar = loss_lpips_ar.detach()
 
+        # v7.1.0: Differentiable anti-collapse regularizers (logits -> probs -> marginal stats).
+        loss_div_reg = torch.tensor(0.0, device=DEVICE)
+        loss_rep_reg = torch.tensor(0.0, device=DEVICE)
+
+        # Diversity regularizer (KL to uniform) with warm start.
+        if DIV_REG_WEIGHT > 0 and global_step >= DIV_REG_START_STEP:
+            if DIV_REG_APPLY_TO == "ar" and logits_ar_last is not None:
+                loss_div_reg = marginal_kl_to_uniform_from_logits(logits_ar_last)
+            elif DIV_REG_APPLY_TO == "tf+ar" and (logits_tf_last is not None or logits_ar_last is not None):
+                parts = []
+                if logits_tf_last is not None:
+                    parts.append(marginal_kl_to_uniform_from_logits(logits_tf_last))
+                if logits_ar_last is not None:
+                    parts.append(marginal_kl_to_uniform_from_logits(logits_ar_last))
+                loss_div_reg = torch.stack(parts).mean() if parts else loss_div_reg
+            else:
+                raise ValueError(f"Unknown DIV_REG_APPLY_TO={DIV_REG_APPLY_TO!r} (expected 'ar' or 'tf+ar').")
+
+        # Optional neighbor anti-repetition prior (AR-only by default).
+        if REP_REG_WEIGHT > 0:
+            if REP_REG_APPLY_TO == "ar" and logits_ar_last is not None:
+                loss_rep_reg = expected_neighbor_agreement_from_logits(logits_ar_last)
+            else:
+                raise ValueError(f"Unknown REP_REG_APPLY_TO={REP_REG_APPLY_TO!r} (expected 'ar').")
+
         total_loss = (SEMANTIC_WEIGHT * loss_sem_total +
                      LPIPS_WEIGHT * loss_lpips_total +
-                     IDM_LOSS_WEIGHT * loss_idm_total)
+                     IDM_LOSS_WEIGHT * loss_idm_total +
+                     DIV_REG_WEIGHT * loss_div_reg +
+                     REP_REG_WEIGHT * loss_rep_reg)
+
+        # Finalize TF/AR stats (mean over timesteps in each segment).
+        with torch.no_grad():
+            tf_steps_safe = max(tf_steps, 1)
+            ar_steps_safe = max(ar_steps, 1)
+            tf_stats_mean = {k_: (v_ / tf_steps_safe) for k_, v_ in tf_stats_sum.items()}
+            ar_stats_mean = {k_: (v_ / ar_steps_safe) for k_, v_ in ar_stats_sum.items()}
+
+            # AR marginal distribution stats (p_bar) on the last AR logits (or fallback to last logits).
+            pbar_entropy = torch.tensor(0.0, device=DEVICE)
+            pbar_top1_mass = torch.tensor(0.0, device=DEVICE)
+            if logits_ar_last is not None:
+                probs_ar = torch.softmax(logits_ar_last.float(), dim=1)
+                p_bar = probs_ar.mean(dim=(0, 2, 3))
+                p_bar = p_bar / (p_bar.sum() + 1e-9)
+                pbar_entropy = -(p_bar * torch.log(p_bar + 1e-9)).sum()
+                pbar_top1_mass = p_bar.max()
+
+            # Curriculum diversity gate should track AR regime when present.
+            prev_unique_codes = int(ar_stats_mean["argmax_unique_codes"].item() if logits_ar_last is not None else tf_stats_mean["argmax_unique_codes"].item())
 
     t_forward = (time.perf_counter() - t_forward_start) * 1000  # ms
 
@@ -754,19 +1280,25 @@ while global_step < MAX_STEPS:
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     t_backward = (time.perf_counter() - t_backward_start) * 1000  # ms
 
+    diag_grad_log = None
+    if wandb and (global_step % DIAGNOSTIC_LOG_STEPS == 0):
+        diag_grad_log = diagnostic_action_grad_stats(model)
+
     t_optimizer_start = time.perf_counter()
     scaler.step(optimizer)
     scaler.update()
     t_optimizer = (time.perf_counter() - t_optimizer_start) * 1000  # ms
 
-    # 6. Diagnostics
+    # 6. Diagnostics (already computed during forward; this is just CPU sync for logging)
     t_diagnostics_start = time.perf_counter()
-    with torch.no_grad():
-        probs_last = F.softmax(logits_last.float(), dim=1)
-        entropy = -(probs_last * torch.log(probs_last + 1e-9)).sum(dim=1).mean()
-        confidence = probs_last.max(dim=1)[0].mean()
-        unique_codes = logits_last.argmax(dim=1).unique().numel()
-        prev_unique_codes = int(unique_codes)
+    tf_entropy = float(tf_stats_mean["mean_entropy"].item())
+    tf_max_prob = float(tf_stats_mean["mean_max_prob"].item())
+    tf_unique = float(tf_stats_mean["argmax_unique_codes"].item())
+    ar_entropy = float(ar_stats_mean["mean_entropy"].item())
+    ar_max_prob = float(ar_stats_mean["mean_max_prob"].item())
+    ar_unique = float(ar_stats_mean["argmax_unique_codes"].item())
+    ar_pbar_entropy = float(pbar_entropy.item())
+    ar_pbar_top1_mass = float(pbar_top1_mass.item())
     t_diagnostics = (time.perf_counter() - t_diagnostics_start) * 1000  # ms
 
     step_time = time.perf_counter() - t_step_start
@@ -789,7 +1321,7 @@ while global_step < MAX_STEPS:
             f"[Step {global_step}] Loss: {total_loss.item():.4f} | "
             f"Sem: {loss_sem_total.item():.4f} | LPIPS: {loss_lpips_total.item():.4f} | "
             f"IDM: {loss_idm_total.item():.4f} | "
-            f"AR: {ar_len} | Unique: {unique_codes} | "
+            f"AR: {ar_len} | UniqueAR: {ar_unique:.0f} | "
             f"{throughput:.2f} steps/s\n"
             f"  Tau: {current_tau:.3f} | CorruptP: {current_corrupt_p:.3f} | "
             f"  Timing: Data={timing_ema['data_load']:.0f}ms | Fwd={timing_ema['forward']:.0f}ms "
@@ -805,6 +1337,8 @@ while global_step < MAX_STEPS:
                 "train/loss_lpips_tf": loss_lpips_tf.item(),
                 "train/loss_lpips_ar": loss_lpips_ar.item(),
                 "train/loss_idm": loss_idm_total.item(),
+                "train/loss_div_reg": loss_div_reg.item(),
+                "train/loss_rep_reg": loss_rep_reg.item(),
                 "train/grad_norm": float(grad_norm),
                 "train/lr": optimizer.param_groups[0]['lr'],
                 "train/gumbel_tau": current_tau,
@@ -812,9 +1346,14 @@ while global_step < MAX_STEPS:
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "curriculum/lpips_ratio": prev_lpips_ar / (prev_lpips_tf + 1e-6),
-                "diagnostics/entropy": float(entropy),
-                "diagnostics/confidence": float(confidence),
-                "diagnostics/unique_codes": unique_codes,
+                "diagnostics/tf/mean_entropy": tf_entropy,
+                "diagnostics/ar/mean_entropy": ar_entropy,
+                "diagnostics/tf/mean_max_prob": tf_max_prob,
+                "diagnostics/ar/mean_max_prob": ar_max_prob,
+                "diagnostics/tf/argmax_unique_codes": tf_unique,
+                "diagnostics/ar/argmax_unique_codes": ar_unique,
+                "diagnostics/ar/pbar_entropy": ar_pbar_entropy,
+                "diagnostics/ar/pbar_top1_mass": ar_pbar_top1_mass,
                 "timing/step_ms": step_time * 1000,
                 "timing/throughput": 1 / step_time,
                 "timing/data_load_ms": timing_ema['data_load'],
@@ -832,6 +1371,60 @@ while global_step < MAX_STEPS:
         action_metrics = validate_action_conditioning(model, vqvae_model, Z_seq, global_step)
         if wandb and action_metrics:
             wandb.log(action_metrics, step=global_step)
+
+    if wandb and (global_step % DIAGNOSTIC_LOG_STEPS == 0):
+        with torch.no_grad():
+            device = Z_seq.device
+            z_start = Z_seq[0:1, 0]
+
+            diag_actions = {
+                "static": torch.tensor(encode_action_v5_np(), device=device).unsqueeze(0),
+                "camera_left": torch.tensor(encode_action_v5_np(yaw_raw=-0.5), device=device).unsqueeze(0),
+                "camera_right": torch.tensor(encode_action_v5_np(yaw_raw=0.5), device=device).unsqueeze(0),
+                "camera_up": torch.tensor(encode_action_v5_np(pitch_raw=0.5), device=device).unsqueeze(0),
+                "camera_down": torch.tensor(encode_action_v5_np(pitch_raw=-0.5), device=device).unsqueeze(0),
+                "move_forward": torch.tensor(encode_action_v5_np(w=1.0), device=device).unsqueeze(0),
+                "jump": torch.tensor(encode_action_v5_np(jump=1.0), device=device).unsqueeze(0),
+            }
+
+            diag_log = {}
+
+            # 1) Action-path “is movement dead?” probes
+            for name, a in diag_actions.items():
+                s = diagnostic_action_path_stats(model, a)
+                for k, v in s.items():
+                    diag_log[f"{k}/{name}"] = v
+
+            # 1b) Gradient-flow: are movement AdaLN params getting grads?
+            if diag_grad_log:
+                diag_log.update(diag_grad_log)
+
+            # 1c) Token-space action sensitivity (logits differ at all?)
+            diag_log.update(diagnostic_action_logit_sensitivity(model, z_start, diag_actions))
+
+            # 2) Temporal attention stickiness probes (entropy / max weight)
+            diag_log.update(diagnostic_temporal_attention_stats(model, z_start, diag_actions["static"]))
+            diag_log.update(diagnostic_temporal_attention_stats(model, z_start, diag_actions["camera_right"]))
+
+            # 3) Token-space rollout shift probes (does yaw behave like a shift? does it churn?)
+            for name, a in diag_actions.items():
+                if name in ("static", "camera_left", "camera_right", "camera_up", "camera_down", "move_forward", "jump"):
+                    diag_log.update(diagnostic_rollout_shift_stats(model, z_start, a, name=name))
+
+            wandb.log(diag_log, step=global_step)
+
+    if fixed_eval_contexts and EVAL_SNAPSHOT_STEPS > 0 and (global_step % EVAL_SNAPSHOT_STEPS == 0) and global_step > 0:
+        was_training = model.training
+        model.eval()
+        save_fixed_context_eval_snapshots(
+            model,
+            vqvae_model,
+            fixed_eval_contexts,
+            global_step=global_step,
+            device=DEVICE,
+        )
+        if was_training:
+            model.train()
 
     if global_step % MILESTONE_SAVE_STEPS == 0 and global_step > 0:
         # Remove old checkpoint if it exists

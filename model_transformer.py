@@ -311,6 +311,50 @@ class ActionAdaLN(nn.Module):
 
         return x_normalized, gate
 
+    @torch.no_grad()
+    def action_to_params(self, action: torch.Tensor, *, split_paths: bool = False) -> dict:
+        """
+        Diagnostic helper: compute AdaLN params induced by `action` without needing `x`.
+
+        Returns dict with keys:
+          - combined: scale/shift/gate_raw/gate (B, C)
+          - (optional) camera/movement: same keys per path (pre-sigmoid gate_raw)
+        """
+        camera = action[..., :8]
+        movement = action[..., 8:]
+
+        cam_params = self.camera_mlp(camera)
+        mov_params = self.movement_mlp(movement)
+        params = cam_params + mov_params
+
+        scale, shift, gate_raw = params.chunk(3, dim=-1)
+        out = {
+            "combined": {
+                "scale": scale,
+                "shift": shift,
+                "gate_raw": gate_raw,
+                "gate": torch.sigmoid(gate_raw),
+            }
+        }
+
+        if split_paths:
+            cam_scale, cam_shift, cam_gate_raw = cam_params.chunk(3, dim=-1)
+            mov_scale, mov_shift, mov_gate_raw = mov_params.chunk(3, dim=-1)
+            out["camera"] = {
+                "scale": cam_scale,
+                "shift": cam_shift,
+                "gate_raw": cam_gate_raw,
+                "gate": torch.sigmoid(cam_gate_raw),
+            }
+            out["movement"] = {
+                "scale": mov_scale,
+                "shift": mov_shift,
+                "gate_raw": mov_gate_raw,
+                "gate": torch.sigmoid(mov_gate_raw),
+            }
+
+        return out
+
 
 # ----------------------------
 # Temporal Context
@@ -332,12 +376,14 @@ class TemporalCrossAttention(nn.Module):
         hidden_dim: int = 384,
         context_len: int = 4,
         downsample_factor: int = 3,
-        num_heads: int = 4
+        num_heads: int = 4,
+        recency_decay: float = 1.0  # NEW: 1.0=no decay, 0.9=prefer recent frames
     ):
         super().__init__()
         self.context_len = context_len
         self.downsample_factor = downsample_factor
         self.compressed_dim = hidden_dim // 2
+        self.recency_decay = recency_decay  # NEW: exponential decay for old frames
 
         # Spatial downsampling: 18x32 -> 6x11 (with stride 3)
         # Actually computes to: floor(18/3) x floor(32/3) = 6 x 10 = 60 tokens
@@ -387,11 +433,93 @@ class TemporalCrossAttention(nn.Module):
         context = torch.cat(recent, dim=1)  # (B, total_past_tokens, compressed_dim)
         context = self.context_proj(context)  # (B, total_past_tokens, hidden_dim)
 
+        # NEW: Apply exponential decay mask based on frame age
+        if self.recency_decay < 1.0:
+            frames_in_buffer = len(recent)
+            tokens_per_frame = recent[0].shape[1]  # Each compressed frame has same number of tokens
+
+            # Create decay weights: newest frame (index -1) gets weight 1.0,
+            # older frames get exponentially decayed weights
+            decay_weights = []
+            for i in range(frames_in_buffer):
+                age = frames_in_buffer - i - 1  # 0=newest, 7=oldest
+                weight = self.recency_decay ** age
+                decay_weights.extend([weight] * tokens_per_frame)
+
+            decay_mask = torch.tensor(decay_weights, device=context.device, dtype=context.dtype)
+            decay_mask = decay_mask.unsqueeze(0).unsqueeze(2)  # (1, total_past_tokens, 1)
+
+            # Scale context by decay mask
+            context = context * decay_mask  # (B, total_past_tokens, hidden_dim)
+
         # Cross-attend: current frame queries past frames
         x_norm = self.norm(x)
         out, _ = self.cross_attn(x_norm, context, context)
 
         return x + out  # Residual
+
+    @torch.no_grad()
+    def attention_stats(
+        self,
+        x: torch.Tensor,
+        temporal_buffer: Optional[List[torch.Tensor]],
+        *,
+        num_query_tokens: int = 64,
+    ) -> Optional[dict]:
+        """
+        Diagnostic helper: sample a subset of query tokens and compute attention weight stats.
+
+        Returns:
+          dict with:
+            - attn_mean_per_src (src_len,)
+            - attn_entropy (scalar)
+            - src_len (int)
+            - num_queries (int)
+        """
+        if temporal_buffer is None or len(temporal_buffer) == 0 or self.context_len <= 0:
+            return None
+
+        recent = temporal_buffer[-self.context_len:]
+        if len(recent) == 0:
+            return None
+
+        context = torch.cat(recent, dim=1)  # (B, src_len, compressed_dim)
+        context = self.context_proj(context)  # (B, src_len, hidden_dim)
+
+        B, tgt_len, _ = x.shape
+        src_len = context.shape[1]
+        frames_in_buffer = len(recent)
+        tokens_per_frame = int(recent[0].shape[1]) if frames_in_buffer > 0 else 0
+
+        if tgt_len <= 0 or src_len <= 0:
+            return None
+
+        num_q = min(int(num_query_tokens), int(tgt_len))
+        # Use same query indices for the whole batch (good enough for diagnostics).
+        q_idx = torch.randperm(tgt_len, device=x.device)[:num_q]
+
+        x_q = self.norm(x[:, q_idx, :])
+        _, attn_w = self.cross_attn(x_q, context, context, need_weights=True, average_attn_weights=True)
+        # attn_w: (B, num_q, src_len)
+        attn_mean_per_src = attn_w.mean(dim=(0, 1))  # (src_len,)
+        attn_mean_per_src = attn_mean_per_src / (attn_mean_per_src.sum() + 1e-9)
+
+        # Entropy over src tokens for the averaged distribution.
+        ent = -(attn_mean_per_src * torch.log(attn_mean_per_src + 1e-9)).sum()
+
+        attn_mean_per_frame = None
+        if frames_in_buffer > 0 and tokens_per_frame > 0 and frames_in_buffer * tokens_per_frame == src_len:
+            attn_mean_per_frame = attn_mean_per_src.view(frames_in_buffer, tokens_per_frame).sum(dim=1)
+
+        return {
+            "attn_mean_per_src": attn_mean_per_src.detach(),
+            "attn_mean_per_frame": attn_mean_per_frame.detach() if attn_mean_per_frame is not None else None,
+            "attn_entropy": ent.detach(),
+            "src_len": int(src_len),
+            "num_queries": int(num_q),
+            "frames_in_buffer": int(frames_in_buffer),
+            "tokens_per_frame": int(tokens_per_frame),
+        }
 
 
 # ----------------------------
@@ -553,6 +681,7 @@ class MinecraftConvTransformer(nn.Module):
         idm_max_span: int = 5,
         mlp_ratio: float = 2.0,
         use_checkpointing: bool = False,
+        recency_decay: float = 1.0,  # NEW: Exponential decay for temporal attention (1.0=no decay)
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -581,7 +710,8 @@ class MinecraftConvTransformer(nn.Module):
 
         # Temporal cross-attention
         self.temporal_attn = TemporalCrossAttention(
-            hidden_dim, temporal_context_len, downsample_factor=3, num_heads=4
+            hidden_dim, temporal_context_len, downsample_factor=3, num_heads=4,
+            recency_decay=recency_decay  # NEW: Pass decay parameter
         )
 
         # IDM for auxiliary supervision
@@ -658,7 +788,7 @@ class MinecraftConvTransformer(nn.Module):
 
         # Apply transformer blocks
         for block in self.blocks:
-            if self.use_checkpointing and self.training:
+            if self.use_checkpointing and self.training and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(block, x, action, self.H, self.W, use_reentrant=False)
             else:
                 x = block(x, action, self.H, self.W)
