@@ -921,3 +921,18 @@ Objective logging (TF vs AR split; must-have):
 Fixed-context eval snapshots (reproducibility):
 - Periodically run inference-style diagnostics on a small fixed set of `preprocessedv5/*.npz` contexts and write JSON artifacts under `diagnostics/runs/v7.1.0/<step>/...`.
 - `diagnostics/inference_diagnostics.py` supports a lighter profile (override step/sample counts via config) to keep snapshot overhead manageable during training.
+
+Results, step 40k:
+- Diversity improved vs v7.0.5 baseline: `argmax_unique_codes` 28.65 → 36.45 (+27%), `code_concentration` 0.217 → 0.157 (−27%), `mean_max_prob` 0.977 → 0.953
+- Pre-registered 50k targets not yet met: `argmax_unique_codes` ~41–45 (target ≥60), `pbar_top1_mass` ~0.15–0.25 (target <0.10)
+- Inference diagnostic (`topk=50, temp=1.0`): `consistency_score=1.0` — repeated top-k rollouts produce identical token grids; sampling is fully deterministic despite stochastic training
+- Temperature probe (`topk=50, temp=2.0`): `consistency_score=1.0` still — entropy 4×'d (0.21→0.86) but dominant token still wins at every step, confirming concentration is a training-time artifact in the logits, not an inference-time sampling artifact
+- Unique codes during rollout ~46–55 (static vs camera/movement actions); action_effect_magnitude 0.246
+
+### v7.1.1
+
+Motivation: `consistency_score=1.0` at both temp=1.0 and temp=2.0 confirms `DIV_REG_WEIGHT=1e-4` is too weak — the diversity regularizer is overwhelmed by cross-entropy and cannot flatten the marginal code distribution. `argmax_unique_codes` has improved enough (~46–55) that spatial tiling is now the next-order failure mode.
+
+train.py (hyperparameter-only change):
+- `DIV_REG_WEIGHT`: `1e-4 → 1e-3` (10×) to provide meaningful gradient pressure against logit concentration
+- `REP_REG_WEIGHT`: `0.0 → 1e-4` (enable anti-repetition prior) per the v7.1.0 spec trigger: "enable if diversity is up but visuals remain tiled"

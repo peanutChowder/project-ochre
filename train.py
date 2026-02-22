@@ -58,7 +58,7 @@ LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was stronge
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 
-# --- v7.1.0 ANTI-COLLAPSE TRAINING ---
+# --- v7.1.1 ANTI-COLLAPSE TRAINING ---
 # Objective: prevent AR rollouts from collapsing to a tiny, overconfident code subset.
 #
 # Change 1: Stochastic AR feedback during training (sampling instead of argmax).
@@ -67,12 +67,17 @@ AR_SAMPLE_TOPK = 50
 AR_SAMPLE_TEMP = 1.0
 #
 # Change 2: Differentiable marginal code-distribution regularizer (AR-only by default).
-DIV_REG_WEIGHT = 1e-4
+# v7.1.1: DIV_REG_WEIGHT increased 1e-4 → 1e-3. Inference diagnostics (k50_t1.0 and k50_t2.0)
+# showed consistency_score=1.0 at both temperatures, confirming 1e-4 is too weak to overcome
+# cross-entropy pressure. See detailed-changelogs/v7.1.1-CHANGES.md.
+DIV_REG_WEIGHT = 1e-3
 DIV_REG_START_STEP = 5_000
 DIV_REG_APPLY_TO = "ar"     # "ar" | "tf+ar"
 #
 # Change 3 (optional): Differentiable anti-repetition prior (AR-only; default off).
-REP_REG_WEIGHT = 0.0
+# v7.1.1: Enabled at 1e-4. argmax_unique_codes has improved enough (~46-55 unique codes)
+# that spatial tiling of the remaining dominant codes is now the next-order failure mode.
+REP_REG_WEIGHT = 1e-4
 REP_REG_APPLY_TO = "ar"     # "ar"
 
 # Gumbel temperature schedule (v7.0.2: Annealing restored)
@@ -126,8 +131,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.1.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.1.0"
+RUN_NAME = "v7.1.1-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.1.1"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -151,9 +156,10 @@ DIAG_LOG_PER_BLOCK = False
 # --- FIXED-CONTEXT EVAL SNAPSHOTS (v7.1.0; strongly recommended) ---
 # Periodically write inference-style diagnostic JSONs on fixed contexts to prevent "it looked better once" drift.
 EVAL_SNAPSHOT_STEPS = 5000
-EVAL_SNAPSHOT_CONTEXT_DIR = "./preprocessedv5"
+# Fixed contexts for reproducibility — use a small local set, not the full training dataset.
+EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.1.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.1.1"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -304,7 +310,7 @@ def logits_calibration_stats(logits: torch.Tensor, *, codebook_size: int, eps: f
 def _select_fixed_eval_contexts() -> list[str]:
     if EVAL_SNAPSHOT_STEPS <= 0 or EVAL_SNAPSHOT_NUM_CONTEXTS <= 0:
         return []
-    if not os.path.isdir(EVAL_SNAPSHOT_CONTEXT_DIR):
+    if not isinstance(EVAL_SNAPSHOT_CONTEXT_DIR, str) or not os.path.isdir(EVAL_SNAPSHOT_CONTEXT_DIR):
         return []
     import glob
     paths = sorted(glob.glob(os.path.join(EVAL_SNAPSHOT_CONTEXT_DIR, "*.npz")))
@@ -990,6 +996,11 @@ prev_unique_codes = None
 fixed_eval_contexts = _select_fixed_eval_contexts()
 if fixed_eval_contexts:
     print(f"  - Fixed-context eval snapshots: {len(fixed_eval_contexts)} contexts every {EVAL_SNAPSHOT_STEPS} steps")
+elif EVAL_SNAPSHOT_STEPS > 0 and EVAL_SNAPSHOT_NUM_CONTEXTS > 0:
+    print(
+        "  - Fixed-context eval snapshots: ENABLED but no .npz contexts found in "
+        f"{EVAL_SNAPSHOT_CONTEXT_DIR!r}; no snapshots will be written."
+    )
 
 # Timing EMA for smooth metrics (alpha=0.1 gives ~10 step window)
 timing_ema = {
