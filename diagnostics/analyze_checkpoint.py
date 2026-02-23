@@ -25,13 +25,13 @@ from pathlib import Path
 from model_transformer import MinecraftConvTransformer
 from vq_vae.vq_vae import VQVAE
 from action_encoding import encode_action_v5_np
-from diagnostics_enhanced import (
-    diagnostic_per_frame_ar_quality,
-    diagnostic_ablation_action_effect,
-    diagnostic_ablation_buffer_quality,
-    diagnostic_film_evolution,
-    diagnostic_temporal_attention_evolution,
-    diagnostic_tf_vs_ar_comparison,
+from diagnostics.diagnostics_enhanced import (
+	diagnostic_per_frame_ar_quality,
+	diagnostic_ablation_action_effect,
+	diagnostic_ablation_buffer_quality,
+	diagnostic_film_evolution,
+	diagnostic_temporal_attention_evolution,
+	diagnostic_tf_vs_ar_comparison,
 )
 
 
