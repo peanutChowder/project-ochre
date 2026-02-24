@@ -103,14 +103,22 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v6.3 config) ---
-BASE_SEQ_LEN = 16
-CURRICULUM_AR = True
-AR_WARMUP_STEPS = 5000
+# --- AR CURRICULUM (v7.2.0: pure AR training, no TF, no curriculum) ---
+# v7.2.0: Remove TF entirely. BASE_SEQ_LEN=2 → 3 frames per sample (GT frame 0 as context;
+# model predicts frame 1 via TF step then frame 2 via AR step using its own frame 1 output).
+# AR_MAX_LEN=1 is fixed; curriculum and warmup are disabled.
+BASE_SEQ_LEN = 2
+CURRICULUM_AR = False
+AR_WARMUP_STEPS = 0
 AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
-AR_MAX_LEN = 20
+AR_MAX_LEN = 1
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
+
+# v7.2.0: CE loss with label smoothing — directly limits logit overconfidence inside the loss.
+# label_smoothing=0.1 hard-caps max_prob at ~0.9001 (for C=1024 codes).
+LABEL_SMOOTHING = 0.1
+CE_WEIGHT = 1.0
 
 # v7.0.3: Run-local AR resize freeze.
 # When resuming from a checkpoint, relying only on GLOBAL step means the AR curriculum can immediately start
@@ -131,8 +139,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.1.1-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.1.1"
+RUN_NAME = "v7.2.0-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.2.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -159,7 +167,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.1.1"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.2.0"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -985,8 +993,8 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
 loader_iter = iter(loader)
 
 print(f"Training Start")
-print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
-print(f"  - AR curriculum: {AR_MIN_LEN}-{AR_MAX_LEN}, diversity gate at {MIN_UNIQUE_CODES_FOR_AR_GROWTH}")
+print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
+print(f"  - AR: fixed ar_len={AR_MAX_LEN}, seq_len={BASE_SEQ_LEN} (pure AR, no curriculum)")
 
 model.train()
 prev_lpips_tf = 0.0
@@ -1020,12 +1028,8 @@ while global_step < MAX_STEPS:
     t_step_start = time.perf_counter()
     t_last = t_step_start
 
-    # 1. Update Curriculum
-    run_local_step = global_step - run_start_global_step
-    if run_local_step < RUN_LOCAL_AR_RESIZE_FREEZE_STEPS:
-        ar_len = curriculum.ar_len
-    else:
-        ar_len = curriculum.update(global_step, prev_lpips_tf, prev_lpips_ar, prev_unique_codes)
+    # 1. Fixed AR length (v7.2.0: pure AR training, no curriculum)
+    ar_len = AR_MAX_LEN
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
     current_tau = tau_scheduler.get_tau(global_step)
     current_corrupt_p = corrupt_scheduler.get_p(global_step)
@@ -1078,6 +1082,7 @@ while global_step < MAX_STEPS:
 
     with autocast(enabled=(DEVICE == "cuda")):
         loss_sem_list = []
+        loss_ce_list = []
         loss_lpips_tf_list = []
         loss_lpips_ar_list = []
         loss_idm_list = []
@@ -1150,12 +1155,16 @@ while global_step < MAX_STEPS:
 
             # --- Losses ---
 
-            # A. Semantic Loss
+            # A. Semantic Loss + CE Loss with label smoothing
             t_sem_start = time.perf_counter()
             logits_flat = logits_t.permute(0, 2, 3, 1).reshape(-1, logits_t.size(1))
             target_flat = Z_target[:, t].reshape(-1)
             loss_sem = semantic_criterion(logits_flat, target_flat, current_tau)
             loss_sem_list.append(loss_sem)
+            # v7.2.0: CE loss with label smoothing — hard-caps max_prob at ~0.9001 (ε=0.1, C=1024).
+            # Applied to all steps (both TF and AR) to prevent overconfidence at any position.
+            loss_ce_t = F.cross_entropy(logits_flat, target_flat, label_smoothing=LABEL_SMOOTHING)
+            loss_ce_list.append(loss_ce_t)
             t_sem_total += (time.perf_counter() - t_sem_start)
 
             # B. LPIPS Loss
@@ -1218,6 +1227,7 @@ while global_step < MAX_STEPS:
 
         # Aggregate losses
         loss_sem_total = torch.stack(loss_sem_list).mean()
+        loss_ce_total = torch.stack(loss_ce_list).mean() if loss_ce_list else torch.tensor(0.0, device=DEVICE)
         loss_lpips_tf = torch.stack(loss_lpips_tf_list).mean() if loss_lpips_tf_list else torch.tensor(0.0, device=DEVICE)
         loss_lpips_ar = torch.stack(loss_lpips_ar_list).mean() if loss_lpips_ar_list else torch.tensor(0.0, device=DEVICE)
         loss_idm_total = torch.stack(loss_idm_list).mean() if loss_idm_list else torch.tensor(0.0, device=DEVICE)
@@ -1257,6 +1267,7 @@ while global_step < MAX_STEPS:
                 raise ValueError(f"Unknown REP_REG_APPLY_TO={REP_REG_APPLY_TO!r} (expected 'ar').")
 
         total_loss = (SEMANTIC_WEIGHT * loss_sem_total +
+                     CE_WEIGHT * loss_ce_total +
                      LPIPS_WEIGHT * loss_lpips_total +
                      IDM_LOSS_WEIGHT * loss_idm_total +
                      DIV_REG_WEIGHT * loss_div_reg +
@@ -1344,6 +1355,7 @@ while global_step < MAX_STEPS:
             wandb.log({
                 "train/loss": total_loss.item(),
                 "train/loss_semantic": loss_sem_total.item(),
+                "train/loss_ce": loss_ce_total.item(),
                 "train/loss_lpips": loss_lpips_total.item(),
                 "train/loss_lpips_tf": loss_lpips_tf.item(),
                 "train/loss_lpips_ar": loss_lpips_ar.item(),

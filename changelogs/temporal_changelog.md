@@ -936,3 +936,11 @@ Motivation: `consistency_score=1.0` at both temp=1.0 and temp=2.0 confirms `DIV_
 train.py (hyperparameter-only change):
 - `DIV_REG_WEIGHT`: `1e-4 → 1e-3` (10×) to provide meaningful gradient pressure against logit concentration
 - `REP_REG_WEIGHT`: `0.0 → 1e-4` (enable anti-repetition prior) per the v7.1.0 spec trigger: "enable if diversity is up but visuals remain tiled"
+
+### v7.2.0
+
+Motivation: v7.1.1 inference diagnostics revealed two independent root causes for rollout collapse. (1) Distribution shift: training with TF means the model never sees its own outputs; at inference the first AR step collapses from ~107 unique codes (GT context) to ~31, compounding to entropy ~0.20 and `action_effect_magnitude` ~0.10 by step 30k while training-time AR metrics look healthy (~0.83 max_prob). Regularizers cannot close this gap — training on the actual inference regime is required. (2) Overconfidence: `div_reg` + `rep_reg` contribute ~0.4–0.8% of total loss and are overwhelmed by CE pressure; a mechanism operating inside the CE loss is needed.
+
+train.py:
+- (Almost) Pure AR training: `BASE_SEQ_LEN: 16 → 2`, `AR_MAX_LEN: 20 → 1`, `AR_WARMUP_STEPS: 5000 → 0`, `CURRICULUM_AR: True → False`. Yields 3 frames per sample — GT frame 0 as context, model-predicted frame 1 used as AR input for frame 2. Every training step's AR loss trains on the actual inference distribution. ARCurriculum.update() replaced with fixed `ar_len = AR_MAX_LEN`.
+- CE loss with label smoothing: `LABEL_SMOOTHING=0.1`, `CE_WEIGHT=1.0`. `F.cross_entropy(..., label_smoothing=0.1)` hard-caps max_prob at ~0.9001 for C=1024, operating inside the loss itself rather than as a competing regularizer. Applied to all steps (TF + AR). Logged as `train/loss_ce`.
