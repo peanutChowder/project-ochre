@@ -423,7 +423,89 @@ def diagnostic_per_frame_quality(model, vqvae, z_start, action, num_steps=20, to
 
 
 # ========================================
-# Diagnostic 6: VQ-VAE Decode Quality Check
+# Diagnostic 6: Action Transition Effect
+# ========================================
+
+@torch.no_grad()
+def diagnostic_action_transition(model, vqvae, z_start, warmup_action, test_action, warmup_steps=8, test_steps=12, topk=50, temperature=1.0):
+    """
+    Measure quality before and after switching actions mid-rollout.
+
+    Runs `warmup_steps` with `warmup_action` to prime the temporal buffer,
+    then switches to `test_action` for `test_steps` more steps.
+    Measures input_unique_codes, argmax_unique_codes, max_prob, and sharpness
+    at every step, with the transition marked at `warmup_steps`.
+
+    Returns:
+        - steps: total steps (warmup_steps + test_steps)
+        - transition_at: index where action switches (= warmup_steps)
+        - input_unique_codes: array of length `steps`
+        - argmax_unique_codes: array of length `steps`
+        - max_prob: array of length `steps`
+        - sharpness: array of length `steps`
+        - pre/post_transition_mean_* summary stats
+    """
+    input_unique_codes = []
+    argmax_unique_codes = []
+    max_probs = []
+    sharpness_per_frame = []
+    temporal_buffer = []
+    z_t = z_start
+
+    laplacian_kernel = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], dtype=torch.float32, device=z_start.device)
+
+    total_steps = warmup_steps + test_steps
+    for step in range(total_steps):
+        action = warmup_action if step < warmup_steps else test_action
+        input_unique_codes.append(z_t.unique().numel())
+
+        logits, new_state = model.step(z_t, action, temporal_buffer)
+
+        probs = F.softmax(logits / temperature, dim=1)
+        max_prob_per_position = probs.max(dim=1)[0]
+        max_probs.append(max_prob_per_position.mean().item())
+
+        z_argmax = logits.argmax(dim=1)
+        argmax_unique_codes.append(z_argmax.unique().numel())
+
+        if topk > 0:
+            topk_probs, topk_indices = probs.topk(topk, dim=1)
+            topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
+            B, _, H, W = topk_probs.shape
+            topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
+            sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
+            z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+        else:
+            z_t = z_argmax
+
+        img_pred = vqvae.decode_code(z_t)
+        gray = img_pred.mean(dim=1, keepdim=True)
+        laplacian = F.conv2d(gray, laplacian_kernel, padding=1)
+        sharpness_per_frame.append(laplacian.var().item())
+
+        temporal_buffer.append(new_state.detach())
+        if len(temporal_buffer) > 8:
+            temporal_buffer.pop(0)
+
+    return {
+        'steps': total_steps,
+        'transition_at': warmup_steps,
+        'input_unique_codes': np.array(input_unique_codes),
+        'argmax_unique_codes': np.array(argmax_unique_codes),
+        'max_prob': np.array(max_probs),
+        'sharpness': np.array(sharpness_per_frame),
+        'pre_transition_mean_sharpness': float(np.mean(sharpness_per_frame[:warmup_steps])),
+        'post_transition_mean_sharpness': float(np.mean(sharpness_per_frame[warmup_steps:])),
+        'sharpness_ratio_post_over_pre': float(np.mean(sharpness_per_frame[warmup_steps:]) / (np.mean(sharpness_per_frame[:warmup_steps]) + 1e-9)),
+        'pre_transition_mean_max_prob': float(np.mean(max_probs[:warmup_steps])),
+        'post_transition_mean_max_prob': float(np.mean(max_probs[warmup_steps:])),
+        'pre_transition_mean_input_unique': float(np.mean(input_unique_codes[:warmup_steps])),
+        'post_transition_mean_input_unique': float(np.mean(input_unique_codes[warmup_steps:])),
+    }
+
+
+# ========================================
+# Diagnostic 7: VQ-VAE Decode Quality Check
 # ========================================
 
 @torch.no_grad()
@@ -462,7 +544,7 @@ def diagnostic_vqvae_decode_quality(vqvae, z_pred):
 
 def run_all_diagnostics(model, vqvae, z_start, test_actions, config):
     """
-    Run all 6 diagnostic categories with specified configuration.
+    Run all 7 diagnostic categories with specified configuration.
 
     Args:
         model: Loaded world model
@@ -529,8 +611,37 @@ def run_all_diagnostics(model, vqvae, z_start, test_actions, config):
         )
         print(f"  {action_name}: degradation_onset_frame={results[f'per_frame_quality/{action_name}']['degradation_onset_frame']}, sharpness_retention={results[f'per_frame_quality/{action_name}']['sharpness_retention']:.2%}")
 
-    # Diagnostic 6: VQ-VAE Decode Quality
-    print("\n[6/6] Running VQ-VAE decode quality check...")
+    # Diagnostic 6: Action Transition Effect
+    print("\n[6/7] Running action transition diagnostics...")
+    transition_pairs = [
+        ("static_to_move_forward",  "static",       "move_forward"),
+        ("static_to_jump",          "static",       "jump"),
+        ("camera_right_to_move_forward", "camera_right", "move_forward"),
+        ("camera_right_to_static",  "camera_right", "static"),
+        ("move_forward_to_static",  "move_forward", "static"),
+    ]
+    warmup_steps = int(config.get("transition_warmup_steps", 8))
+    test_steps   = int(config.get("transition_test_steps", 12))
+    for name, warmup_name, test_name in transition_pairs:
+        if warmup_name not in test_actions or test_name not in test_actions:
+            continue
+        r = diagnostic_action_transition(
+            model, vqvae, z_start,
+            warmup_action=test_actions[warmup_name],
+            test_action=test_actions[test_name],
+            warmup_steps=warmup_steps,
+            test_steps=test_steps,
+            topk=topk,
+            temperature=temperature,
+        )
+        results[f'action_transition/{name}'] = r
+        ratio = r['sharpness_ratio_post_over_pre']
+        mp_delta = r['post_transition_mean_max_prob'] - r['pre_transition_mean_max_prob']
+        iu_delta = r['post_transition_mean_input_unique'] - r['pre_transition_mean_input_unique']
+        print(f"  {name}: sharpness_ratio={ratio:.3f}  Δmax_prob={mp_delta:+.3f}  Δinput_unique={iu_delta:+.1f}")
+
+    # Diagnostic 7: VQ-VAE Decode Quality
+    print("\n[7/7] Running VQ-VAE decode quality check...")
     results['vqvae_quality'] = diagnostic_vqvae_decode_quality(vqvae, z_start)
     print(f"  code_diversity={results['vqvae_quality']['pred_code_diversity']}, most_common_freq={results['vqvae_quality']['most_common_code_frequency']:.3f}")
 

@@ -944,3 +944,23 @@ Motivation: v7.1.1 inference diagnostics revealed two independent root causes fo
 train.py:
 - (Almost) Pure AR training: `BASE_SEQ_LEN: 16 → 2`, `AR_MAX_LEN: 20 → 1`, `AR_WARMUP_STEPS: 5000 → 0`, `CURRICULUM_AR: True → False`. Yields 3 frames per sample — GT frame 0 as context, model-predicted frame 1 used as AR input for frame 2. Every training step's AR loss trains on the actual inference distribution. ARCurriculum.update() replaced with fixed `ar_len = AR_MAX_LEN`.
 - CE loss with label smoothing: `LABEL_SMOOTHING=0.1`, `CE_WEIGHT=1.0`. `F.cross_entropy(..., label_smoothing=0.1)` hard-caps max_prob at ~0.9001 for C=1024, operating inside the loss itself rather than as a competing regularizer. Applied to all steps (TF + AR). Logged as `train/loss_ce`.
+
+Results, step 240k:
+- Major anti-collapse improvement vs v7.1.x: `avg_max_prob` down to ~0.50, `consistency_score` down to ~0.49, and rollout code usage up to ~200-240 unique codes depending on context.
+- First-step AR collapse no longer present: `input_unique_codes` stays high after the first sampled step instead of immediately dropping into the ~30-code regime seen in v7.1.x.
+- Action-conditioned outputs are materially more distinct: `action_effect_magnitude` sits in the ~0.25-0.35 band across the run, indicating the model is no longer nearly deterministic under different actions.
+- Live inference is improved but not solved: recognizable structure can persist for 10+ second rollouts, but sustained keyboard-driven camera/movement still causes block edges and textures to flatten or drift over time.
+- The final checkpoint is NOT the best v7.2.0 checkpoint on every metric; the ~150k-185k region looked stronger on some diagnostic axes, but 240k still clearly outperforms v7.1.x overall.
+
+### v7.3.0
+
+Motivation: v7.2.0 fixed first-step AR collapse but still degrades under longer action-conditioned rollouts, suggesting the remaining gap is limited multi-step self-conditioning rather than missing action response. 
+
+train.py:
+- Conservative AR extension: `BASE_SEQ_LEN: 2 → 3`, `AR_MAX_LEN: 1 → 2`. Training now uses 1 TF step followed by 2 AR steps.
+- Resuming from v7.2.0 @ step 240k weights, but optimizer and global step reset.
+
+diagnostics/inference_diagnostics.py:
+- Added action-transition diagnostics to measure what happens when the temporal buffer is primed with one action regime and then switched to another.
+- New transition pairs: `static→move_forward`, `static→jump`, `camera_right→move_forward`, `camera_right→static`, and `move_forward→static`.
+- Transition outputs now log pre/post sharpness, `max_prob`, and `input_unique_codes`, giving a more direct readout of buffer poisoning and recovery than the older camera-vs-static overlap metric alone.

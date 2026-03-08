@@ -103,15 +103,17 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.2.0: pure AR training, no TF, no curriculum) ---
-# v7.2.0: Remove TF entirely. BASE_SEQ_LEN=2 → 3 frames per sample (GT frame 0 as context;
-# model predicts frame 1 via TF step then frame 2 via AR step using its own frame 1 output).
-# AR_MAX_LEN=1 is fixed; curriculum and warmup are disabled.
-BASE_SEQ_LEN = 2
+# --- AR CURRICULUM (v7.3.0: conservative AR extension) ---
+# v7.3.0: Extend AR depth modestly from 1 to 2. BASE_SEQ_LEN=3 → 4 frames per sample.
+# ar_cutoff = K - AR_MAX_LEN = 3 - 2 = 1, so t=0 is the sole TF step;
+# t=1..2 are AR steps with model-sampled token feedback.
+# This tests whether a slightly deeper self-conditioning chain improves buffer robustness
+# without the much larger optimization jump of 7 consecutive AR steps.
+BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
 AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
-AR_MAX_LEN = 1
+AR_MAX_LEN = 2
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
@@ -139,14 +141,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.2.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.2.0"
+RUN_NAME = "v7.3.0-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.3.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 5000
 
-RESUME_CHECKPOINT_PATH = ""  # v7.0.5: Start fresh (no checkpoint resume)
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.2.0-step240k.pt"  # v7.3.0: Warm-start from v7.2.0 weights
+RESUME_MODEL_ONLY = True  # v7.3.0: Reset optimizer/global_step for the new loss geometry
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -167,7 +170,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.2.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.3.0"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -947,13 +950,14 @@ if RESUME_CHECKPOINT_PATH:
         raise KeyError("Resume checkpoint missing 'model_state' dict.")
     model.load_state_dict(resume_state, strict=True)
 
-    # Optimizer state (best-effort; allow continuing even if optimizer state is incompatible)
-    opt_state = resume_checkpoint.get("optimizer_state") if isinstance(resume_checkpoint, dict) else None
-    if isinstance(opt_state, dict):
-        try:
-            optimizer.load_state_dict(opt_state)
-        except Exception as e:
-            print(f"⚠️ Warning: could not load optimizer state ({type(e).__name__}: {e}); continuing with fresh optimizer.")
+    if not RESUME_MODEL_ONLY:
+        # Optimizer state (best-effort; allow continuing even if optimizer state is incompatible)
+        opt_state = resume_checkpoint.get("optimizer_state") if isinstance(resume_checkpoint, dict) else None
+        if isinstance(opt_state, dict):
+            try:
+                optimizer.load_state_dict(opt_state)
+            except Exception as e:
+                print(f"⚠️ Warning: could not load optimizer state ({type(e).__name__}: {e}); continuing with fresh optimizer.")
 
 # Losses
 semantic_criterion = SemanticCodebookLoss(codebook).to(DEVICE)
@@ -984,7 +988,7 @@ if isinstance(resume_checkpoint, dict):
 # TRAINING LOOP
 # ==========================================
 
-global_step = int(resume_checkpoint.get("global_step", 0)) if isinstance(resume_checkpoint, dict) else 0
+global_step = 0 if (isinstance(resume_checkpoint, dict) and RESUME_MODEL_ONLY) else int(resume_checkpoint.get("global_step", 0)) if isinstance(resume_checkpoint, dict) else 0
 run_start_global_step = global_step
 prev_seq_len = BASE_SEQ_LEN
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
