@@ -35,27 +35,27 @@ echo "📦 Checking dataset..."
 # Download to parent directory or current directory based on location
 if [[ $(basename "$PWD") == "project-ochre" ]]; then
     # Already in project-ochre, check parent directory for dataset
-    if [[ -d "../preprocessedv5_plains_clear" ]]; then
-        echo "✅ Dataset already exists at ../preprocessedv5_plains_clear, skipping download"
+    if [[ -d "../preprocessedv5" ]]; then
+        echo "✅ Dataset already exists at ../preprocessedv5, skipping download"
     else
         echo "📦 Downloading dataset to parent directory..."
         cd ..
-        gdown 1sqxDK2jHQu--pWH343l9gTzGnJozJLRX
-        tar -xvf preprocessedv5_plains_clear.tar
-        echo "✅ Dataset extracted to $(pwd)/preprocessedv5_plains_clear"
-        ls preprocessedv5_plains_clear | head -5
+        gdown 1nggXCV3ZJM_Ym-DrRcnjJ3KAtF6bSDLG
+        tar -xvf preprocessedv5.tar
+        echo "✅ Dataset extracted to $(pwd)/preprocessedv5"
+        ls preprocessedv5 | head -5
         cd project-ochre
     fi
 else
     # In parent directory
-    if [[ -d "preprocessedv5_plains_clear" ]]; then
-        echo "✅ Dataset already exists at ./preprocessedv5_plains_clear, skipping download"
+    if [[ -d "preprocessedv5" ]]; then
+        echo "✅ Dataset already exists at ./preprocessedv5, skipping download"
     else
         echo "📦 Downloading dataset..."
-        gdown 1sqxDK2jHQu--pWH343l9gTzGnJozJLRX
-        tar -xvf preprocessedv5_plains_clear.tar
-        echo "✅ Dataset extracted to $(pwd)/preprocessedv5_plains_clear"
-        ls preprocessedv5_plains_clear | head -5
+        gdown 1nggXCV3ZJM_Ym-DrRcnjJ3KAtF6bSDLG
+        tar -xvf preprocessedv5.tar
+        echo "✅ Dataset extracted to $(pwd)/preprocessedv5"
+        ls preprocessedv5 | head -5
     fi
 fi
 

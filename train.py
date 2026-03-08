@@ -34,7 +34,7 @@ if DEVICE == "cuda":
     print("Enabled cuDNN benchmark mode for performance")
 
 # --- PATHS ---
-DATA_DIR = "../preprocessedv5_plains_clear"
+DATA_DIR = "../preprocessedv5"
 VQVAE_PATH = "./checkpoints/vqvae_v2.1.6__epoch100.pt"
 MANIFEST_PATH = os.path.join(DATA_DIR, "manifest.json")
 
