@@ -103,17 +103,19 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.3.0: conservative AR extension) ---
-# v7.3.0: Extend AR depth modestly from 1 to 2. BASE_SEQ_LEN=3 → 4 frames per sample.
-# ar_cutoff = K - AR_MAX_LEN = 3 - 2 = 1, so t=0 is the sole TF step;
-# t=1..2 are AR steps with model-sampled token feedback.
-# This tests whether a slightly deeper self-conditioning chain improves buffer robustness
-# without the much larger optimization jump of 7 consecutive AR steps.
-BASE_SEQ_LEN = 3
+# --- AR CURRICULUM (v7.4.0: full AR depth matching) ---
+# v7.4.0: Match training AR depth to inference temporal buffer depth exactly.
+# TEMPORAL_CONTEXT_LEN=8, so AR_MAX_LEN=7 ensures the temporal buffer is fully
+# populated with model-generated states during training — matching inference exactly.
+# ar_cutoff = K - AR_MAX_LEN = 8 - 7 = 1, so t=0 is the sole TF step;
+# t=1..7 are AR steps (7 consecutive self-conditioned steps).
+# v7.3.0 (AR_MAX_LEN=2) regressed post_jump diversity vs v7.2.0 (1 AR step),
+# confirming that partial-match training is the worst of both worlds.
+BASE_SEQ_LEN = 8
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
 AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
-AR_MAX_LEN = 2
+AR_MAX_LEN = 7
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
@@ -121,6 +123,11 @@ MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 # label_smoothing=0.1 hard-caps max_prob at ~0.9001 (for C=1024 codes).
 LABEL_SMOOTHING = 0.1
 CE_WEIGHT = 1.0
+
+# v7.4.0: Selective LPIPS — only compute on TF step (t=0) and last AR step (t=K-1).
+# With 8 forward passes per step, computing LPIPS on all steps is expensive.
+# Intermediate AR steps (t=1..6) are supervised by CE + semantic loss only.
+LPIPS_AR_ENDPOINT_ONLY = True
 
 # v7.0.3: Run-local AR resize freeze.
 # When resuming from a checkpoint, relying only on GLOBAL step means the AR curriculum can immediately start
@@ -141,15 +148,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.3.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.3.0"
+RUN_NAME = "v7.4.0-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.4.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 5000
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.2.0-step240k.pt"  # v7.3.0: Warm-start from v7.2.0 weights
-RESUME_MODEL_ONLY = True  # v7.3.0: Reset optimizer/global_step for the new loss geometry
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.2.0-step240k.pt"  # v7.4.0: Warm-start from v7.2.0 (better diversity than v7.3.0@255k)
+RESUME_MODEL_ONLY = True  # v7.4.0: Reset optimizer/global_step for the new loss geometry
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -170,7 +177,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.3.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.4.0"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -1172,22 +1179,26 @@ while global_step < MAX_STEPS:
             t_sem_total += (time.perf_counter() - t_sem_start)
 
             # B. LPIPS Loss
+            # v7.4.0: Skip LPIPS entirely for intermediate AR steps when LPIPS_AR_ENDPOINT_ONLY=True.
+            # This avoids the Gumbel decode + VQ-VAE decode + lpips_criterion forward pass on steps t=1..K-2.
             t_lpips_start = time.perf_counter()
-            lpips_use_soft = (current_tau > LPIPS_SOFT_TAU_THRESHOLD) and (not (LPIPS_SOFT_TF_ONLY and is_ar_step))
-            probs = F.gumbel_softmax(logits_flat, tau=current_tau, hard=not lpips_use_soft, dim=-1)
-            probs = probs.reshape(B, H, W, -1)
-            soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
-            pred_rgb = vqvae_model.decoder(soft_emb)
+            _compute_lpips = not (is_ar_step and LPIPS_AR_ENDPOINT_ONLY and t != K - 1)
+            if _compute_lpips:
+                lpips_use_soft = (current_tau > LPIPS_SOFT_TAU_THRESHOLD) and (not (LPIPS_SOFT_TF_ONLY and is_ar_step))
+                probs = F.gumbel_softmax(logits_flat, tau=current_tau, hard=not lpips_use_soft, dim=-1)
+                probs = probs.reshape(B, H, W, -1)
+                soft_emb = torch.matmul(probs, codebook).permute(0, 3, 1, 2)
+                pred_rgb = vqvae_model.decoder(soft_emb)
 
-            # v7.0.5: Use pre-decoded target (already computed before loop)
-            tgt_rgb = tgt_rgb_all[:, t]
+                # v7.0.5: Use pre-decoded target (already computed before loop)
+                tgt_rgb = tgt_rgb_all[:, t]
 
-            lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
+                lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
 
-            if is_ar_step:
-                loss_lpips_ar_list.append(lpips_val)
-            else:
-                loss_lpips_tf_list.append(lpips_val)
+                if is_ar_step:
+                    loss_lpips_ar_list.append(lpips_val)
+                else:
+                    loss_lpips_tf_list.append(lpips_val)
             t_lpips_total += (time.perf_counter() - t_lpips_start)
 
             # C. IDM Loss

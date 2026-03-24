@@ -964,3 +964,21 @@ diagnostics/inference_diagnostics.py:
 - Added action-transition diagnostics to measure what happens when the temporal buffer is primed with one action regime and then switched to another.
 - New transition pairs: `static→move_forward`, `static→jump`, `camera_right→move_forward`, `camera_right→static`, and `move_forward→static`.
 - Transition outputs now log pre/post sharpness, `max_prob`, and `input_unique_codes`, giving a more direct readout of buffer poisoning and recovery than the older camera-vs-static overlap metric alone.
+
+Results (live inference @ 255k, seeds 1000/1001/1002; v7.2.0@240k as baseline — same seeds, same conditions):
+- avg_max_prob: 0.329 / 0.219 / 0.447 (v7.2.0: 0.498 / 0.414 / 0.425) — lower on seeds 1000/1001, slightly higher on 1002
+- consistency: 0.320 / 0.272 / 0.437 (v7.2.0: 0.447 / 0.428 / 0.334)
+- action_effect: 0.311 / 0.248 / 0.277 (v7.2.0: 0.308 / 0.260 / 0.257)
+- static→jump post_au (argmax_unique[-1]): 49 / 29 / 28 (v7.2.0: 40 / 13 / 30)
+- Seeds 1000 and 1001 improved on nearly all transitions vs v7.2.0. Seed 1002 camera transitions regressed (camera_right→move_fwd: 38→24; camera_right→static: 38→18).
+- Note: an earlier summary mislabeled `input_unique_codes[-1]` (57/59/67) as post_au; correct v7.2.0 post_au baseline is 40/13/30.
+- Conclusion: incremental AR depth (1→2 steps) produced partial, real improvement but did not close the 6-step training/inference temporal buffer gap.
+
+### v7.4.0
+
+Motivation: v7.3.0 showed that increasing AR depth from 1→2 steps improved post-transition diversity on seeds 1000 and 1001. The training/inference gap remains (2 training AR steps vs 8 inference buffer slots). Full depth matching tests whether closing this gap completely achieves convergent improvement across all seeds and transitions.
+
+train.py:
+- Full AR depth matching: `BASE_SEQ_LEN: 3 → 8`, `AR_MAX_LEN: 2 → 7`. 9 frames per sample, K=8 forward passes per step. t=0 is the sole TF step; t=1..7 are 7 consecutive AR steps. At inference TEMPORAL_CONTEXT_LEN=8, so training now fills the temporal buffer with 7 AR-generated states per sample.
+- Selective LPIPS (`LPIPS_AR_ENDPOINT_ONLY = True`): LPIPS computed only at t=0 (TF) and t=K-1 (last AR step). Intermediate AR steps (t=1..6) are supervised by CE + semantic loss only. The forward pass is skipped entirely for intermediate steps (guard placed before Gumbel decode + VQ-VAE decode + lpips_criterion).
+- Warm-start from v7.2.0@240k (not v7.3.0@255k). Optimizer and global step reset.
