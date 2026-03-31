@@ -982,3 +982,35 @@ train.py:
 - Full AR depth matching: `BASE_SEQ_LEN: 3 → 8`, `AR_MAX_LEN: 2 → 7`. 9 frames per sample, K=8 forward passes per step. t=0 is the sole TF step; t=1..7 are 7 consecutive AR steps. At inference TEMPORAL_CONTEXT_LEN=8, so training now fills the temporal buffer with 7 AR-generated states per sample.
 - Selective LPIPS (`LPIPS_AR_ENDPOINT_ONLY = True`): LPIPS computed only at t=0 (TF) and t=K-1 (last AR step). Intermediate AR steps (t=1..6) are supervised by CE + semantic loss only. The forward pass is skipped entirely for intermediate steps (guard placed before Gumbel decode + VQ-VAE decode + lpips_criterion).
 - Warm-start from v7.2.0@240k (not v7.3.0@255k). Optimizer and global step reset.
+
+Results (live inference @ 270k, seeds 1000/1001/1002/1728; rerun diagnostics):
+- avg_max_prob: ≈0.20 across seeds — best calibration of any v7.x model
+- consistency: ≈0.29 — lower than v7.3.0 (0.32), lower than v7.2.0 (0.43)
+- static→jump post_au: 40 / 26 / 24 / 30 (v7.3.0: 48 / 29 / 28 / 39) — **regressed vs v7.3.0**, effectively back to the v7.2.0 mean
+- camera_right→move_fwd post_au: avg 29.0 (v7.3.0: avg 38.75) — regressed
+- camera_right→static post_au: avg 28.5 (v7.3.0: avg 37.0) — regressed
+- static→jump post_input_unique: avg 88.0, equal to v7.3.0 and far above v7.2.0 (68.3) — buffers stay broad, but greedy recovery still fails
+- action_effect: 0.21–0.25 — preserved, but lower than v7.2.0 mean and not clearly better than v7.3.0
+- High-variance across training: best single checkpoint ≈215k (post_au 52/36 for seeds 1000/1001); never stable
+
+Post-mortem: v7.4.0 achieved better calibration but worse transition controllability than v7.3.0. Full AR depth matching (7 steps) produced "more diffuse, not more useful" outputs: lower confidence, broader latent support, but weaker post-transition greedy structure. The training/inference AR depth gap is not the primary bottleneck. Remaining problem is transition-specific supervision and action disentanglement.
+
+### v7.5.0
+
+Motivation: v7.4.0 falsified the "more AR depth" hypothesis. The next best explanation is that the model is under-supervised on regime changes and isolated action effects. v7.5.0 keeps the anti-collapse recipe and the stronger v7.3.0-style AR regime, then changes the training distribution instead of the architecture.
+
+train.py:
+- Return to modest AR depth: `BASE_SEQ_LEN: 8 → 3`, `AR_MAX_LEN: 7 → 2`. This restores the v7.3.0-style training regime, which was the strongest recent baseline on transition recovery.
+- Restore LPIPS on all steps: `LPIPS_AR_ENDPOINT_ONLY: True → False`. v7.5.0 changes the sampler, not perceptual supervision.
+- Transition-aware + action-balance sampling via `WeightedRandomSampler`. Every candidate window is bucketed as `transition`, `movement_only`, `camera_only`, `combined`, or `static` using the window's action sequence.
+- Conservative target mix for the first run: `transition 30%`, `movement_only 20%`, `camera_only 20%`, `combined 25%`, `static 5%`. This pressures the model toward transitions without over-suppressing the dominant combined-action regime.
+- Warm-start from `v7.3.0@255k`, model-only resume, with new outputs under `diagnostics/runs/v7.5.0`.
+
+Rationale:
+- v7.3.0 was the best recent run on actual transition-recovery metrics.
+- v7.4.0 showed deeper AR mostly changes calibration, not the missing capability.
+- Sampling changes are the lowest-risk way to directly target the remaining failure: post-transition controllability.
+- The first v7.5.0 sampler is intentionally moderate because over-downsampling combined camera+movement windows could hurt realism and overall action response.
+
+Open question to monitor:
+- With `BASE_SEQ_LEN=3`, v7.5.0 mainly tests whether improving immediate post-transition supervision improves the start of the rollout. If it helps short-horizon recovery but not full 20-frame transitions, the next follow-up should keep the sampler and increase sequence length to include a longer post-transition tail.

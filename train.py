@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.cuda.amp import autocast, GradScaler
 from torchvision.utils import make_grid
 
@@ -103,19 +103,15 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.4.0: full AR depth matching) ---
-# v7.4.0: Match training AR depth to inference temporal buffer depth exactly.
-# TEMPORAL_CONTEXT_LEN=8, so AR_MAX_LEN=7 ensures the temporal buffer is fully
-# populated with model-generated states during training — matching inference exactly.
-# ar_cutoff = K - AR_MAX_LEN = 8 - 7 = 1, so t=0 is the sole TF step;
-# t=1..7 are AR steps (7 consecutive self-conditioned steps).
-# v7.3.0 (AR_MAX_LEN=2) regressed post_jump diversity vs v7.2.0 (1 AR step),
-# confirming that partial-match training is the worst of both worlds.
-BASE_SEQ_LEN = 8
+# --- AR CURRICULUM (v7.5.0: keep modest AR depth; change the data distribution instead) ---
+# v7.4.0 showed that increasing AR depth from 2 -> 7 improved calibration but did not
+# improve transition recovery. v7.5.0 therefore returns to the v7.3.0-style AR regime
+# and targets transition/action supervision via sampling.
+BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
 AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
-AR_MAX_LEN = 7
+AR_MAX_LEN = 2
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
@@ -124,10 +120,19 @@ MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 LABEL_SMOOTHING = 0.1
 CE_WEIGHT = 1.0
 
-# v7.4.0: Selective LPIPS — only compute on TF step (t=0) and last AR step (t=K-1).
-# With 8 forward passes per step, computing LPIPS on all steps is expensive.
-# Intermediate AR steps (t=1..6) are supervised by CE + semantic loss only.
-LPIPS_AR_ENDPOINT_ONLY = True
+# v7.5.0: keep perceptual supervision on all steps while changing only the sampler.
+LPIPS_AR_ENDPOINT_ONLY = False
+
+# --- v7.5.0 SAMPLING ---
+# Reweight window sampling toward transition windows and isolated-action supervision.
+SAMPLER_MODE = "transition_action_balance"   # "uniform" | "transition_action_balance"
+SAMPLER_TARGET_MIX = {
+    "transition": 0.30,
+    "movement_only": 0.20,
+    "camera_only": 0.20,
+    "combined": 0.25,
+    "static": 0.05,
+}
 
 # v7.0.3: Run-local AR resize freeze.
 # When resuming from a checkpoint, relying only on GLOBAL step means the AR curriculum can immediately start
@@ -148,15 +153,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.4.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.4.0"
+RUN_NAME = "v7.5.0-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.5.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 5000
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.2.0-step240k.pt"  # v7.4.0: Warm-start from v7.2.0 (better diversity than v7.3.0@255k)
-RESUME_MODEL_ONLY = True  # v7.4.0: Reset optimizer/global_step for the new loss geometry
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.3.0-step255k.pt"
+RESUME_MODEL_ONLY = True
 
 # Action validation
 ACTION_VALIDATION_STEPS = [1, 5, 10]
@@ -177,7 +182,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.4.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.0"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -488,6 +493,33 @@ class SemanticCodebookLoss(nn.Module):
         return F.mse_loss(pred_vectors, target_vectors)
 
 
+WINDOW_BUCKETS = ("transition", "movement_only", "camera_only", "combined", "static")
+STABLE_WINDOW_BUCKETS = ("camera_only", "movement_only", "combined", "static")
+
+
+def classify_action_frames(actions: np.ndarray) -> np.ndarray:
+    """Vectorized frame-level action classification."""
+    yaw_center = actions[:, 2] > 0.5
+    pitch_center = actions[:, 6] > 0.5
+    camera_neutral = yaw_center & pitch_center
+    movement_active = np.any(actions[:, 8:15] > 0.5, axis=1)
+
+    labels = np.full(actions.shape[0], 3, dtype=np.uint8)  # static
+    labels[camera_neutral & movement_active] = 1           # movement_only
+    labels[~camera_neutral & ~movement_active] = 0         # camera_only
+    labels[~camera_neutral & movement_active] = 2          # combined
+    return labels
+
+
+def classify_window_bucket(frame_labels: np.ndarray) -> str:
+    """Bucket a training window by whether it is stable or contains a regime switch."""
+    if frame_labels.size == 0:
+        return "static"
+    if np.all(frame_labels == frame_labels[0]):
+        return STABLE_WINDOW_BUCKETS[int(frame_labels[0])]
+    return "transition"
+
+
 class GTTokenDataset(Dataset):
     """Dataset for pre-tokenized sequences."""
     def __init__(self, manifest_path, root_dir, seq_len=16):
@@ -496,11 +528,28 @@ class GTTokenDataset(Dataset):
         self.root_dir = root_dir
         self.seq_len = seq_len
         self.index_map = []
+        self.window_buckets = []
+        self.bucket_indices = {name: [] for name in WINDOW_BUCKETS}
         for vid_idx, meta in enumerate(self.entries):
             L = meta["length"]
-            if L > seq_len + 1:
-                for i in range(L - (seq_len + 1)):
-                    self.index_map.append((vid_idx, i))
+            max_start = L - (seq_len + 1)
+            if max_start <= 0:
+                continue
+
+            path = os.path.join(self.root_dir, meta["file"])
+            try:
+                with np.load(path, mmap_mode='r') as data:
+                    actions = np.array(data["actions"][:], dtype=np.float32)
+            except Exception:
+                with np.load(path) as data:
+                    actions = np.array(data["actions"][:], dtype=np.float32)
+
+            frame_labels = classify_action_frames(actions)
+            for i in range(max_start):
+                bucket = classify_window_bucket(frame_labels[i:i + seq_len])
+                self.bucket_indices[bucket].append(len(self.index_map))
+                self.window_buckets.append(bucket)
+                self.index_map.append((vid_idx, i))
 
     def __len__(self):
         return len(self.index_map)
@@ -527,6 +576,46 @@ class GTTokenDataset(Dataset):
             torch.tensor(actions.astype(np.float32), dtype=torch.float32),
             torch.tensor(Z_target.astype(np.int32), dtype=torch.long),
         )
+
+
+def build_loader(dataset: GTTokenDataset) -> DataLoader:
+    sampler = None
+    shuffle = True
+    if SAMPLER_MODE == "transition_action_balance":
+        weights = np.zeros(len(dataset), dtype=np.float64)
+        for bucket, target in SAMPLER_TARGET_MIX.items():
+            bucket_indices = dataset.bucket_indices.get(bucket, [])
+            if not bucket_indices:
+                continue
+            weights[bucket_indices] = float(target) / float(len(bucket_indices))
+
+        nonzero = weights > 0
+        if np.any(nonzero):
+            min_nonzero = weights[nonzero].min()
+            weights[~nonzero] = min_nonzero
+            sampler = WeightedRandomSampler(
+                weights=torch.from_numpy(weights),
+                num_samples=len(dataset),
+                replacement=True,
+            )
+            shuffle = False
+
+            print("Sampling buckets:")
+            for bucket in WINDOW_BUCKETS:
+                count = len(dataset.bucket_indices.get(bucket, []))
+                target = SAMPLER_TARGET_MIX.get(bucket, 0.0)
+                frac = count / max(1, len(dataset))
+                print(f"  - {bucket}: count={count} ({frac:.1%}), target={target:.1%}")
+
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
 
 def log_images_to_wandb(vqvae, Z_target, logits, global_step):
@@ -999,13 +1088,13 @@ global_step = 0 if (isinstance(resume_checkpoint, dict) and RESUME_MODEL_ONLY) e
 run_start_global_step = global_step
 prev_seq_len = BASE_SEQ_LEN
 dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=prev_seq_len)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                    num_workers=4, pin_memory=True, persistent_workers=True)
+loader = build_loader(dataset)
 loader_iter = iter(loader)
 
 print(f"Training Start")
 print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
 print(f"  - AR: fixed ar_len={AR_MAX_LEN}, seq_len={BASE_SEQ_LEN} (pure AR, no curriculum)")
+print(f"  - Sampler: {SAMPLER_MODE}")
 
 model.train()
 prev_lpips_tf = 0.0
@@ -1057,8 +1146,7 @@ while global_step < MAX_STEPS:
             gc.collect()  # Force cleanup of worker processes
 
         dataset = GTTokenDataset(MANIFEST_PATH, DATA_DIR, seq_len=seq_len)
-        loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                           num_workers=4, pin_memory=True, persistent_workers=True)
+        loader = build_loader(dataset)
         loader_iter = iter(loader)
 
     # 2. Get Batch
