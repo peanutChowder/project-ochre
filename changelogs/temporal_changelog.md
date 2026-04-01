@@ -1014,3 +1014,20 @@ Rationale:
 
 Open question to monitor:
 - With `BASE_SEQ_LEN=3`, v7.5.0 mainly tests whether improving immediate post-transition supervision improves the start of the rollout. If it helps short-horizon recovery but not full 20-frame transitions, the next follow-up should keep the sampler and increase sequence length to include a longer post-transition tail.
+
+### v7.5.1
+
+Motivation: `v7.5.0` validated the transition-aware sampling direction and improved both control and relative visual metrics, but absolute picture quality remains weak: outputs are still grainy, block edges are not stable enough, and predicted token diversity in visual eval remains far below GT. Since quality is now the main concern, the next run keeps the successful `v7.5.0` recipe and adds a direct sharpness-oriented signal instead of changing AR depth or the sampler again.
+
+train.py:
+- Keep the `v7.5.0` base intact: same sampler, `BASE_SEQ_LEN=3`, `AR_MAX_LEN=2`, LPIPS on all steps.
+- Add explicit edge-preservation loss: decode predicted/GT RGB, compute Sobel edge magnitude maps, and apply `L1` loss on edges. New metrics: `train/loss_edge`, `train/loss_edge_tf`, `train/loss_edge_ar`.
+- Resume from `v7.5.0@270k` with model-only resume.
+
+Rationale:
+- `v7.5.0` already answered the sampler question positively; reopening that axis would blur attribution.
+- Edge loss is a more direct lever for blurry / unstable block boundaries than another AR-depth or sampler change.
+- This run intentionally prioritizes visual fidelity while preserving the newly recovered action responsiveness.
+
+Open question to monitor:
+- This tests a different hypothesis than the earlier "increase seq_len after sampler success" follow-up. If `v7.5.1` improves visual metrics (LPIPS / edge F1 / qualitative sharpness) but not transition `post_au`, that would suggest picture quality and long-horizon transition recovery are now separate bottlenecks, and the seq_len hypothesis should be revisited next.

@@ -57,6 +57,7 @@ SEMANTIC_WEIGHT = 1.0     # v7.0.2: Restored - essential to prevent mode collaps
 LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was strongest action in v4.x)
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
+EDGE_WEIGHT = 1.0         # v7.5.1: Explicit edge-preservation loss to sharpen block boundaries
 
 # --- v7.1.1 ANTI-COLLAPSE TRAINING ---
 # Objective: prevent AR rollouts from collapsing to a tiny, overconfident code subset.
@@ -103,10 +104,9 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.5.0: keep modest AR depth; change the data distribution instead) ---
-# v7.4.0 showed that increasing AR depth from 2 -> 7 improved calibration but did not
-# improve transition recovery. v7.5.0 therefore returns to the v7.3.0-style AR regime
-# and targets transition/action supervision via sampling.
+# --- AR CURRICULUM (v7.5.1: keep modest AR depth; refine visual quality) ---
+# v7.5.0 showed that the sampler change improved transition recovery and relative
+# visual quality. v7.5.1 keeps that regime and adds explicit edge supervision.
 BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
@@ -120,10 +120,10 @@ MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 LABEL_SMOOTHING = 0.1
 CE_WEIGHT = 1.0
 
-# v7.5.0: keep perceptual supervision on all steps while changing only the sampler.
+# v7.5.1: keep perceptual supervision on all steps while adding explicit edge loss.
 LPIPS_AR_ENDPOINT_ONLY = False
 
-# --- v7.5.0 SAMPLING ---
+# --- v7.5.1 SAMPLING ---
 # Reweight window sampling toward transition windows and isolated-action supervision.
 SAMPLER_MODE = "transition_action_balance"   # "uniform" | "transition_action_balance"
 SAMPLER_TARGET_MIX = {
@@ -153,15 +153,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.5.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.5.0"
+RUN_NAME = "v7.5.1-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.5.1"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
-MILESTONE_SAVE_STEPS = 20000
+MILESTONE_SAVE_STEPS = 10_000
 MAX_SAVED_CHECKPOINTS = 40
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.3.0-step255k.pt"
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.0-step270k.pt"
 RESUME_MODEL_ONLY = True
 
 # Action validation
@@ -183,7 +183,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.1"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -289,6 +289,28 @@ def sample_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int | N
         chosen = torch.multinomial(probs.reshape(-1, C), num_samples=1).view(B, -1)  # (B, HW)
 
     return chosen.view(B, H, W).long()
+
+
+def rgb_to_edge_map(rgb: torch.Tensor) -> torch.Tensor:
+    """Sobel edge magnitude on decoded RGB frames."""
+    gray = 0.2989 * rgb[:, 0:1] + 0.5870 * rgb[:, 1:2] + 0.1140 * rgb[:, 2:3]
+    kernel_x = torch.tensor(
+        [[1.0, 0.0, -1.0],
+         [2.0, 0.0, -2.0],
+         [1.0, 0.0, -1.0]],
+        device=rgb.device,
+        dtype=rgb.dtype,
+    ).view(1, 1, 3, 3)
+    kernel_y = torch.tensor(
+        [[1.0, 2.0, 1.0],
+         [0.0, 0.0, 0.0],
+         [-1.0, -2.0, -1.0]],
+        device=rgb.device,
+        dtype=rgb.dtype,
+    ).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, kernel_x, padding=1)
+    gy = F.conv2d(gray, kernel_y, padding=1)
+    return torch.sqrt(gx.square() + gy.square() + 1e-8)
 
 
 def marginal_kl_to_uniform_from_logits(logits: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
@@ -1093,7 +1115,7 @@ loader = build_loader(dataset)
 loader_iter = iter(loader)
 
 print(f"Training Start")
-print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
+print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + Edge({EDGE_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
 print(f"  - AR: fixed ar_len={AR_MAX_LEN}, seq_len={BASE_SEQ_LEN} (pure AR, no curriculum)")
 print(f"  - Sampler: {SAMPLER_MODE}")
 
@@ -1185,6 +1207,8 @@ while global_step < MAX_STEPS:
         loss_ce_list = []
         loss_lpips_tf_list = []
         loss_lpips_ar_list = []
+        loss_edge_tf_list = []
+        loss_edge_ar_list = []
         loss_idm_list = []
 
         ar_cutoff = K - ar_len
@@ -1283,11 +1307,14 @@ while global_step < MAX_STEPS:
                 tgt_rgb = tgt_rgb_all[:, t]
 
                 lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
+                edge_val = F.l1_loss(rgb_to_edge_map(pred_rgb), rgb_to_edge_map(tgt_rgb))
 
                 if is_ar_step:
                     loss_lpips_ar_list.append(lpips_val)
+                    loss_edge_ar_list.append(edge_val)
                 else:
                     loss_lpips_tf_list.append(lpips_val)
+                    loss_edge_tf_list.append(edge_val)
             t_lpips_total += (time.perf_counter() - t_lpips_start)
 
             # C. IDM Loss
@@ -1334,9 +1361,12 @@ while global_step < MAX_STEPS:
         loss_ce_total = torch.stack(loss_ce_list).mean() if loss_ce_list else torch.tensor(0.0, device=DEVICE)
         loss_lpips_tf = torch.stack(loss_lpips_tf_list).mean() if loss_lpips_tf_list else torch.tensor(0.0, device=DEVICE)
         loss_lpips_ar = torch.stack(loss_lpips_ar_list).mean() if loss_lpips_ar_list else torch.tensor(0.0, device=DEVICE)
+        loss_edge_tf = torch.stack(loss_edge_tf_list).mean() if loss_edge_tf_list else torch.tensor(0.0, device=DEVICE)
+        loss_edge_ar = torch.stack(loss_edge_ar_list).mean() if loss_edge_ar_list else torch.tensor(0.0, device=DEVICE)
         loss_idm_total = torch.stack(loss_idm_list).mean() if loss_idm_list else torch.tensor(0.0, device=DEVICE)
 
         loss_lpips_total = loss_lpips_tf + AR_LOSS_WEIGHT * loss_lpips_ar
+        loss_edge_total = loss_edge_tf + AR_LOSS_WEIGHT * loss_edge_ar
 
         # v7.0.5: Track for curriculum as tensors (avoid GPU->CPU sync every step)
         # Only sync when curriculum.update() needs the values
@@ -1373,6 +1403,7 @@ while global_step < MAX_STEPS:
         total_loss = (SEMANTIC_WEIGHT * loss_sem_total +
                      CE_WEIGHT * loss_ce_total +
                      LPIPS_WEIGHT * loss_lpips_total +
+                     EDGE_WEIGHT * loss_edge_total +
                      IDM_LOSS_WEIGHT * loss_idm_total +
                      DIV_REG_WEIGHT * loss_div_reg +
                      REP_REG_WEIGHT * loss_rep_reg)
@@ -1463,6 +1494,9 @@ while global_step < MAX_STEPS:
                 "train/loss_lpips": loss_lpips_total.item(),
                 "train/loss_lpips_tf": loss_lpips_tf.item(),
                 "train/loss_lpips_ar": loss_lpips_ar.item(),
+                "train/loss_edge": loss_edge_total.item(),
+                "train/loss_edge_tf": loss_edge_tf.item(),
+                "train/loss_edge_ar": loss_edge_ar.item(),
                 "train/loss_idm": loss_idm_total.item(),
                 "train/loss_div_reg": loss_div_reg.item(),
                 "train/loss_rep_reg": loss_rep_reg.item(),
