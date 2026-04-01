@@ -158,7 +158,8 @@ MODEL_OUT_PREFIX = "ochre-v7.5.0"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
-MILESTONE_SAVE_STEPS = 5000
+MILESTONE_SAVE_STEPS = 20000
+MAX_SAVED_CHECKPOINTS = 40
 
 RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.3.0-step255k.pt"
 RESUME_MODEL_ONLY = True
@@ -1553,11 +1554,6 @@ while global_step < MAX_STEPS:
             model.train()
 
     if global_step % MILESTONE_SAVE_STEPS == 0 and global_step > 0:
-        # Remove old checkpoint if it exists
-        old_checkpoint = f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step - MILESTONE_SAVE_STEPS}.pt"
-        if os.path.exists(old_checkpoint):
-            os.remove(old_checkpoint)
-
         torch.save({
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
@@ -1576,6 +1572,14 @@ while global_step < MAX_STEPS:
             }
         }, f"./checkpoints/{MODEL_OUT_PREFIX}-step{global_step//1000}k.pt")
         print(f"Saved checkpoint: {MODEL_OUT_PREFIX}-step{global_step//1000}k.pt")
+
+        # Prune oldest checkpoint once we exceed MAX_SAVED_CHECKPOINTS
+        ckpt_dir = "./checkpoints"
+        saved = sorted(f for f in (os.path.join(ckpt_dir, n) for n in os.listdir(ckpt_dir))
+                       if os.path.isfile(f) and os.path.basename(f).startswith(f"{MODEL_OUT_PREFIX}-step") and f.endswith(".pt"))
+        if len(saved) > MAX_SAVED_CHECKPOINTS:
+            os.remove(saved[0])
+            print(f"Pruned oldest checkpoint: {saved[0]}")
 
     global_step += 1
 
