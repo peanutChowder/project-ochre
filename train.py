@@ -46,7 +46,7 @@ TEMPORAL_CONTEXT_LEN = 8
 WINDOW_SIZE = 4
 
 # --- TRAINING HYPERPARAMETERS ---
-BATCH_SIZE = 8            # Reduced to prevent OOM
+BATCH_SIZE = 24            # Reduced to prevent OOM
 MAX_STEPS = 300_000
 LR = 1e-4                 # Higher than ConvGRU - transformers tolerate more
 WARMUP_STEPS = 2000       # Longer warmup for transformer stability
@@ -161,7 +161,7 @@ IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 10_000
 MAX_SAVED_CHECKPOINTS = 40
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.0-step270k.pt"
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.1-step30k.pt"
 RESUME_MODEL_ONLY = True
 
 # Action validation
