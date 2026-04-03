@@ -1031,3 +1031,20 @@ Rationale:
 
 Open question to monitor:
 - This tests a different hypothesis than the earlier "increase seq_len after sampler success" follow-up. If `v7.5.1` improves visual metrics (LPIPS / edge F1 / qualitative sharpness) but not transition `post_au`, that would suggest picture quality and long-horizon transition recovery are now separate bottlenecks, and the seq_len hypothesis should be revisited next.
+
+### v7.5.2
+
+Motivation: `v7.5.1` substantially improved per-frame picture quality, but the remaining failure is temporal scene maintenance: edges shimmer, block boundaries move around between adjacent frames, and otherwise good-looking scenes dissolve into fuzzy shaking. The next run therefore targets temporal stability directly rather than adding more single-frame sharpness or changing AR depth again.
+
+train.py:
+- Keep the `v7.5.1` base intact: same sampler, `BASE_SEQ_LEN=3`, `AR_MAX_LEN=2`, LPIPS on all steps, and single-frame edge loss.
+- Add temporal edge-delta consistency loss: compare frame-to-frame changes in predicted Sobel edge maps against GT edge-map changes. New metrics: `train/loss_temporal_edge`, `train/loss_temporal_edge_tf`, `train/loss_temporal_edge_ar`.
+- Resume from `v7.5.1@240k` with model-only resume, since `240k` is the best current overall checkpoint when quality is prioritized.
+
+Rationale:
+- `v7.5.1` already improved sharpness, LPIPS, edge F1, PSNR, and token accuracy; the remaining bottleneck is no longer per-frame fidelity.
+- Flicker is a cross-frame failure, so the next supervision signal should target temporal change structure rather than another static-image proxy.
+- Matching edge deltas encourages coherent persistence without forcing adjacent frames to be identical, preserving the possibility of real camera and movement motion.
+
+Open question to monitor:
+- If `v7.5.2` lowers edge flicker but also damps true motion or weakens action responsiveness, the temporal-consistency weight is too strong. If it preserves sharpness but flicker remains high, the remaining bottleneck is likely longer-horizon supervision rather than local temporal consistency alone.

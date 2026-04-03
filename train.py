@@ -58,6 +58,7 @@ LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was stronge
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 EDGE_WEIGHT = 1.0         # v7.5.1: Explicit edge-preservation loss to sharpen block boundaries
+TEMPORAL_EDGE_WEIGHT = 0.5  # v7.5.2: Match frame-to-frame edge changes to reduce shimmer/flicker
 
 # --- v7.1.1 ANTI-COLLAPSE TRAINING ---
 # Objective: prevent AR rollouts from collapsing to a tiny, overconfident code subset.
@@ -104,9 +105,9 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.5.1: keep modest AR depth; refine visual quality) ---
-# v7.5.0 showed that the sampler change improved transition recovery and relative
-# visual quality. v7.5.1 keeps that regime and adds explicit edge supervision.
+# --- AR CURRICULUM (v7.5.2: keep modest AR depth; refine temporal visual stability) ---
+# v7.5.0 improved transition recovery and v7.5.1 improved per-frame quality.
+# v7.5.2 keeps that regime and adds temporal edge consistency to reduce flicker.
 BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
@@ -120,10 +121,10 @@ MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 LABEL_SMOOTHING = 0.1
 CE_WEIGHT = 1.0
 
-# v7.5.1: keep perceptual supervision on all steps while adding explicit edge loss.
+# v7.5.2: keep perceptual supervision on all steps while adding explicit edge losses.
 LPIPS_AR_ENDPOINT_ONLY = False
 
-# --- v7.5.1 SAMPLING ---
+# --- v7.5.2 SAMPLING ---
 # Reweight window sampling toward transition windows and isolated-action supervision.
 SAMPLER_MODE = "transition_action_balance"   # "uniform" | "transition_action_balance"
 SAMPLER_TARGET_MIX = {
@@ -153,15 +154,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.5.1-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.5.1"
+RUN_NAME = "v7.5.2-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.5.2"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 10_000
 MAX_SAVED_CHECKPOINTS = 40
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.1-step30k.pt"
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.1-step240k.pt"
 RESUME_MODEL_ONLY = True
 
 # Action validation
@@ -183,7 +184,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.1"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.2"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -311,6 +312,17 @@ def rgb_to_edge_map(rgb: torch.Tensor) -> torch.Tensor:
     gx = F.conv2d(gray, kernel_x, padding=1)
     gy = F.conv2d(gray, kernel_y, padding=1)
     return torch.sqrt(gx.square() + gy.square() + 1e-8)
+
+
+def temporal_edge_delta_loss(
+    pred_edge: torch.Tensor,
+    prev_pred_edge: torch.Tensor,
+    tgt_edge: torch.Tensor,
+    prev_tgt_edge: torch.Tensor,
+) -> torch.Tensor:
+    pred_delta = pred_edge - prev_pred_edge
+    tgt_delta = tgt_edge - prev_tgt_edge
+    return F.l1_loss(pred_delta, tgt_delta)
 
 
 def marginal_kl_to_uniform_from_logits(logits: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
@@ -1115,7 +1127,11 @@ loader = build_loader(dataset)
 loader_iter = iter(loader)
 
 print(f"Training Start")
-print(f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + LPIPS({LPIPS_WEIGHT}) + Edge({EDGE_WEIGHT}) + IDM({IDM_LOSS_WEIGHT})")
+print(
+    f"  - Losses: Semantic({SEMANTIC_WEIGHT}) + CE(ls={LABEL_SMOOTHING}, w={CE_WEIGHT}) + "
+    f"LPIPS({LPIPS_WEIGHT}) + Edge({EDGE_WEIGHT}) + TemporalEdge({TEMPORAL_EDGE_WEIGHT}) + "
+    f"IDM({IDM_LOSS_WEIGHT})"
+)
 print(f"  - AR: fixed ar_len={AR_MAX_LEN}, seq_len={BASE_SEQ_LEN} (pure AR, no curriculum)")
 print(f"  - Sampler: {SAMPLER_MODE}")
 
@@ -1209,11 +1225,15 @@ while global_step < MAX_STEPS:
         loss_lpips_ar_list = []
         loss_edge_tf_list = []
         loss_edge_ar_list = []
+        loss_temporal_edge_tf_list = []
+        loss_temporal_edge_ar_list = []
         loss_idm_list = []
 
         ar_cutoff = K - ar_len
         temporal_buffer = []
         h_buffer = []  # For IDM
+        prev_pred_edge = None
+        prev_tgt_edge = None
         logits_last = None
         logits_tf_last = None
         logits_ar_last = None
@@ -1307,14 +1327,25 @@ while global_step < MAX_STEPS:
                 tgt_rgb = tgt_rgb_all[:, t]
 
                 lpips_val = lpips_criterion(pred_rgb * 2 - 1, tgt_rgb * 2 - 1).mean()
-                edge_val = F.l1_loss(rgb_to_edge_map(pred_rgb), rgb_to_edge_map(tgt_rgb))
+                pred_edge = rgb_to_edge_map(pred_rgb)
+                tgt_edge = rgb_to_edge_map(tgt_rgb)
+                edge_val = F.l1_loss(pred_edge, tgt_edge)
+                temporal_edge_val = None
+                if prev_pred_edge is not None and prev_tgt_edge is not None:
+                    temporal_edge_val = temporal_edge_delta_loss(pred_edge, prev_pred_edge, tgt_edge, prev_tgt_edge)
+                prev_pred_edge = pred_edge.detach()
+                prev_tgt_edge = tgt_edge.detach()
 
                 if is_ar_step:
                     loss_lpips_ar_list.append(lpips_val)
                     loss_edge_ar_list.append(edge_val)
+                    if temporal_edge_val is not None:
+                        loss_temporal_edge_ar_list.append(temporal_edge_val)
                 else:
                     loss_lpips_tf_list.append(lpips_val)
                     loss_edge_tf_list.append(edge_val)
+                    if temporal_edge_val is not None:
+                        loss_temporal_edge_tf_list.append(temporal_edge_val)
             t_lpips_total += (time.perf_counter() - t_lpips_start)
 
             # C. IDM Loss
@@ -1363,10 +1394,13 @@ while global_step < MAX_STEPS:
         loss_lpips_ar = torch.stack(loss_lpips_ar_list).mean() if loss_lpips_ar_list else torch.tensor(0.0, device=DEVICE)
         loss_edge_tf = torch.stack(loss_edge_tf_list).mean() if loss_edge_tf_list else torch.tensor(0.0, device=DEVICE)
         loss_edge_ar = torch.stack(loss_edge_ar_list).mean() if loss_edge_ar_list else torch.tensor(0.0, device=DEVICE)
+        loss_temporal_edge_tf = torch.stack(loss_temporal_edge_tf_list).mean() if loss_temporal_edge_tf_list else torch.tensor(0.0, device=DEVICE)
+        loss_temporal_edge_ar = torch.stack(loss_temporal_edge_ar_list).mean() if loss_temporal_edge_ar_list else torch.tensor(0.0, device=DEVICE)
         loss_idm_total = torch.stack(loss_idm_list).mean() if loss_idm_list else torch.tensor(0.0, device=DEVICE)
 
         loss_lpips_total = loss_lpips_tf + AR_LOSS_WEIGHT * loss_lpips_ar
         loss_edge_total = loss_edge_tf + AR_LOSS_WEIGHT * loss_edge_ar
+        loss_temporal_edge_total = loss_temporal_edge_tf + AR_LOSS_WEIGHT * loss_temporal_edge_ar
 
         # v7.0.5: Track for curriculum as tensors (avoid GPU->CPU sync every step)
         # Only sync when curriculum.update() needs the values
@@ -1404,6 +1438,7 @@ while global_step < MAX_STEPS:
                      CE_WEIGHT * loss_ce_total +
                      LPIPS_WEIGHT * loss_lpips_total +
                      EDGE_WEIGHT * loss_edge_total +
+                     TEMPORAL_EDGE_WEIGHT * loss_temporal_edge_total +
                      IDM_LOSS_WEIGHT * loss_idm_total +
                      DIV_REG_WEIGHT * loss_div_reg +
                      REP_REG_WEIGHT * loss_rep_reg)
@@ -1477,7 +1512,7 @@ while global_step < MAX_STEPS:
         print(
             f"[Step {global_step}] Loss: {total_loss.item():.4f} | "
             f"Sem: {loss_sem_total.item():.4f} | LPIPS: {loss_lpips_total.item():.4f} | "
-            f"IDM: {loss_idm_total.item():.4f} | "
+            f"EdgeT: {loss_temporal_edge_total.item():.4f} | IDM: {loss_idm_total.item():.4f} | "
             f"AR: {ar_len} | UniqueAR: {ar_unique:.0f} | "
             f"{throughput:.2f} steps/s\n"
             f"  Tau: {current_tau:.3f} | CorruptP: {current_corrupt_p:.3f} | "
@@ -1497,6 +1532,9 @@ while global_step < MAX_STEPS:
                 "train/loss_edge": loss_edge_total.item(),
                 "train/loss_edge_tf": loss_edge_tf.item(),
                 "train/loss_edge_ar": loss_edge_ar.item(),
+                "train/loss_temporal_edge": loss_temporal_edge_total.item(),
+                "train/loss_temporal_edge_tf": loss_temporal_edge_tf.item(),
+                "train/loss_temporal_edge_ar": loss_temporal_edge_ar.item(),
                 "train/loss_idm": loss_idm_total.item(),
                 "train/loss_div_reg": loss_div_reg.item(),
                 "train/loss_rep_reg": loss_rep_reg.item(),
