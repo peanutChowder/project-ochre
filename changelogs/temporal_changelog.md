@@ -1048,3 +1048,21 @@ Rationale:
 
 Open question to monitor:
 - If `v7.5.2` lowers edge flicker but also damps true motion or weakens action responsiveness, the temporal-consistency weight is too strong. If it preserves sharpness but flicker remains high, the remaining bottleneck is likely longer-horizon supervision rather than local temporal consistency alone.
+
+### v7.5.3
+
+Motivation: even after `v7.5.1`, the frame-quality gap between VQ-VAE reconstructions and world-model predictions remains large. Outputs are still too soft, surfaces look smeared rather than discretely block-structured, and the decoded frames do not look "Minecraft enough" even when they are plausible. `v7.5.2` tested temporal edge consistency, but that did not produce a clear enough overall improvement, so the next run shifts back to per-frame symbolic fidelity.
+
+train.py:
+- Keep the `v7.5.1` base intact: same sampler, `BASE_SEQ_LEN=3`, `AR_MAX_LEN=2`, LPIPS on all steps, and single-frame edge loss.
+- Increase token-fidelity pressure conservatively by lowering `LABEL_SMOOTHING` from `0.10` to `0.05` and increasing `CE_WEIGHT` from `1.00` to `1.25`.
+- Disable the temporal-edge branch by setting `TEMPORAL_EDGE_WEIGHT = 0.0`.
+- Resume from `v7.5.1@240k` with model-only resume.
+
+Rationale:
+- The current outputs still look undercommitted in code space, which suggests the model needs slightly sharper, more correct token choices rather than more perceptual or temporal smoothing.
+- CE is the most direct training signal for matching the GT token lattice; increasing its influence should push decoded frames closer to the VQ-VAE manifold.
+- The change is intentionally modest so quality can improve without reintroducing the old overconfident-collapse regime.
+
+Open question to monitor:
+- If `v7.5.3` improves token accuracy and block fidelity but starts increasing confidence too much or reducing diversity, then the sharper CE regime is overshooting and the anti-collapse balance needs to be restored.

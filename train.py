@@ -58,7 +58,7 @@ LPIPS_WEIGHT = 2.0        # v7.0.5: Increased to restore camera U/D (was stronge
 IDM_LOSS_WEIGHT = 0.5     # v4.11: 84x gradient boost for movement
 AR_LOSS_WEIGHT = 2.5      # Keep same as v6.3
 EDGE_WEIGHT = 1.0         # v7.5.1: Explicit edge-preservation loss to sharpen block boundaries
-TEMPORAL_EDGE_WEIGHT = 0.5  # v7.5.2: Match frame-to-frame edge changes to reduce shimmer/flicker
+TEMPORAL_EDGE_WEIGHT = 0.0  # v7.5.3: Disable temporal-edge branch; refocus on token fidelity / per-frame quality
 
 # --- v7.1.1 ANTI-COLLAPSE TRAINING ---
 # Objective: prevent AR rollouts from collapsing to a tiny, overconfident code subset.
@@ -105,9 +105,9 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.5.2: keep modest AR depth; refine temporal visual stability) ---
+# --- AR CURRICULUM (v7.5.3: keep modest AR depth; refocus on sharper discrete structure) ---
 # v7.5.0 improved transition recovery and v7.5.1 improved per-frame quality.
-# v7.5.2 keeps that regime and adds temporal edge consistency to reduce flicker.
+# v7.5.3 keeps that regime but shifts the objective toward crisper token choices.
 BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
@@ -116,15 +116,15 @@ AR_MAX_LEN = 2
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
-# v7.2.0: CE loss with label smoothing — directly limits logit overconfidence inside the loss.
-# label_smoothing=0.1 hard-caps max_prob at ~0.9001 (for C=1024 codes).
-LABEL_SMOOTHING = 0.1
-CE_WEIGHT = 1.0
+# v7.5.3: modestly reduce smoothing and increase CE pressure to favor sharper, more correct token choices
+# while preserving the anti-collapse recipe.
+LABEL_SMOOTHING = 0.05
+CE_WEIGHT = 1.25
 
-# v7.5.2: keep perceptual supervision on all steps while adding explicit edge losses.
+# v7.5.3: keep perceptual supervision on all steps while focusing on single-frame quality.
 LPIPS_AR_ENDPOINT_ONLY = False
 
-# --- v7.5.2 SAMPLING ---
+# --- v7.5.3 SAMPLING ---
 # Reweight window sampling toward transition windows and isolated-action supervision.
 SAMPLER_MODE = "transition_action_balance"   # "uniform" | "transition_action_balance"
 SAMPLER_TARGET_MIX = {
@@ -154,8 +154,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.5.2-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.5.2"
+RUN_NAME = "v7.5.3-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.5.3"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -184,7 +184,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.2"
+EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.3"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
