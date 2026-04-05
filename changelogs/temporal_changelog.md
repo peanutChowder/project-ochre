@@ -1032,6 +1032,13 @@ Rationale:
 Open question to monitor:
 - This tests a different hypothesis than the earlier "increase seq_len after sampler success" follow-up. If `v7.5.1` improves visual metrics (LPIPS / edge F1 / qualitative sharpness) but not transition `post_au`, that would suggest picture quality and long-horizon transition recovery are now separate bottlenecks, and the seq_len hypothesis should be revisited next.
 
+Results, step 240k:
+- Strong per-frame quality gain over `v7.5.0` and the first checkpoint in the family that clearly closed more of the VQ-VAE-vs-world-model quality gap.
+- 4-context visual eval: `PSNR≈21.73`, `LPIPS≈0.322`, `edge_f1≈0.765`, `token_accuracy≈0.1146`, `pred_unique_codes≈86.3`, all strong improvements over `v7.5.0`.
+- Control remained healthy but was not a clear transition win over the sampler baseline: 4-seed reruns gave `avg_max_prob≈0.305`, `consistency≈0.330`, `action_effect≈0.273`, `static_to_jump_post_au=39.0`, `camera_right_to_move_forward_post_au=41.25`, `camera_right_to_static_post_au=39.5`.
+- Main remaining issue: temporal stability. `edge_flicker_l1_mean≈0.147` remained high enough that scenes still shimmered and lost persistence over longer rollouts.
+- Conclusion: `v7.5.1` proved that explicit edge supervision can materially improve frame quality, but flicker and scene maintenance were still open bottlenecks.
+
 ### v7.5.2
 
 Motivation: `v7.5.1` substantially improved per-frame picture quality, but the remaining failure is temporal scene maintenance: edges shimmer, block boundaries move around between adjacent frames, and otherwise good-looking scenes dissolve into fuzzy shaking. The next run therefore targets temporal stability directly rather than adding more single-frame sharpness or changing AR depth again.
@@ -1048,6 +1055,13 @@ Rationale:
 
 Open question to monitor:
 - If `v7.5.2` lowers edge flicker but also damps true motion or weakens action responsiveness, the temporal-consistency weight is too strong. If it preserves sharpness but flicker remains high, the remaining bottleneck is likely longer-horizon supervision rather than local temporal consistency alone.
+
+Results, steps 220k and 240k:
+- `v7.5.2` was informative but not a clean overall win. The temporal edge-delta loss slightly improved some global quality metrics at `220k`, but did not produce the decisive flicker reduction the run was targeting.
+- `220k` was the better quality checkpoint: `PSNR≈22.49`, `LPIPS≈0.312`, `edge_flicker_l1≈0.145`, modestly better than `v7.5.1@240k` on those axes.
+- `240k` was the stronger control checkpoint: `avg_max_prob≈0.315`, `consistency≈0.315`, `action_effect≈0.294`, `static_to_jump_post_au=42.25`, `camera_right_to_move_forward_post_au=42.0`, but quality regressed versus `220k`.
+- Both checkpoints still regressed on some important axes relative to `v7.5.1`, especially `camera_right_to_static` transition recovery and overall visual consistency.
+- Conclusion: the temporal edge-delta loss did not solve flicker strongly enough to justify replacing `v7.5.1`; the next step should focus on per-frame symbolic fidelity again rather than more temporal-edge matching.
 
 ### v7.5.3
 
@@ -1066,3 +1080,28 @@ Rationale:
 
 Open question to monitor:
 - If `v7.5.3` improves token accuracy and block fidelity but starts increasing confidence too much or reducing diversity, then the sharper CE regime is overshooting and the anti-collapse balance needs to be restored.
+
+Results, step 240k:
+- Best overall checkpoint in the `v7.5.x` family so far. Fresh 4-seed reruns on the fixed MacBook eval path gave: `avg_max_prob≈0.255`, `consistency_score≈0.306`, `action_effect≈0.270`, `static_to_jump_post_au=45.5`, `camera_right_to_move_forward_post_au=45.25`, `camera_right_to_static_post_au=45.5`.
+- Quality improved over `v7.5.1@240k` on the main cross-run metrics: `PSNR 21.73→22.42`, `LPIPS 0.322→0.316`, `edge_f1 0.765→0.776`, `token_accuracy 0.1146→0.1154`, `pred_unique_codes 86.3→91.9`.
+- On the canonical `seed_1000` artifact suite, contact sheets and token-agreement panels show clearly stronger token fidelity and sharper decoded structure than `v7.5.1`.
+- Remaining weakness: temporal stability is still not solved. `edge_flicker_l1_mean` regressed slightly (`0.147→0.153`), and repeated-action stability strips / storyboard rollouts still show edge shimmer and scene drift over time.
+- Conclusion: `v7.5.3` solved more of the per-frame "Minecraft-ness" gap, but the next bottleneck is temporal maintenance rather than static sharpness.
+
+### v7.5.4
+
+Motivation: `v7.5.3` improved per-frame token fidelity and overall visual structure, but the dominant remaining failure is long-horizon scene maintenance: edges drift, repeated-action rollouts lose stability, and extended inference still degrades into a fuzzy shaking scene. The next run keeps the successful `v7.5.3` quality/control recipe and increases the AR horizon moderately to teach a longer post-context tail.
+
+train.py:
+- Keep the `v7.5.3` base intact: same sampler, `LABEL_SMOOTHING=0.05`, `CE_WEIGHT=1.25`, LPIPS on all steps, single-frame edge loss, and temporal-edge loss disabled (`TEMPORAL_EDGE_WEIGHT=0.0`).
+- Moderate AR extension: `BASE_SEQ_LEN: 3 → 5`, `AR_MAX_LEN: 2 → 4`.
+- Resume from `v7.5.3@240k` with model-only resume.
+- Continue writing train-time snapshots under `./eval/runs/train/v7.5.4`.
+
+Rationale:
+- `v7.4.0` showed that jumping straight to full AR depth is too risky.
+- `v7.5.3` suggests the model is now strong enough per frame that a moderate horizon increase is the most direct next test for temporal persistence.
+- This change is intentionally narrower than the old `8/7` full-AR plan so attribution stays clean: if temporal stability improves, the extra post-context supervision is the likely cause.
+
+Open question to monitor:
+- If `v7.5.4` improves stability-strip flicker and long-horizon rollouts without giving back `v7.5.3` token fidelity, then the main remaining bottleneck really was training horizon. If it regresses sharpness or action recovery, the model is still not ready for a longer fixed-AR regime and the next step should revisit objective-level temporal supervision instead.

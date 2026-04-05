@@ -108,11 +108,11 @@ LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback ea
 # --- AR CURRICULUM (v7.5.3: keep modest AR depth; refocus on sharper discrete structure) ---
 # v7.5.0 improved transition recovery and v7.5.1 improved per-frame quality.
 # v7.5.3 keeps that regime but shifts the objective toward crisper token choices.
-BASE_SEQ_LEN = 3
+BASE_SEQ_LEN = 5
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
 AR_MIN_LEN = 1            # v7.0.2: Critical fix: Allow short AR horizons if diversity is low
-AR_MAX_LEN = 2
+AR_MAX_LEN = 4
 AR_DIVERSITY_GATE_START = 5000
 MIN_UNIQUE_CODES_FOR_AR_GROWTH = 30
 
@@ -154,15 +154,15 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.5.3-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.5.3"
+RUN_NAME = "v7.5.4-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.5.4"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
 MILESTONE_SAVE_STEPS = 10_000
 MAX_SAVED_CHECKPOINTS = 40
 
-RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.1-step240k.pt"
+RESUME_CHECKPOINT_PATH = "./checkpoints/ochre-v7.5.3-step240k.pt"
 RESUME_MODEL_ONLY = True
 
 # Action validation
@@ -184,7 +184,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./diagnostics/runs/v7.5.3"
+EVAL_SNAPSHOT_OUT_ROOT = "./eval/runs/train/v7.5.4"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
