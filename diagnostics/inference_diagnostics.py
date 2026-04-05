@@ -42,6 +42,19 @@ from action_encoding import encode_action_v5_np
 from diagnostics.analyze_checkpoint import load_checkpoint, get_test_actions
 
 
+def sample_topk_tokens(topk_probs: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
+    """Sample top-k tokens robustly; on MPS, sample on CPU to avoid deterministic grid draws."""
+    B, K, H, W = topk_probs.shape
+    flat_probs = topk_probs.permute(0, 2, 3, 1).reshape(B * H * W, K)
+    flat_indices = topk_indices.permute(0, 2, 3, 1).reshape(B * H * W, K)
+    if flat_probs.device.type == "mps":
+        sampled = torch.multinomial(flat_probs.cpu(), 1).to(flat_probs.device)
+    else:
+        sampled = torch.multinomial(flat_probs, 1)
+    z_t = flat_indices[torch.arange(B * H * W, device=flat_indices.device), sampled.flatten()]
+    return z_t.reshape(B, H, W)
+
+
 # ========================================
 # Diagnostic 1: Logit Entropy/Confidence
 # ========================================
@@ -97,9 +110,7 @@ def diagnostic_logit_entropy_over_time(model, z_start, action, num_steps=20, top
 
             # Sample from top-k
             B, _, H, W = topk_probs.shape
-            topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-            sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-            z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+            z_t = sample_topk_tokens(topk_probs, topk_indices)
         else:
             # Argmax (greedy)
             z_t = z_argmax
@@ -152,9 +163,7 @@ def diagnostic_code_distribution(model, vqvae, z_start, action, num_steps=20, to
             topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
 
             B, _, H, W = topk_probs.shape
-            topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-            sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-            z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+            z_t = sample_topk_tokens(topk_probs, topk_indices)
         else:
             z_t = logits.argmax(dim=1)
 
@@ -214,9 +223,7 @@ def diagnostic_topk_consistency(model, vqvae, z_start, action, num_samples=10, n
                 topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
 
                 B, _, H, W = topk_probs.shape
-                topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-                sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-                z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+                z_t = sample_topk_tokens(topk_probs, topk_indices)
             else:
                 z_t = logits.argmax(dim=1)
 
@@ -296,9 +303,7 @@ def diagnostic_action_sensitivity_inference(model, vqvae, z_start, num_steps=10,
                 topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
 
                 B, _, H, W = topk_probs.shape
-                topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-                sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-                z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+                z_t = sample_topk_tokens(topk_probs, topk_indices)
             else:
                 z_t = logits.argmax(dim=1)
 
@@ -372,9 +377,7 @@ def diagnostic_per_frame_quality(model, vqvae, z_start, action, num_steps=20, to
             topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
 
             B, _, H, W = topk_probs.shape
-            topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-            sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-            z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+            z_t = sample_topk_tokens(topk_probs, topk_indices)
         else:
             z_t = z_argmax
 
@@ -472,9 +475,7 @@ def diagnostic_action_transition(model, vqvae, z_start, warmup_action, test_acti
             topk_probs, topk_indices = probs.topk(topk, dim=1)
             topk_probs = topk_probs / topk_probs.sum(dim=1, keepdim=True)
             B, _, H, W = topk_probs.shape
-            topk_probs_flat = topk_probs.permute(0, 2, 3, 1).reshape(B*H*W, topk)
-            sampled_indices = torch.multinomial(topk_probs_flat, 1).reshape(B, H, W)
-            z_t = topk_indices.permute(0, 2, 3, 1).reshape(B*H*W, topk)[torch.arange(B*H*W), sampled_indices.flatten()].reshape(B, H, W)
+            z_t = sample_topk_tokens(topk_probs, topk_indices)
         else:
             z_t = z_argmax
 
@@ -564,7 +565,7 @@ def run_all_diagnostics(model, vqvae, z_start, test_actions, config):
     entropy_steps = int(config.get("entropy_steps", 20))
     code_dist_steps = int(config.get("code_dist_steps", 20))
     consistency_samples = int(config.get("consistency_samples", 10))
-    consistency_steps = int(config.get("consistency_steps", 10))
+    consistency_steps = int(config.get("consistency_steps", 5))
     action_sensitivity_steps = int(config.get("action_sensitivity_steps", 10))
     quality_steps = int(config.get("quality_steps", 20))
 
@@ -654,128 +655,51 @@ def run_all_diagnostics(model, vqvae, z_start, test_actions, config):
 
 def analyze_results(results, config):
     """
-    Interpret diagnostic results and provide actionable insights.
+    Print raw diagnostic numbers. No qualitative thresholds — those were
+    calibrated to old model behaviour and are no longer reliable. Use the
+    saved JSON summary for programmatic comparison.
     """
     print("\n" + "="*80)
-    print("DIAGNOSTIC ANALYSIS SUMMARY")
+    print("DIAGNOSTIC SUMMARY (raw values — see JSON for structured output)")
     print("="*80)
 
-    # Check for Scenario A: Model is Uncertain (High Entropy)
-    avg_entropy = np.mean([results[f'entropy/{action}']['entropy'].mean() for action in ['static', 'camera_left', 'camera_right']])
-    avg_max_prob = np.mean([results[f'entropy/{action}']['max_prob'].mean() for action in ['static', 'camera_left', 'camera_right']])
+    all_actions = [k.split('/')[1] for k in results if k.startswith('entropy/')]
+    avg_entropy = np.mean([results[f'entropy/{a}']['entropy'].mean() for a in all_actions])
+    avg_max_prob = np.mean([results[f'entropy/{a}']['max_prob'].mean() for a in all_actions])
 
     print("\n1. PREDICTION CONFIDENCE:")
-    print(f"   - Average entropy: {avg_entropy:.3f} (expect ~2.0 for sharp predictions)")
-    print(f"   - Average max_prob: {avg_max_prob:.3f} (expect ~0.7-0.9 for confident predictions)")
+    print(f"   avg_entropy:  {avg_entropy:.3f}")
+    print(f"   avg_max_prob: {avg_max_prob:.3f}")
+    for a in all_actions:
+        mp = np.mean(results[f'entropy/{a}']['max_prob'])
+        print(f"     {a}: max_prob={mp:.3f}")
 
-    if avg_entropy > 5.0:
-        print("   ⚠️  SCENARIO A: HIGH ENTROPY - Model is uncertain, spreading probability across many codes")
-        print("       → Recommended fix: Add commitment loss, use temperature < 1.0")
-    elif avg_max_prob < 0.3:
-        print("   ⚠️  SCENARIO A: LOW CONFIDENCE - Model has no confident predictions")
-        print("       → Recommended fix: Add commitment loss, increase Gumbel annealing duration")
-    else:
-        print("   ✅  Confidence levels reasonable")
-
-    # Check for Scenario B: Top-k is Too Noisy
     consistency = results['consistency']['consistency_score']
+    print(f"\n2. TOP-K CONSISTENCY: {consistency:.3f}")
 
-    print("\n2. TOP-K CONSISTENCY:")
-    print(f"   - Consistency score: {consistency:.3f} (1.0 = all samples agree, 0.1 = random)")
+    avg_unique_codes = np.mean([results[f'code_dist/{a}']['num_unique_codes'] for a in all_actions])
+    avg_concentration = np.mean([results[f'code_dist/{a}']['code_concentration'] for a in all_actions])
+    print(f"\n3. CODE USAGE: unique_codes={avg_unique_codes:.1f}/1024  concentration={avg_concentration:.3f}")
 
-    if consistency < 0.5:
-        print("   ⚠️  SCENARIO B: TOP-K TOO NOISY - High variance across samples")
-        print(f"       → Recommended fix: Reduce k from {config['topk']} to 25, or use nucleus sampling (top-p)")
-    else:
-        print("   ✅  Top-k sampling produces consistent results")
-
-    # Check for Scenario C: Using Generic/Safe Codes
-    avg_unique_codes = np.mean([results[f'code_dist/{action}']['num_unique_codes'] for action in ['static', 'camera_left', 'camera_right']])
-    avg_concentration = np.mean([results[f'code_dist/{action}']['code_concentration'] for action in ['static', 'camera_left', 'camera_right']])
-
-    print("\n3. CODE USAGE DISTRIBUTION:")
-    print(f"   - Average unique codes: {avg_unique_codes:.1f} / 1024")
-    print(f"   - Average code concentration: {avg_concentration:.3f} (fraction using most common code)")
-
-    if avg_unique_codes < 40:
-        print("   ⚠️  SCENARIO C: USING NARROW SET OF CODES - May be generic/safe codes")
-        print("       → Recommended fix: Add code diversity loss, anti-repetition loss")
-    elif avg_concentration > 0.15:
-        print("   ⚠️  SCENARIO C: HIGH CODE CONCENTRATION - One code dominates")
-        print("       → Recommended fix: Penalize repeated code usage")
-    else:
-        print("   ✅  Code usage distribution reasonable")
-
-    # Check for Scenario D: Actions Don't Change Predictions
     action_effect = results['action_sensitivity']['action_effect_magnitude']
+    print(f"\n4. ACTION SENSITIVITY: action_effect_magnitude={action_effect:.3f}")
 
-    print("\n4. ACTION SENSITIVITY:")
-    print(f"   - Action effect magnitude: {action_effect:.3f} (expect > 0.15 for meaningful effect)")
+    avg_sharpness_retention = np.mean([results[f'per_frame_quality/{a}']['sharpness_retention'] for a in all_actions])
+    avg_degradation_onset = np.mean([results[f'per_frame_quality/{a}']['degradation_onset_frame'] for a in all_actions])
+    print(f"\n5. QUALITY DEGRADATION: onset=frame {avg_degradation_onset:.1f}  sharpness_retention={avg_sharpness_retention:.2%}")
 
-    if action_effect < 0.05:
-        print("   ⚠️  SCENARIO D: ACTIONS BARELY CHANGE PREDICTIONS")
-        print("       → Recommended fix: Separate optimizer for action pathway, consistency loss")
-    else:
-        print("   ✅  Actions have meaningful effect on predictions")
-
-    # Check for degradation onset
-    avg_degradation_onset = np.mean([results[f'per_frame_quality/{action}']['degradation_onset_frame'] for action in ['static', 'camera_left', 'camera_right']])
-    avg_sharpness_retention = np.mean([results[f'per_frame_quality/{action}']['sharpness_retention'] for action in ['static', 'camera_left', 'camera_right']])
-
-    print("\n5. QUALITY DEGRADATION:")
-    print(f"   - Average degradation onset: frame {avg_degradation_onset:.1f}")
-    print(f"   - Average sharpness retention: {avg_sharpness_retention:.2%}")
-
-    if avg_degradation_onset < 5:
-        print("   ⚠️  SEVERE DEGRADATION - Quality drops within 5 frames")
-    elif avg_sharpness_retention < 0.5:
-        print("   ⚠️  POOR SHARPNESS RETENTION - More than 50% loss over rollout")
-    else:
-        print("   ✅  Quality degradation acceptable")
-
-    # VQ-VAE quality check
     vqvae_diversity = results['vqvae_quality']['pred_code_diversity']
-    vqvae_concentration = results['vqvae_quality']['most_common_code_frequency']
+    print(f"\n6. VQ-VAE INPUT DIVERSITY: {vqvae_diversity} unique codes")
 
-    print("\n6. VQ-VAE DECODE QUALITY:")
-    print(f"   - Initial code diversity: {vqvae_diversity}")
-    print(f"   - Most common code frequency: {vqvae_concentration:.3f}")
+    if 'action_transition/static_to_jump' in results:
+        print("\n7. TRANSITION POST_AU (argmax_unique_codes[-1]):")
+        for key in results:
+            if key.startswith('action_transition/'):
+                name = key.split('/')[1]
+                au = results[key]['argmax_unique_codes'][-1]
+                print(f"   {name}: {au}")
 
-    if vqvae_diversity > 60 and avg_unique_codes < 40:
-        print("   ⚠️  SCENARIO E: VQ-VAE BOTTLENECK - Codes diverse initially but model doesn't maintain")
-    else:
-        print("   ✅  VQ-VAE decode quality acceptable")
-
-    print("\n" + "="*80)
-    print("RECOMMENDED NEXT STEPS:")
-    print("="*80)
-
-    recommendations = []
-
-    if avg_entropy > 5.0 or avg_max_prob < 0.3:
-        recommendations.append("1. Add commitment loss to force confident predictions")
-        recommendations.append("2. Use temperature < 1.0 (e.g., 0.8) during AR sampling")
-
-    if consistency < 0.5:
-        recommendations.append(f"3. Reduce top-k from {config['topk']} to 25 or use nucleus sampling")
-
-    if avg_unique_codes < 40 or avg_concentration > 0.15:
-        recommendations.append("4. Add code diversity loss (encourage full codebook usage)")
-
-    if action_effect < 0.05:
-        recommendations.append("5. Implement separate optimizer for action pathway")
-        recommendations.append("6. Add multi-rollout consistency loss")
-
-    if avg_degradation_onset < 5:
-        recommendations.append("7. Investigate initial prediction quality (may need VQ-VAE fixes)")
-
-    if not recommendations:
-        recommendations.append("No critical issues detected - model behavior is reasonable")
-
-    for rec in recommendations:
-        print(f"   {rec}")
-
-    print("\n")
+    print()
 
 
 # ========================================
@@ -792,6 +716,8 @@ def main():
     parser.add_argument("--recency_decay", type=float, default=1.0, help="Temporal attention recency decay")
     parser.add_argument("--output_dir", default="./diagnostics/inference-analysis", help="Output directory for results")
     parser.add_argument("--device", default="mps", help="Device to use (cuda/mps/cpu)")
+    parser.add_argument("--consistency_samples", type=int, default=10, help="Number of repeated top-k rollouts for consistency test")
+    parser.add_argument("--consistency_steps", type=int, default=5, help="Short rollout horizon for consistency test")
     args = parser.parse_args()
 
     # Setup device
@@ -832,6 +758,8 @@ def main():
         'topk': args.topk,
         'temperature': args.temperature,
         'recency_decay': args.recency_decay,
+        'consistency_samples': args.consistency_samples,
+        'consistency_steps': args.consistency_steps,
     }
 
     # Run diagnostics
@@ -856,11 +784,27 @@ def main():
         else:
             results_serializable[key] = value
 
+    # Build flat summary for agent-friendly access
+    entropy_actions = [k.split("/")[1] for k in results_serializable if k.startswith("entropy/")]
+    summary = {
+        "avg_max_prob": float(np.mean([
+            np.mean(results[f"entropy/{a}"]["max_prob"])
+            for a in entropy_actions
+        ])),
+        "consistency_score": float(results["consistency"]["consistency_score"]),
+        "action_effect_magnitude": float(results["action_sensitivity"]["action_effect_magnitude"]),
+        "static_to_jump_post_au": int(results["action_transition/static_to_jump"]["argmax_unique_codes"][-1]),
+        "camera_right_to_move_forward_post_au": int(results["action_transition/camera_right_to_move_forward"]["argmax_unique_codes"][-1]),
+        "camera_right_to_static_post_au": int(results["action_transition/camera_right_to_static"]["argmax_unique_codes"][-1]),
+    }
+
     # Save to JSON
     output_path = os.path.join(args.output_dir, f"inference_diagnostics_k{args.topk}_t{args.temperature}_rd{args.recency_decay}.json")
     with open(output_path, 'w') as f:
         json.dump({
+            'schema_version': 2,
             'config': config,
+            'summary': summary,
             'results': results_serializable,
         }, f, indent=2)
 
