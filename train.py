@@ -112,10 +112,12 @@ CORRUPT_BLOCK_MAX_FRAC = 0.35    # max block side length as fraction of H/W
 LPIPS_SOFT_TAU_THRESHOLD = 0.3  # use soft embeddings when current_tau > threshold
 LPIPS_SOFT_TF_ONLY = True       # keep AR steps hard to reduce drift/feedback early on
 
-# --- AR CURRICULUM (v7.6.0: revert to v7.5.3 horizon; test partial GT patch replacement on AR inputs) ---
+# --- AR CURRICULUM (v7.6.1: keep v7.5.3 horizon; heavily assist the first AR boundary) ---
 # v7.5.4 showed that a longer fixed AR horizon worsened both quality and control.
-# v7.6.0 returns to the short, proven horizon and instead reduces the self-conditioning cliff
-# by feeding mixed predicted/GT token inputs during AR steps.
+# v7.6.0 kept the short, proven horizon and mixed GT patches into all AR-fed inputs, but the
+# self-conditioning gap eval still showed a steep cliff on the first self-conditioned frame.
+# v7.6.1 therefore targets only the first AR-fed step with much stronger GT assistance and
+# anneals that assistance slowly, while leaving later AR steps fully autoregressive.
 BASE_SEQ_LEN = 3
 CURRICULUM_AR = False
 AR_WARMUP_STEPS = 0
@@ -132,15 +134,18 @@ CE_WEIGHT = 1.25
 # v7.5.3: keep perceptual supervision on all steps while focusing on single-frame quality.
 LPIPS_AR_ENDPOINT_ONLY = False
 
-# --- v7.6.0 PARTIAL GT PATCH REPLACEMENT ON AR INPUTS ---
-# Instead of feeding fully self-generated token frames during AR training, replace a modest fraction
-# of the sampled AR frame with GT tokens from the matching input position. This trains recovery from
-# partial local mistakes without forcing a long pure-AR chain.
+# --- v7.6.1 FIRST-AR-STEP GT ASSIST ---
+# The measured failure is concentrated at the first self-conditioned step, not a slow long-horizon
+# drift. So only AR step 1 receives heavy GT assistance, beginning at 95% replaced tokens and
+# annealing to 10% over 200k steps. The helper places a few spatial patches first, then randomly
+# tops up any remaining target tokens; at high replacement fractions this behaves more like strong
+# GT-assisted scheduled sampling than pure patch-only recovery. Later AR-fed steps stay fully AR.
 AR_GT_PATCH_REPLACE_ENABLED = True
 AR_GT_PATCH_REPLACE_START_STEP = 0
-AR_GT_PATCH_REPLACE_START_FRAC = 0.12
-AR_GT_PATCH_REPLACE_END_FRAC = 0.04
-AR_GT_PATCH_REPLACE_RAMP_STEPS = 20_000
+AR_GT_PATCH_REPLACE_RAMP_STEPS = 200_000
+AR_GT_PATCH_REPLACE_FIRST_AR_STEP_ONLY = True
+AR_GT_PATCH_REPLACE_STEP1_START_FRAC = 0.95
+AR_GT_PATCH_REPLACE_STEP1_END_FRAC = 0.10
 AR_GT_PATCH_BLOCKS = 2
 AR_GT_PATCH_MIN_FRAC = 0.18
 AR_GT_PATCH_MAX_FRAC = 0.30
@@ -175,8 +180,8 @@ ACTION_WEIGHTS = torch.tensor([
 
 # --- LOGGING ---
 PROJECT = "project-ochre"
-RUN_NAME = "v7.6.0-step0k"
-MODEL_OUT_PREFIX = "ochre-v7.6.0"
+RUN_NAME = "v7.6.1-step0k"
+MODEL_OUT_PREFIX = "ochre-v7.6.1"
 
 LOG_STEPS = 10
 IMAGE_LOG_STEPS = 1000
@@ -205,7 +210,7 @@ EVAL_SNAPSHOT_STEPS = 5000
 # Fixed contexts for reproducibility — use a small local set, not the full training dataset.
 EVAL_SNAPSHOT_CONTEXT_DIR = DATA_DIR
 EVAL_SNAPSHOT_NUM_CONTEXTS = 3
-EVAL_SNAPSHOT_OUT_ROOT = "./eval/runs/train/v7.6.0"
+EVAL_SNAPSHOT_OUT_ROOT = "./eval/runs/train/v7.6.1"
 EVAL_SNAPSHOT_TOPK = 50
 EVAL_SNAPSHOT_TEMP = 1.0
 EVAL_SNAPSHOT_RECENCY_DECAY = 1.0
@@ -313,18 +318,20 @@ def sample_tokens(logits: torch.Tensor, temperature: float = 1.0, top_k: int | N
     return chosen.view(B, H, W).long()
 
 
-def get_ar_gt_patch_replace_frac(step: int) -> float:
+def get_ar_gt_patch_replace_frac(step: int, ar_step_idx: int) -> float:
     if not AR_GT_PATCH_REPLACE_ENABLED:
         return 0.0
     if step < AR_GT_PATCH_REPLACE_START_STEP:
         return 0.0
+    if AR_GT_PATCH_REPLACE_FIRST_AR_STEP_ONLY and ar_step_idx != 1:
+        return 0.0
     local_step = step - AR_GT_PATCH_REPLACE_START_STEP
     if AR_GT_PATCH_REPLACE_RAMP_STEPS <= 0:
-        return float(AR_GT_PATCH_REPLACE_END_FRAC)
+        return float(AR_GT_PATCH_REPLACE_STEP1_END_FRAC)
     alpha = min(1.0, local_step / float(AR_GT_PATCH_REPLACE_RAMP_STEPS))
     return float(
-        AR_GT_PATCH_REPLACE_START_FRAC +
-        alpha * (AR_GT_PATCH_REPLACE_END_FRAC - AR_GT_PATCH_REPLACE_START_FRAC)
+        AR_GT_PATCH_REPLACE_STEP1_START_FRAC +
+        alpha * (AR_GT_PATCH_REPLACE_STEP1_END_FRAC - AR_GT_PATCH_REPLACE_STEP1_START_FRAC)
     )
 
 
@@ -339,6 +346,7 @@ def mix_pred_with_gt_patches(
 ) -> tuple[torch.Tensor, float]:
     """
     Replace a fraction of predicted tokens with GT tokens using a small number of spatial patches.
+    If the patches undershoot the requested replacement target, randomly top up the remainder.
 
     pred_tokens / gt_tokens: (B, H, W) long
     Returns: mixed tokens, realized replacement fraction
@@ -1224,9 +1232,10 @@ print(
 print(f"  - AR: fixed ar_len={AR_MAX_LEN}, seq_len={BASE_SEQ_LEN} (short horizon, no curriculum)")
 if AR_GT_PATCH_REPLACE_ENABLED:
     print(
-        f"  - AR input mixing: GT patch replace frac {AR_GT_PATCH_REPLACE_START_FRAC:.2f}"
-        f"->{AR_GT_PATCH_REPLACE_END_FRAC:.2f} over {AR_GT_PATCH_REPLACE_RAMP_STEPS} steps, "
-        f"blocks={AR_GT_PATCH_BLOCKS}, block_frac={AR_GT_PATCH_MIN_FRAC:.2f}-{AR_GT_PATCH_MAX_FRAC:.2f}"
+        f"  - AR input mixing: first AR step GT patch replace frac {AR_GT_PATCH_REPLACE_STEP1_START_FRAC:.2f}"
+        f"->{AR_GT_PATCH_REPLACE_STEP1_END_FRAC:.2f} over {AR_GT_PATCH_REPLACE_RAMP_STEPS} steps, "
+        f"later AR steps=0.00, blocks={AR_GT_PATCH_BLOCKS}, "
+        f"block_frac={AR_GT_PATCH_MIN_FRAC:.2f}-{AR_GT_PATCH_MAX_FRAC:.2f}"
     )
 print(f"  - Sampler: {SAMPLER_MODE}")
 
@@ -1267,7 +1276,7 @@ while global_step < MAX_STEPS:
     seq_len = max(BASE_SEQ_LEN, ar_len + 1)
     current_tau = tau_scheduler.get_tau(global_step)
     current_corrupt_p = corrupt_scheduler.get_p(global_step)
-    current_ar_gt_patch_replace_frac = get_ar_gt_patch_replace_frac(global_step)
+    logged_step1_gt_assist_frac = get_ar_gt_patch_replace_frac(global_step, ar_step_idx=1)
 
     if seq_len != prev_seq_len:
         print(f"[Curriculum] Resizing: seq_len {prev_seq_len} -> {seq_len}")
@@ -1352,6 +1361,7 @@ while global_step < MAX_STEPS:
 
         for t in range(K):
             is_ar_step = (t >= ar_cutoff and t > 0)
+            ar_step_idx = (t - ar_cutoff + 1) if is_ar_step else 0
 
             # Input: teacher forcing or AR
             if t == 0:
@@ -1366,11 +1376,12 @@ while global_step < MAX_STEPS:
                         z_pred = sample_tokens(logits_last, temperature=AR_SAMPLE_TEMP, top_k=AR_SAMPLE_TOPK)
                 else:
                     raise ValueError(f"Unknown AR_FEEDBACK_MODE={AR_FEEDBACK_MODE!r} (expected 'argmax' or 'topk').")
-                if AR_GT_PATCH_REPLACE_ENABLED and global_step >= AR_GT_PATCH_REPLACE_START_STEP:
+                step_gt_assist_frac = get_ar_gt_patch_replace_frac(global_step, ar_step_idx)
+                if step_gt_assist_frac > 0.0:
                     z_in, realized_replace_frac = mix_pred_with_gt_patches(
                         z_pred,
                         Z_seq[:, t],
-                        replace_frac=current_ar_gt_patch_replace_frac,
+                        replace_frac=step_gt_assist_frac,
                         num_blocks=AR_GT_PATCH_BLOCKS,
                         min_block_frac=AR_GT_PATCH_MIN_FRAC,
                         max_block_frac=AR_GT_PATCH_MAX_FRAC,
@@ -1626,7 +1637,7 @@ while global_step < MAX_STEPS:
             f"AR: {ar_len} | UniqueAR: {ar_unique:.0f} | MixGT: {ar_gt_patch_replace_frac:.2f} | "
             f"{throughput:.2f} steps/s\n"
             f"  Tau: {current_tau:.3f} | CorruptP: {current_corrupt_p:.3f} | "
-            f"PatchMixTarget: {current_ar_gt_patch_replace_frac:.2f} | "
+            f"Step1GTTarget: {logged_step1_gt_assist_frac:.2f} | "
             f"  Timing: Data={timing_ema['data_load']:.0f}ms | Fwd={timing_ema['forward']:.0f}ms "
             f"(Sem={timing_ema['semantic']:.0f}ms, LPIPS={timing_ema['lpips']:.0f}ms, IDM={timing_ema['idm']:.0f}ms) | "
             f"Bwd={timing_ema['backward']:.0f}ms | Opt={timing_ema['optimizer']:.0f}ms"
@@ -1653,7 +1664,8 @@ while global_step < MAX_STEPS:
                 "train/lr": optimizer.param_groups[0]['lr'],
                 "train/gumbel_tau": current_tau,
                 "train/corrupt_p": current_corrupt_p,
-                "train/ar_gt_patch_replace_target_frac": current_ar_gt_patch_replace_frac,
+                "train/ar_step1_gt_assist_target_frac": logged_step1_gt_assist_frac,
+                "train/ar_gt_patch_replace_target_frac": logged_step1_gt_assist_frac,
                 "curriculum/seq_len": seq_len,
                 "curriculum/ar_len": ar_len,
                 "curriculum/lpips_ratio": prev_lpips_ar / (prev_lpips_tf + 1e-6),

@@ -2,6 +2,10 @@
 
 ## Current training version
 
+### v7.6.1
+
+- (see bottom)
+
 ### v1.1
 
 - 6 frame input + yaw/axis data, single frame prediction.
@@ -1132,3 +1136,14 @@ Rationale:
 
 Open question to monitor:
 - If `v7.6.0` reduces the self-conditioning cliff or improves stability/flicker while preserving `v7.5.3` token fidelity, then partial GT patch replacement is the right next direction. If it fails, the next likely step is a stronger consistency-regularization variant rather than more scheduled sampling or more AR depth.
+
+### v7.6.1
+
+- Resume from `v7.5.3@240k`, keeping the short proven horizon (`BASE_SEQ_LEN=3`, `AR_MAX_LEN=2`).
+- Change GT patch replacement to target only the first self-conditioned AR step.
+- AR step 1 now starts with `95%` GT patch replacement and anneals to `10%` over `200k` steps.
+- Later AR steps receive `0%` GT patch replacement.
+
+Rationale:
+- `v7.6.0` train-time metrics stayed healthy, but self-conditioning-gap eval still showed a steep first-AR-frame cliff.
+- The new hypothesis is not “more GT everywhere,” but “much more GT specifically at the first AR boundary,” where the quality collapse first appears.
