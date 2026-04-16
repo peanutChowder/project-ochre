@@ -1105,3 +1105,30 @@ Rationale:
 
 Open question to monitor:
 - If `v7.5.4` improves stability-strip flicker and long-horizon rollouts without giving back `v7.5.3` token fidelity, then the main remaining bottleneck really was training horizon. If it regresses sharpness or action recovery, the model is still not ready for a longer fixed-AR regime and the next step should revisit objective-level temporal supervision instead.
+
+Results, step 90k:
+- `v7.5.4` did not validate the moderate horizon-increase hypothesis. 4-seed inference reruns regressed vs `v7.5.3@240k`: `avg_max_prob 0.255→0.294`, `consistency 0.305→0.332`, `action_effect 0.270→0.261`, `static_to_jump_post_au 45.5→30.5`, `camera_right_to_move_forward_post_au 45.25→36.25`, `camera_right_to_static_post_au 45.5→42.0`.
+- 4-context visual-quality eval also regressed: `PSNR 22.42→19.91`, `LPIPS 0.316→0.394`, `center LPIPS 0.180→0.217`, `edge_l1 0.119→0.126`, `edge_flicker_l1 0.153→0.159`, `token_accuracy 0.115→0.111`, `pred_unique_codes 91.9→86.6`. `edge_f1` was effectively flat.
+- Artifact suite agrees with the scalar result. On the canonical `seed_1000` contact sheet and token-agreement panels, `v7.5.4` is substantially less token-faithful than `v7.5.3`; storyboard `storyboard_post_au` also regressed on all three transitions (`42→30`, `46→31`, `47→36`).
+- Stability strips do not show a temporal win: static-strip flicker worsened (`0.069→0.087`), so the extra AR horizon did not improve scene maintenance in the target regime.
+- Conclusion: `v7.5.4` is a negative result. `v7.5.3@240k` remains the best baseline, and the next stability intervention should be more targeted than simply increasing AR depth.
+
+### v7.6.0
+
+Motivation: the new debug suite showed that the current temporal failure is not primarily weak action conditioning or unused memory. Instead, the model fails with a **self-conditioning cliff**: once it starts consuming its own imperfect predictions, quality drops sharply and recovery is poor. `v7.5.4` confirmed that increasing AR depth makes this worse rather than better. The next run therefore tests a new hypothesis: keep the short, proven `v7.5.3` horizon, but make AR training inputs partially teacher-corrected at the token level so the model learns to recover from local self-conditioning mistakes without being overwhelmed by fully AR frames.
+
+train.py:
+- Revert horizon back to the `v7.5.3` regime: `BASE_SEQ_LEN: 5 → 3`, `AR_MAX_LEN: 4 → 2`.
+- Keep the `v7.5.3` objective stack intact: same sampler, `LABEL_SMOOTHING=0.05`, `CE_WEIGHT=1.25`, LPIPS on all steps, single-frame edge loss, temporal-edge loss disabled.
+- Add partial GT patch replacement on AR inputs only. After sampling the AR-fed token frame, replace a modest fraction of tokens with GT tokens from the matching input position using `2` spatial patches. The replacement target ramps from `12%` down to `4%` over the first `20k` steps, with larger patch sizes (`18%-30%` side lengths) so the replacement is actually patch-dominated rather than mostly random scatter.
+- Resume from `v7.5.3@240k`, model-only, with outputs under `./eval/runs/train/v7.6.0`.
+
+Rationale:
+- Debug diagnostics showed a consistent cliff between teacher-forced and self-conditioned rollouts across `v7.5.1`, `v7.5.3`, and `v7.5.4`.
+- Action-memory swap evals did **not** support the idea that buffer state is overpowering action conditioning.
+- Buffer ablations showed temporal memory is actively used, but fragile to corrupted states.
+- Recovery evals showed the model generally fails to recover from small token or buffer perturbations once they enter the rollout.
+- Therefore the next intervention should target recovery from **partial local AR mistakes**, not longer AR depth.
+
+Open question to monitor:
+- If `v7.6.0` reduces the self-conditioning cliff or improves stability/flicker while preserving `v7.5.3` token fidelity, then partial GT patch replacement is the right next direction. If it fails, the next likely step is a stronger consistency-regularization variant rather than more scheduled sampling or more AR depth.
