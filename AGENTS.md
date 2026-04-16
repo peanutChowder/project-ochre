@@ -11,6 +11,7 @@
 | 5 | **Agent** | Read logs; identify best checkpoint step (transition recovery metrics, not just loss) |
 | 6 | **User** | Download selected checkpoint `.pt` file to MacBook Air |
 | 7 | **Agent** | Run eval suite (see below); interpret results; recommend next experiment |
+| 8 | **Agent** | Evaluate resuls in context of evals. Why did an assumption work/not work?
 
 ---
 
